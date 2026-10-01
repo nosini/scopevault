@@ -13,9 +13,9 @@ including the passwords of all other apps.
 
 ## Status
 
-This is the groundwork. scopevault can tell Flatpak apps from host
-programs reliably and route Secret Service requests per app, but it
-doesn't store anything yet: there is no vault and no daemon.
+This is early work. scopevault can tell Flatpak apps from host programs
+and has an encrypted vault with a password dialog, but the Secret Service
+itself doesn't use the vault yet, and there is no daemon to run.
 
 It is written in Rust and needs a session bus that hands out process file
 descriptors, which dbus-broker does.
@@ -26,6 +26,8 @@ descriptors, which dbus-broker does.
   `host`. Callers that can't be identified reliably are refused.
 - Foreign objects look exactly like missing ones, and signals only reach
   the scope they concern.
+- Secrets are stored in one encrypted vault, opened with a master password
+  through pinentry.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains
@@ -35,6 +37,7 @@ what it does protect and why.
 
 - [docs/DESIGN.md](docs/DESIGN.md): how callers are identified, how scopes
   work, and the limits.
+- [docs/STORE.md](docs/STORE.md): the encrypted vault.
 - [docs/TESTING.md](docs/TESTING.md): the tests, and checking scopevault
   against real Flatpak apps without touching your keyring.
 - [CHANGELOG.md](CHANGELOG.md)

@@ -1,0 +1,304 @@
+//! On-disk layout: a private directory holding one SQLite database.
+//!
+//! The database contains only the key wrap (KDF parameters, salt, wrapped
+//! key) and records of `(id, kind, namespace, nonce, ciphertext)`. IDs and
+//! namespace IDs are random; labels, attributes, scope names and secrets are
+//! only ever inside ciphertext, so the database, its WAL and its shared
+//! memory file hold no plaintext. What remains visible is described in
+//! docs/STORE.md.
+
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rustix::fs::{FlockOperation, Mode, OFlags};
+
+use super::StoreError;
+use crate::crypto::{KdfParams, KeyWrap, NONCE_LEN, SALT_LEN};
+
+pub const DB_FILE: &str = "vault.db";
+const LOCK_FILE: &str = "lock";
+/// "SVLT" — marks the file as ours.
+const APPLICATION_ID: i64 = 0x5356_4c54;
+pub const SCHEMA_VERSION: i64 = 1;
+
+pub type RecordId = [u8; 16];
+
+#[derive(Debug, Clone)]
+pub struct RawRecord {
+    pub id: RecordId,
+    pub kind: u8,
+    pub namespace: RecordId,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+/// A value of the wrong SQL type means the file was altered outside the
+/// vault; report it as corruption, not as a database failure.
+fn typed(e: rusqlite::Error) -> StoreError {
+    match e {
+        rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..) => StoreError::Corrupt("stored value has the wrong type".into()),
+        other => StoreError::Db(other),
+    }
+}
+
+pub struct Db {
+    conn: Connection,
+    dir: PathBuf,
+    /// Held for the lifetime of the store; a second opener fails.
+    _lock: OwnedFd,
+}
+
+fn uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+/// Creates `dir` (mode 0700) if needed and checks that it is a real
+/// directory owned by us and not accessible to others. Returns an fd.
+fn private_dir(dir: &Path) -> Result<OwnedFd, StoreError> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            rustix::fs::mkdir(dir, Mode::RWXU).map_err(std::io::Error::from)?;
+        }
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    let fd =
+        rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|e| StoreError::InsecurePath(format!("{}: {e}", dir.display())))?;
+    let st = rustix::fs::fstat(&fd).map_err(std::io::Error::from)?;
+    if st.st_uid != uid() || st.st_mode & 0o077 != 0 {
+        return Err(StoreError::InsecurePath(format!(
+            "{} must be owned by you with mode 0700 (is {:o})",
+            dir.display(),
+            st.st_mode & 0o7777
+        )));
+    }
+    Ok(fd)
+}
+
+/// Checks a file in the private directory, if it exists: regular, ours,
+/// not accessible to others.
+fn check_file(dir_fd: &OwnedFd, name: &str) -> Result<(), StoreError> {
+    match rustix::fs::statat(dir_fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(std::io::Error::from(e).into()),
+        Ok(st) => {
+            let regular = rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile;
+            if !regular || st.st_uid != uid() || st.st_mode & 0o077 != 0 {
+                return Err(StoreError::InsecurePath(format!("{name} must be a regular file with mode 0600")));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// One opener per vault. Note that `flock` belongs to the open file
+/// description, so a child forked while the lock is held keeps it until the
+/// child execs (the descriptor is close-on-exec).
+fn take_lock(dir_fd: &OwnedFd) -> Result<OwnedFd, StoreError> {
+    let fd = rustix::fs::openat(
+        dir_fd,
+        LOCK_FILE,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(std::io::Error::from)?;
+    rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive).map_err(|_| StoreError::InUse)?;
+    Ok(fd)
+}
+
+impl Db {
+    pub fn exists(dir: &Path) -> bool {
+        dir.join(DB_FILE).exists()
+    }
+
+    fn open_connection(dir: &Path, create: bool) -> Result<(Connection, OwnedFd), StoreError> {
+        let dir_fd = private_dir(dir)?;
+        let lock = take_lock(&dir_fd)?;
+        if create {
+            // Create the file ourselves so its mode is 0600 from the start;
+            // SQLite gives the WAL and shm files the same mode.
+            rustix::fs::openat(
+                &dir_fd,
+                DB_FILE,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|e| match e {
+                rustix::io::Errno::EXIST => StoreError::Exists,
+                e => std::io::Error::from(e).into(),
+            })?;
+        } else if !Self::exists(dir) {
+            return Err(StoreError::NotFound);
+        }
+        for name in [DB_FILE, "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
+            check_file(&dir_fd, name)?;
+        }
+        let conn = Connection::open_with_flags(
+            dir.join(DB_FILE),
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // Durable commits; no temporary files on disk; overwrite freed pages
+        // so deleted ciphertext does not linger in the file.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             PRAGMA secure_delete = ON;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA trusted_schema = OFF;
+             PRAGMA cell_size_check = ON;",
+        )?;
+        Ok((conn, lock))
+    }
+
+    pub fn create(dir: &Path, wrap: &KeyWrap) -> Result<Db, StoreError> {
+        let (mut conn, lock) = Self::open_connection(dir, true)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        tx.execute_batch(&format!(
+            "PRAGMA application_id = {APPLICATION_ID};
+             PRAGMA user_version = {SCHEMA_VERSION};
+             CREATE TABLE vault (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 kdf_m INTEGER NOT NULL, kdf_t INTEGER NOT NULL, kdf_p INTEGER NOT NULL,
+                 salt BLOB NOT NULL, nonce BLOB NOT NULL, wrapped BLOB NOT NULL);
+             CREATE TABLE records (
+                 id BLOB NOT NULL, kind INTEGER NOT NULL, namespace BLOB NOT NULL,
+                 nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                 PRIMARY KEY (id, kind)) WITHOUT ROWID;"
+        ))?;
+        tx.execute(
+            "INSERT INTO vault (id, kdf_m, kdf_t, kdf_p, salt, nonce, wrapped) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![wrap.kdf.m_kib, wrap.kdf.t, wrap.kdf.p, &wrap.salt[..], &wrap.nonce[..], &wrap.wrapped],
+        )?;
+        tx.commit()?;
+        Ok(Db { conn, dir: dir.to_owned(), _lock: lock })
+    }
+
+    pub fn open(dir: &Path) -> Result<Db, StoreError> {
+        let (conn, lock) = Self::open_connection(dir, false)?;
+        let app_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        if app_id != APPLICATION_ID {
+            return Err(StoreError::NotAVault);
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedVersion(version));
+        }
+        Ok(Db { conn, dir: dir.to_owned(), _lock: lock })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn key_wrap(&self) -> Result<KeyWrap, StoreError> {
+        let row = self
+            .conn
+            .query_row("SELECT kdf_m, kdf_t, kdf_p, salt, nonce, wrapped FROM vault WHERE id = 1", [], |r| {
+                Ok((
+                    r.get::<_, u32>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, u32>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })
+            .optional()
+            .map_err(typed)?
+            .ok_or_else(|| StoreError::Corrupt("missing key wrap".into()))?;
+        let (m_kib, t, p, salt, nonce, wrapped) = row;
+        let salt: [u8; SALT_LEN] = salt.try_into().map_err(|_| StoreError::Corrupt("bad salt length".into()))?;
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| StoreError::Corrupt("bad nonce length".into()))?;
+        Ok(KeyWrap { kdf: KdfParams { m_kib, t, p }, salt, nonce, wrapped })
+    }
+
+    pub fn set_key_wrap(&mut self, wrap: &KeyWrap) -> Result<(), StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            "UPDATE vault SET kdf_m = ?1, kdf_t = ?2, kdf_p = ?3, salt = ?4, nonce = ?5, wrapped = ?6 WHERE id = 1",
+            params![wrap.kdf.m_kib, wrap.kdf.t, wrap.kdf.p, &wrap.salt[..], &wrap.nonce[..], &wrap.wrapped],
+        )?;
+        if n != 1 {
+            return Err(StoreError::Corrupt("missing key wrap".into()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_all(&self) -> Result<Vec<RawRecord>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id, kind, namespace, nonce, ciphertext FROM records")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, namespace, nonce, ciphertext) = row.map_err(typed)?;
+            let bad = |what: &str| StoreError::Corrupt(format!("record with malformed {what}"));
+            out.push(RawRecord {
+                id: id.try_into().map_err(|_| bad("id"))?,
+                kind: u8::try_from(kind).map_err(|_| bad("kind"))?,
+                namespace: namespace.try_into().map_err(|_| bad("namespace"))?,
+                nonce,
+                ciphertext,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn load_one(&self, id: &RecordId, kind: u8) -> Result<Option<RawRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT namespace, nonce, ciphertext FROM records WHERE id = ?1 AND kind = ?2",
+                params![&id[..], kind],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)),
+            )
+            .optional()
+            .map_err(typed)?
+            .map(|(ns, nonce, ciphertext)| -> Result<RawRecord, StoreError> {
+                Ok(RawRecord {
+                    id: *id,
+                    kind,
+                    namespace: ns
+                        .try_into()
+                        .map_err(|_| StoreError::Corrupt("record with malformed namespace".into()))?,
+                    nonce,
+                    ciphertext,
+                })
+            })
+            .transpose()
+    }
+
+    /// Applies writes and deletes atomically.
+    pub fn apply(&mut self, writes: &[RawRecord], deletes: &[(RecordId, u8)]) -> Result<(), StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut put = tx.prepare_cached(
+                "INSERT INTO records (id, kind, namespace, nonce, ciphertext) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (id, kind) DO UPDATE SET namespace = excluded.namespace,
+                     nonce = excluded.nonce, ciphertext = excluded.ciphertext",
+            )?;
+            for r in writes {
+                put.execute(params![&r.id[..], r.kind, &r.namespace[..], &r.nonce, &r.ciphertext])?;
+            }
+            let mut del = tx.prepare_cached("DELETE FROM records WHERE id = ?1 AND kind = ?2")?;
+            for (id, kind) in deletes {
+                del.execute(params![&id[..], kind])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}

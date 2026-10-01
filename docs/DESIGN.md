@@ -154,3 +154,5 @@ and routes them by the caller's scope:
   Isolating Flatpak apps from each other is the point; hiding secrets from
   your own unsandboxed programs is not possible this way.
 - Flatpak apps with permissions that escape the sandbox (see above).
+- Rolling the vault file back to an older copy, and secrets surviving in
+  old backups or snapshots. See [STORE.md](STORE.md).

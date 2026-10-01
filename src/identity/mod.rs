@@ -100,6 +100,18 @@ impl std::fmt::Display for Scope {
     }
 }
 
+impl std::str::FromStr for Scope {
+    type Err = IdentityError;
+
+    /// Parses the [`Display`](std::fmt::Display) form: `host` or `flatpak/<app-id>`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "host" => Ok(Scope::Host),
+            _ => s.strip_prefix("flatpak/").map(AppId::parse).ok_or(IdentityError::InvalidAppId)?.map(Scope::Flatpak),
+        }
+    }
+}
+
 /// Credentials as reported by the bus daemon for one unique name.
 #[derive(Debug, Default)]
 pub struct BusCredentials {
