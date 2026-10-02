@@ -1,9 +1,12 @@
 #!/bin/sh
 # Reports who serves the Secret Service in this session, and which files
 # decide it: the owner of org.freedesktop.secrets and anything queued for
-# it, the owners of org.gnome.keyring and the Secret portal backend, the
-# state of the scopevault unit and of gnome-keyring's own units, the D-Bus activation files, the autostart
-# override and the PAM lines that start gnome-keyring.
+# it, the owners of org.gnome.keyring and the Secret portal backends, the
+# state of the scopevault unit and of gnome-keyring's own units, the D-Bus
+# activation files, the autostart override, the portal configuration and
+# the PAM lines that start gnome-keyring. It also compares the portal
+# frontend's (xdg-desktop-portal's) namespaces, root and LSM label with
+# this shell's: scopevault serves the frontend only if it is a host process.
 #
 # Read-only. Only the bus daemon (org.freedesktop.DBus) is talked to: no
 # method is ever called on org.freedesktop.secrets, org.gnome.keyring or
@@ -12,8 +15,9 @@
 # is-enabled and is-active, which start nothing.
 #
 # Ends with "scopevault serves the Secret Service" (exit 0) when
-# scopevault-daemon owns the name and nothing is queued for it; otherwise
-# a one-line reason (exit 1).
+# scopevault-daemon owns the name, nothing is queued for it, and, if the
+# portal configuration selects scopevault, scopevault-daemon owns its portal
+# backend name; otherwise a one-line reason (exit 1).
 #
 # Needs: gdbus (glib2-tools).
 #
@@ -80,14 +84,47 @@ fi
 
 echo
 echo "-- the other names"
-for name in org.gnome.keyring org.freedesktop.impl.portal.Secret; do
+portal_name=page.codeberg.nosini.ScopeVault.Portal
+portal_owner_cmd=
+for name in org.gnome.keyring org.freedesktop.impl.portal.Secret "$portal_name"; do
     o=$(names "$(bus GetNameOwner "$name" 2>/dev/null || true)")
     if [ -n "$o" ]; then
         echo "owner of $name: $o ($(describe "$o"))"
+        [ "$name" = "$portal_name" ] && portal_owner_cmd=$(command_of "$(pid_of "$o")")
     else
         echo "owner of $name: none"
     fi
 done
+
+echo
+echo "-- the portal frontend"
+frontend=$(names "$(bus GetNameOwner org.freedesktop.portal.Desktop 2>/dev/null || true)")
+if [ -n "$frontend" ]; then
+    echo "owner of org.freedesktop.portal.Desktop: $frontend ($(describe "$frontend"))"
+    fp=$(pid_of "$frontend")
+    if [ -n "$fp" ]; then
+        # The daemon requires a host frontend: same namespaces, root and LSM
+        # label as itself. This shell stands in for the daemon here.
+        diffs=
+        for ns in cgroup ipc mnt net pid user uts; do
+            a=$(readlink "/proc/$fp/ns/$ns" 2>/dev/null || echo unreadable)
+            b=$(readlink "/proc/self/ns/$ns" 2>/dev/null || echo unreadable)
+            [ "$a" = "$b" ] || diffs="$diffs $ns"
+        done
+        [ "$(stat -L -c %d:%i "/proc/$fp/root" 2>/dev/null || echo unreadable)" = "$(stat -L -c %d:%i /)" ] \
+            || diffs="$diffs root"
+        a=$(tr -d '\0' <"/proc/$fp/attr/current" 2>/dev/null || echo unreadable)
+        b=$(tr -d '\0' </proc/self/attr/current 2>/dev/null || echo unreadable)
+        [ "$a" = "$b" ] || diffs="$diffs label($a)"
+        if [ -z "$diffs" ]; then
+            echo "the frontend looks like a host process (same namespaces, root and label as this shell)"
+        else
+            echo "the frontend differs from this shell in:$diffs; scopevault would refuse it"
+        fi
+    fi
+else
+    echo "owner of org.freedesktop.portal.Desktop: none (xdg-desktop-portal starts on demand)"
+fi
 
 echo
 echo "-- the files that decide activation"
@@ -98,6 +135,15 @@ show "$data/dbus-1/services/org.freedesktop.secrets.service" 'SystemdService=' '
 show /usr/share/dbus-1/services/org.freedesktop.secrets.service 'Exec='
 show "$config/autostart/gnome-keyring-secrets.desktop" 'Hidden='
 show /etc/xdg/autostart/gnome-keyring-secrets.desktop 'Exec='
+show "$data/dbus-1/services/$portal_name.service" 'SystemdService='
+show "$data/xdg-desktop-portal/portals/scopevault.portal" 'DBusName=' 'Interfaces='
+show "$config/xdg-desktop-portal/gnome-portals.conf" 'default=' 'org.freedesktop.impl.portal.Secret='
+show /usr/share/xdg-desktop-portal/gnome-portals.conf 'default=' 'org.freedesktop.impl.portal.Secret='
+# xdg-desktop-portal reads the user file first; without a default= line,
+# interfaces it does not name fall through to the system files.
+portal_selected=
+grep -qs '^org.freedesktop.impl.portal.Secret=scopevault' "$config/xdg-desktop-portal/gnome-portals.conf" \
+    && portal_selected=yes
 
 echo
 echo "-- the systemd units"
@@ -132,6 +178,8 @@ elif ! printf '%s' "$owner_cmd" | grep -q scopevault-daemon; then
     reason="org.freedesktop.secrets is served by something else: $owner_cmd"
 elif [ -n "$queued" ]; then
     reason="$(describe "$(printf '%s\n' "$queued" | sed -n 1p)") is queued for org.freedesktop.secrets and takes the name if scopevault exits"
+elif [ -n "$portal_selected" ] && ! printf '%s' "$portal_owner_cmd" | grep -q scopevault-daemon; then
+    reason="the portal configuration selects scopevault, but $portal_name is not owned by scopevault-daemon"
 fi
 if [ -z "$reason" ]; then
     echo "scopevault serves the Secret Service"

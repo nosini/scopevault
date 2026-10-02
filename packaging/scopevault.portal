@@ -1,0 +1,8 @@
+# Declares scopevault as a Secret portal backend. Install as
+# ~/.local/share/xdg-desktop-portal/portals/scopevault.portal.
+# xdg-desktop-portal reads this directory before the system ones. This file
+# only makes the backend known; gnome-portals.conf selects it. No UseIn key:
+# it is chosen by that configuration, never by the deprecated fallback.
+[portal]
+DBusName=page.codeberg.nosini.ScopeVault.Portal
+Interfaces=org.freedesktop.impl.portal.Secret

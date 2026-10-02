@@ -21,8 +21,15 @@ lines where it belongs:
 ```sh
 install -D -m 644 packaging/scopevault.service ~/.config/systemd/user/scopevault.service
 install -D -m 644 packaging/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
+install -D -m 644 packaging/page.codeberg.nosini.ScopeVault.Portal.service ~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service
 install -D -m 644 packaging/gnome-keyring-secrets.desktop ~/.config/autostart/gnome-keyring-secrets.desktop
+install -D -m 644 packaging/scopevault.portal ~/.local/share/xdg-desktop-portal/portals/scopevault.portal
+install -D -m 644 packaging/gnome-portals.conf ~/.config/xdg-desktop-portal/gnome-portals.conf
 ```
+
+If you already have a `~/.config/xdg-desktop-portal/gnome-portals.conf`,
+add the `org.freedesktop.impl.portal.Secret=scopevault` line to its
+`[preferred]` group instead of replacing the file.
 
 What they do:
 
@@ -34,6 +41,12 @@ What they do:
   your own services directory win over the ones in `/usr/share`.
 - `gnome-keyring-secrets.desktop` hides the autostart entry that would
   start gnome-keyring's Secret Service.
+- `scopevault.portal` and `gnome-portals.conf` make scopevault the Secret
+  portal backend, which hands Flatpak apps the keys they encrypt their own
+  files with. Your `gnome-portals.conf` only names the Secret portal;
+  everything else still comes from the system's configuration. The
+  backend has its own bus name, `page.codeberg.nosini.ScopeVault.Portal`, and
+  its activation file starts the same unit.
 
 gnome-keyring's own systemd user units get masked as well. They are
 disabled by default, but a single `systemctl --user restart
@@ -86,7 +99,8 @@ name, and it exits after two minutes.
    ```
 
 5. Log out and back in. gnome-keyring keeps the name until the end of the
-   current session; at the next login scopevault takes it.
+   current session; at the next login scopevault takes it, and
+   xdg-desktop-portal reads its new configuration.
 
 ## Checking it
 
@@ -94,6 +108,13 @@ name, and it exits after two minutes.
   Secret Service".
 - `secret-tool lookup` with the attributes of an item you know opens
   scopevault's unlock dialog and returns the secret.
+- Flatpak apps that use the Secret portal still open their data. If one
+  can't, the daemon's log says why. "The application has a keyring file
+  of its own" means its key wasn't imported; `scopevault-admin portal
+  new-key APP-ID` gives it a new one, but its old file can't be read
+  after that. "Neither imported nor initialised" means no import ran.
+  `scopevault-admin list portal` shows which apps have keys, without the
+  keys.
 - The daemon logs to the journal: `journalctl --user -u scopevault`.
 
 On a desktop that never had gnome-keyring, run `scopevault-admin portal
@@ -119,9 +140,12 @@ and back in. Don't restart scopevault while something is queued.
 The order matters. As long as the D-Bus activation file is installed, any
 request for the name starts scopevault again, and the export would end up
 writing into scopevault itself.
+Keep the portal configuration until step 4: while it is in place and
+scopevault is stopped, portal requests fail, instead of gnome-keyring
+creating new keys that would clash with the ones you export.
 
 1. Disable the units, unmask gnome-keyring's, and remove the files you
-   installed. dbus-broker only reads service files when asked to, so reload it
+   installed (except the two portal files). dbus-broker only reads service files when asked to, so reload it
    along with systemd:
 
    ```sh
@@ -145,7 +169,21 @@ writing into scopevault itself.
    It writes the items gnome-keyring doesn't have and skips the ones it
    has.
 
-4. Log out and back in. The vault stays in `~/.local/share/scopevault`
+   If apps got new portal keys from scopevault, export those as well:
+
+   ```sh
+   scopevault-admin export --scope portal --pinentry /usr/bin/pinentry-gnome3
+   ```
+
+   They go into gnome-keyring's default collection, where its portal
+   backend looks for them. If gnome-keyring already has a different key
+   for one of the apps, nothing is written.
+
+4. Remove `~/.local/share/xdg-desktop-portal/portals/scopevault.portal`
+   and the Secret line in `~/.config/xdg-desktop-portal/gnome-portals.conf`,
+   or the whole file if nothing else is in it.
+
+5. Log out and back in. The vault stays in `~/.local/share/scopevault`
    until you delete it.
 
 ## Backups
@@ -153,3 +191,6 @@ writing into scopevault itself.
 `scopevault-admin backup FILE` writes an encrypted copy of the vault while
 the daemon runs. It opens with the master password you have at that
 moment. `scopevault-admin restore` needs the daemon stopped.
+The portal keys are in the vault and therefore in its backups, but the
+files they decrypt stay in `~/.var/app/<app-id>/`. Back those up as well,
+and restore them together with the vault.
