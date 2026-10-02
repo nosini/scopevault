@@ -114,3 +114,13 @@ and exports everything back.
 `scripts/activation-check.sh` is read-only. It shows who serves the
 Secret Service in your real session, what is queued for the name, and
 which files decide that.
+
+### The Secret portal
+
+`scripts/host-portal-check.sh APP_ID` runs the real xdg-desktop-portal on
+a private bus, first with gnome-keyring as the portal backend: the app
+stores a value with its own libsecret. Then the key is imported,
+gnome-keyring stops, scopevault takes over as the backend, and the app has
+to read the old value and store a new one. The app's keyring file is
+redirected into a temporary directory, and its real data is checked to be
+unchanged at the end.
