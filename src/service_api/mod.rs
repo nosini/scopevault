@@ -2,7 +2,8 @@
 
 pub mod dispatch;
 pub mod interfaces;
-pub mod model;
+pub mod methods;
 pub mod paths;
+pub mod transfer;
 
 pub use dispatch::SecretService;

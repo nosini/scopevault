@@ -82,7 +82,8 @@ async fn real_identity_scopes_host_and_flatpak_callers() {
         policy: IdentityPolicy::default(),
     };
     let resolver = BusIdentityResolver::new(&conn, classifier).await.unwrap();
-    let service = SecretService::new(conn.clone(), resolver);
+    let vault = common::VaultFixture::new(common::VaultState::Unlocked);
+    let service = SecretService::new(conn.clone(), resolver, vault.unlocker.clone());
     tokio::spawn(service.clone().start().await.unwrap());
     conn.request_name(DEST).await.unwrap();
 

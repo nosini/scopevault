@@ -13,9 +13,10 @@ including the passwords of all other apps.
 
 ## Status
 
-This is early work. scopevault can tell Flatpak apps from host programs
-and has an encrypted vault with a password dialog, but the Secret Service
-itself doesn't use the vault yet, and there is no daemon to run.
+The daemon implements the whole Secret Service API on an encrypted vault,
+and works with libsecret, `secret-tool`, Seahorse and Python's
+`secretstorage`. It can be tried on a private bus, but there is no
+installation or migration from gnome-keyring yet.
 
 It is written in Rust and needs a session bus that hands out process file
 descriptors, which dbus-broker does.

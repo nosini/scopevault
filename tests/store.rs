@@ -428,3 +428,43 @@ fn concurrent_writes_and_replacement() {
     assert_eq!(s.collection(&c).unwrap().items.len(), 1 + 8 * 20);
     assert_eq!(s.search(&attrs(&[("id", "shared")])).len(), 1);
 }
+
+#[test]
+fn session_collection_is_memory_only() {
+    let tmp = TempDir::new("store");
+    let dir = vault_dir(&tmp);
+    let p = app("org.example.Session");
+    let mut v = Vault::create(&dir, PW, KDF).unwrap();
+    let (persistent, session);
+    {
+        let mut s = v.scoped(&p).unwrap();
+        persistent = s.create_collection("session", "default").unwrap().0;
+        assert_ne!(persistent, "session", "the name is reserved for the ephemeral collection");
+        session = s.create_collection("Temporary", "session").unwrap().0;
+        assert_eq!(session, "session");
+        assert_eq!(s.alias("session").as_deref(), Some("session"));
+        let (i, _) = s
+            .create_item(
+                &session,
+                "EPHEMERALLABEL",
+                attrs(&[("k", "EPHEMERALATTR")]),
+                &Secret::new("EPHEMERALSECRET", ""),
+                false,
+            )
+            .unwrap();
+        assert_eq!(&s.read_secret(&session, &i).unwrap().value[..], b"EPHEMERALSECRET");
+        s.set_secret(&session, &i, &Secret::new("EPHEMERALSECRET2", "")).unwrap();
+        s.set_item_label(&session, &i, "EPHEMERALLABEL2").unwrap();
+        assert_eq!(s.search(&attrs(&[("k", "EPHEMERALATTR")])).len(), 1);
+    }
+    let needles: [&[u8]; 3] = [b"EPHEMERAL", b"Temporary", b"session\""];
+    assert_eq!(scan_for(&dir, &needles), Vec::<String>::new());
+
+    // Global lock discards it; the persistent collection and alias survive.
+    v.lock();
+    v.unlock(PW).unwrap();
+    let s = v.scoped(&p).unwrap();
+    assert_eq!(s.collection_names(), vec![persistent.clone()]);
+    assert!(s.alias("session").is_none());
+    assert_eq!(s.alias("default"), Some(persistent));
+}

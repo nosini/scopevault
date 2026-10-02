@@ -7,113 +7,15 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::VaultState;
+use common::service::*;
 use futures_util::StreamExt;
-use scopevault::identity::{AppId, CallerResolver, IdentityError, Principal, Resolved};
-use scopevault::service_api::SecretService;
+use scopevault::identity::Principal;
 use zbus::message::{Message, Type as MessageType};
-use zbus::names::{OwnedUniqueName, UniqueName};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MessageStream};
-
-const DEST: &str = "org.freedesktop.secrets";
-const SERVICE: &str = "/org/freedesktop/secrets";
-const SVC_IFACE: &str = "org.freedesktop.Secret.Service";
-const COL_IFACE: &str = "org.freedesktop.Secret.Collection";
-const PROPS: &str = "org.freedesktop.DBus.Properties";
-
-/// Test-only identity: a fixed table filled in by the test.
-#[derive(Default)]
-struct FixedResolver(Mutex<HashMap<OwnedUniqueName, Principal>>);
-
-impl CallerResolver for FixedResolver {
-    async fn resolve(&self, sender: &UniqueName<'_>) -> Resolved {
-        let key = OwnedUniqueName::from(sender.to_owned());
-        Arc::new(match self.0.lock().unwrap().get(&key) {
-            Some(p) => Ok(p.clone()),
-            None => Err(IdentityError::NotHost("unknown test caller".into())),
-        })
-    }
-}
-
-fn flatpak(id: &str) -> Principal {
-    Principal::Flatpak { app_id: AppId::parse(id).unwrap(), instance_id: "1".into(), risks: Default::default() }
-}
-
-struct Fixture {
-    service: Arc<SecretService<FixedResolver>>,
-    resolver: Arc<FixedResolver>,
-    bus: Arc<common::TestBus>,
-}
-
-async fn fixture() -> (Fixture, Arc<common::TestBus>) {
-    let bus = Arc::new(common::TestBus::start());
-    let conn = bus.connect().await;
-    let resolver = Arc::new(FixedResolver::default());
-    let service = SecretService::new(conn.clone(), resolver.clone());
-    let serving = service.clone().start().await.unwrap();
-    tokio::spawn(serving);
-    conn.request_name(DEST).await.unwrap();
-    (Fixture { service, resolver, bus: bus.clone() }, bus)
-}
-
-impl Fixture {
-    async fn client(&self, who: Option<Principal>) -> Connection {
-        let c = self.bus.connect().await;
-        if let Some(p) = who {
-            self.resolver.0.lock().unwrap().insert(c.unique_name().unwrap().clone(), p);
-        }
-        c
-    }
-}
-
-async fn call<B>(c: &Connection, path: &str, iface: &str, method: &str, body: &B) -> Result<Message, (String, String)>
-where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
-{
-    match c.call_method(Some(DEST), path, Some(iface), method, body).await {
-        Ok(m) => Ok(m),
-        Err(zbus::Error::MethodError(name, msg, _)) => Err((name.to_string(), msg.unwrap_or_default())),
-        Err(e) => panic!("transport error: {e}"),
-    }
-}
-
-async fn get(c: &Connection, path: &str, iface: &str, prop: &str) -> Result<OwnedValue, (String, String)> {
-    let m = call(c, path, PROPS, "Get", &(iface, prop)).await?;
-    let (v,): (OwnedValue,) = m.body().deserialize().unwrap();
-    Ok(v)
-}
-
-async fn collections(c: &Connection) -> Vec<String> {
-    let v = get(c, SERVICE, SVC_IFACE, "Collections").await.unwrap();
-    let paths: Vec<OwnedObjectPath> = v.try_into().unwrap();
-    let mut s: Vec<String> = paths.into_iter().map(|p| p.to_string()).collect();
-    s.sort();
-    s
-}
-
-async fn create_collection(c: &Connection, label: &str, alias: &str) -> String {
-    let mut props: HashMap<&str, Value> = HashMap::new();
-    props.insert("org.freedesktop.Secret.Collection.Label", Value::from(label));
-    let m = call(c, SERVICE, SVC_IFACE, "CreateCollection", &(props, alias)).await.unwrap();
-    let (col, prompt): (OwnedObjectPath, OwnedObjectPath) = m.body().deserialize().unwrap();
-    assert_eq!(prompt.as_str(), "/");
-    col.to_string()
-}
-
-async fn introspect_children(c: &Connection, path: &str) -> Result<Vec<String>, (String, String)> {
-    let m = call(c, path, "org.freedesktop.DBus.Introspectable", "Introspect", &()).await?;
-    let (xml,): (String,) = m.body().deserialize().unwrap();
-    let mut names: Vec<String> = xml
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("<node name=\"").and_then(|r| r.strip_suffix("\"/>")))
-        .map(String::from)
-        .collect();
-    names.sort();
-    Ok(names)
-}
 
 /// Collects signals sent to `c` by `from` during `wait`.
 async fn signals_during(c: &Connection, from: &str, wait: Duration) -> Vec<(String, String, String)> {
@@ -137,7 +39,7 @@ async fn signals_during(c: &Connection, from: &str, wait: Duration) -> Vec<(Stri
 
 #[tokio::test(flavor = "multi_thread")]
 async fn collections_and_aliases_are_scoped() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let a = fx.client(Some(flatpak("org.example.A"))).await;
     let b = fx.client(Some(flatpak("org.example.B"))).await;
     let host = fx.client(Some(Principal::Host)).await;
@@ -181,7 +83,7 @@ async fn collections_and_aliases_are_scoped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_paths_are_indistinguishable_from_missing_ones() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let a = fx.client(Some(flatpak("org.example.A"))).await;
     let b = fx.client(Some(flatpak("org.example.B"))).await;
     let foreign = create_collection(&a, "Secret Project", "work").await;
@@ -224,7 +126,7 @@ async fn foreign_paths_are_indistinguishable_from_missing_ones() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn introspection_is_scoped() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let a = fx.client(Some(flatpak("org.example.A"))).await;
     let b = fx.client(Some(flatpak("org.example.B"))).await;
     create_collection(&a, "Alpha", "default").await;
@@ -241,7 +143,7 @@ async fn introspection_is_scoped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn signals_reach_only_the_owning_scope() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let a1 = fx.client(Some(flatpak("org.example.A"))).await;
     let a2 = fx.client(Some(flatpak("org.example.A"))).await;
     let b = fx.client(Some(flatpak("org.example.B"))).await;
@@ -272,7 +174,7 @@ async fn signals_reach_only_the_owning_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unidentified_callers_are_denied_everything() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let stranger = fx.client(None).await;
     for (path, iface, method) in [
         (SERVICE, "org.freedesktop.DBus.Introspectable", "Introspect"),
@@ -288,7 +190,7 @@ async fn unidentified_callers_are_denied_everything() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_requests_are_rejected() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let a = fx.client(Some(flatpak("org.example.A"))).await;
     let e = call(&a, SERVICE, SVC_IFACE, "ReadAlias", &(42u32,)).await.unwrap_err();
     assert_eq!(e.0, "org.freedesktop.DBus.Error.InvalidArgs");
@@ -309,7 +211,7 @@ async fn malformed_requests_are_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_one_reply_per_call_and_disconnects_are_forgotten() {
-    let (fx, _bus) = fixture().await;
+    let fx = fixture(VaultState::Unlocked).await;
     let a = fx.client(Some(flatpak("org.example.A"))).await;
     let mut stream = MessageStream::from(&a);
     let msg = Message::method_call(SERVICE, "ReadAlias")
@@ -340,12 +242,4 @@ async fn exactly_one_reply_per_call_and_disconnects_are_forgotten() {
     drop(extra);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(fx.service.active_connections(), before);
-}
-
-impl Fixture {
-    async fn service_name(&self) -> String {
-        let c = self.bus.connect().await;
-        let dbus = zbus::fdo::DBusProxy::new(&c).await.unwrap();
-        dbus.get_name_owner(DEST.try_into().unwrap()).await.unwrap().to_string()
-    }
 }

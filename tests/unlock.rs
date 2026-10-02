@@ -175,4 +175,6 @@ async fn missing_pinentry_fails_cleanly() {
     let config = PinentryConfig { program: "/nonexistent/pinentry".into(), timeout: Duration::from_secs(5) };
     let u = Unlocker::new(slot, config, KdfParams::MINIMUM);
     assert!(matches!(u.ensure_unlocked(&app()).await, UnlockOutcome::Failed(_)));
+    // Automatic unlocks then pause instead of retrying a broken dialog.
+    assert_eq!(u.ensure_unlocked_implicit(&app()).await, UnlockOutcome::Cancelled);
 }

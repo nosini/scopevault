@@ -18,9 +18,15 @@ Those simulated sandboxes copy Flatpak's mechanisms, namespaces,
 `/.flatpak-info` and instance records, not Flatpak itself. That is why
 the scripts below check the same things against real Flatpak apps.
 
+`tests/libsecret.rs` drives the daemon with libsecret's `secret-tool` and
+is skipped when `secret-tool` isn't installed.
+
 ## Checks on a real desktop
 
 These checks run against real programs but leave your keyring alone.
+Apart from the identity probe, each script starts its own private
+dbus-broker bus with a temporary vault. dbus-broker is needed because
+openSUSE's `dbus-daemon` doesn't report `ProcessFD`.
 
 ### Identity probe
 
@@ -38,3 +44,17 @@ Pick two installed Flatpak apps (`flatpak list --app`). The script runs
 `gdbus` inside each app's sandbox with a one-off permission to talk to the
 probe. The apps themselves are not started, and their permissions are not
 changed.
+
+### libsecret and Seahorse
+
+```sh
+cargo build --bins
+./scripts/host-libsecret-check.sh          # scripted dialogs
+./scripts/host-libsecret-check.sh --real   # real pinentry dialogs
+```
+
+This runs `secret-tool` store, lookup, search, clear, lock, a restart and
+a cancelled unlock. With `--seahorse` it opens Seahorse on the same
+private bus afterwards. `scripts/interop-secretstorage.sh` does the same
+with Python's `secretstorage` library; set `PYTHON` to an interpreter that
+has it.

@@ -147,6 +147,41 @@ and routes them by the caller's scope:
 - One table drives both argument checking and introspection, and a test
   compares it with the upstream interface description in `spec/`.
 
+Every method of the specification is implemented: Service, Collection,
+Item, Session and Prompt, on the encrypted vault.
+
+- Transfer sessions support `plain` and
+  `dh-ietf1024-sha256-aes128-cbc-pkcs7`, the encrypted one libsecret
+  negotiates. Degenerate public keys are refused.
+- A session or prompt belongs to the connection that opened it. Another
+  connection, even of the same app, cannot use it.
+- Each scope can have a `session` collection that lives in memory only.
+- When a prompt is dismissed, the result still has the type the client
+  expects. gnome-keyring returns an empty string there, which trips up
+  libsecret and Python's `secretstorage`.
+- Unlocking with a prompt lists all the requested objects that ended up
+  unlocked, because libsecret only looks at the prompt's result.
+- `GetSecrets` answers with the paths the client sent, aliases included,
+  because libsecret looks results up by its own item paths.
+
+## Locking and unlocking
+
+The vault is one encrypted file with one master password. Unlocking it
+gives the daemon the key; it does not change who may see what. An app
+still only sees its own scope.
+
+When an app asks for something while the vault is locked, the daemon opens
+the unlock dialog. Concurrent requests share one dialog. `CreateItem` is
+the exception: it answers `IsLocked`, because libsecret then unlocks and
+retries by itself.
+After a dialog was cancelled or failed, requests that would open another
+one fail at once for 30 seconds, so an app retrying in a loop cannot keep
+the dialog coming back. An explicit unlock prompt still shows it.
+
+An app can lock its own collections. That locks them for every connection
+of its scope, and reading secrets from them then needs the master password
+again. Other collections and other scopes are not affected.
+
 ## What scopevault does not protect against
 
 - Host code running as your user, or root. It can read the daemon's
@@ -156,3 +191,18 @@ and routes them by the caller's scope:
 - Flatpak apps with permissions that escape the sandbox (see above).
 - Rolling the vault file back to an older copy, and secrets surviving in
   old backups or snapshots. See [STORE.md](STORE.md).
+
+## Compatibility notes
+
+- libsecret reads all of the service's properties as soon as a client
+  connects, so with a locked vault, merely connecting opens the dialog.
+- `secret-tool lock` depends on the libsecret version: before 0.21.8 it
+  takes a collection name rather than a path and can hang, and before
+  0.21.3 it can crash.
+- Collections created by libsecret are labelled "Default keyring", so
+  their path is `/collection/default_keyring`. Clients reach them through
+  the `default` alias.
+- The bus must report `ProcessFD`. dbus-broker does. dbus-daemon only does
+  from 1.15.8 on, and only when built where `SO_PEERPIDFD` is defined;
+  openSUSE's `dbus-daemon` does not. On a bus without it every caller is
+  refused.

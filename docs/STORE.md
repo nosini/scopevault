@@ -19,6 +19,8 @@ same. Changing the password wraps the same vault key again with a fresh
 salt; the records themselves are not re-encrypted.
 
 The default cost is 256 MiB of memory, 3 passes and 1 lane.
+When the daemon creates a vault, it measures the machine and picks the
+number of passes so that unlocking takes about a second.
 Whatever the header says, the parameters must stay within fixed bounds
 (19 MiB to 2 GiB, 1 to 20 passes, 1 to 16 lanes), so a tampered or
 imported vault cannot make the daemon allocate unbounded memory or run for
@@ -53,7 +55,8 @@ Secrets are only decrypted when one is read.
 
 ## On disk
 
-The vault lives in a directory chosen by its user.
+The vault lives in `$XDG_DATA_HOME/scopevault` unless the daemon is given
+`--data-dir`.
 The directory must be a real directory, not a symlink, owned by you and
 closed to everyone else. It holds `vault.db` with SQLite's `-wal` and
 `-shm` files, all mode 0600, and a `lock` file whose exclusive `flock`
@@ -95,6 +98,13 @@ whole vault is locked anyway.
 
 Unlocking never changes who may see what.
 
+## The `session` collection
+
+Each scope can have one collection under the alias and name `session`. It
+lives in memory only: neither it nor its items or secrets are ever written
+to disk, and it is gone after a global lock or a restart. A stored
+collection with that name counts as corruption.
+
 ## The unlock dialog
 
 The daemon runs `pinentry` as a child process and reads the password from
@@ -105,6 +115,9 @@ that depends on the request is the scope, which comes from identification.
 App-supplied labels are never shown.
 
 - Only one dialog at a time; concurrent requests wait for it.
+- After a cancelled or failed dialog, requests that did not explicitly ask
+  for one fail at once for 30 seconds, so an app retrying in a loop cannot
+  bring the dialog back. Explicit unlock prompts still show it.
 - When every waiting request has gone away, pinentry is killed.
 - Three wrong passwords count as a cancel.
 - Without a vault, the dialog asks for a new password twice and creates
@@ -118,6 +131,18 @@ A process that holds the vault calls `harden_process()` first: it sets the
 umask to 077, turns off core dumps and makes the process non-dumpable, so
 other processes of the same user cannot attach to it or read its memory
 through `/proc`.
+
+## Limits
+
+| What | Limit |
+| --- | --- |
+| Collections per scope | 256 |
+| Items per collection | 10 000 |
+| Aliases per scope | 64 |
+| Label | 4 KiB |
+| Attributes per item | 64, each name up to 256 bytes and value up to 4 KiB |
+| Secret | 512 KiB |
+| Content type | 128 bytes |
 
 ## What this does not protect against
 

@@ -1,11 +1,14 @@
 [package]
 name = "scopevault"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
+aes = { version = "=0.9.3", features = ["zeroize"] }
 argon2 = { version = "=0.6.0", features = ["zeroize"] }
+cbc = { version = "=0.2.1", features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+crypto-bigint = { version = "=0.7.5", features = ["zeroize"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
 hkdf = "=0.13.0"

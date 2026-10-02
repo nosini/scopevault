@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
@@ -26,6 +27,10 @@ use crate::identity::Scope;
 use crate::store::{StoreError, Vault};
 
 pub const MAX_ATTEMPTS: usize = 3;
+/// After a cancelled or failed dialog, automatic unlock attempts (requests
+/// that need the vault but did not ask for a prompt) fail at once for this
+/// long, so an app retrying in a loop cannot reopen the dialog over and over.
+pub const IMPLICIT_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// The vault, or the place where it will be created.
 pub struct VaultSlot {
@@ -70,6 +75,10 @@ pub struct Unlocker {
     new_vault_kdf: KdfParams,
     flight: Mutex<Option<Flight>>,
     next_id: AtomicU64,
+    /// Held while any dialog is shown, so dialogs never overlap.
+    dialog_gate: tokio::sync::Mutex<()>,
+    cooldown_until: Mutex<Option<Instant>>,
+    unlocked_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 /// Drops one waiter; the last one out cancels the dialog.
@@ -101,11 +110,25 @@ fn display(scope: &Scope) -> String {
 
 impl Unlocker {
     pub fn new(vault: SharedVault, pinentry: PinentryConfig, new_vault_kdf: KdfParams) -> Arc<Self> {
-        Arc::new(Unlocker { vault, pinentry, new_vault_kdf, flight: Mutex::new(None), next_id: AtomicU64::new(1) })
+        Arc::new(Unlocker {
+            vault,
+            pinentry,
+            new_vault_kdf,
+            flight: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+            dialog_gate: tokio::sync::Mutex::new(()),
+            cooldown_until: Mutex::new(None),
+            unlocked_tx: tokio::sync::broadcast::channel(4).0,
+        })
     }
 
     pub fn vault(&self) -> &SharedVault {
         &self.vault
+    }
+
+    /// Notified each time a dialog unlocks (or creates) the vault.
+    pub fn subscribe_unlocked(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.unlocked_tx.subscribe()
     }
 
     /// Returns once the vault is unlocked, the user cancelled, or unlocking
@@ -146,12 +169,76 @@ impl Unlocker {
             Err(_) => UnlockOutcome::Cancelled,
         };
         drop(guard);
+        // A failing dialog (pinentry missing or unable to show) pauses
+        // automatic unlocks too; otherwise every request would start
+        // another pinentry at once.
+        if outcome != UnlockOutcome::Unlocked {
+            *self.cooldown_until.lock().unwrap() = Some(Instant::now() + IMPLICIT_COOLDOWN);
+        }
         outcome
     }
 
+    /// Like [`Unlocker::ensure_unlocked`], for requests that need the vault
+    /// without having asked for a prompt. Shortly after a cancelled or failed
+    /// dialog it returns `Cancelled` without showing another one.
+    pub async fn ensure_unlocked_implicit(self: &Arc<Self>, requester: &Scope) -> UnlockOutcome {
+        if self.vault.lock().unwrap().is_unlocked() {
+            return UnlockOutcome::Unlocked;
+        }
+        if self.cooldown_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
+            return UnlockOutcome::Cancelled;
+        }
+        self.ensure_unlocked(requester).await
+    }
+
+    /// Asks for the master password and checks it, without changing the
+    /// vault. Used to reopen a collection its owner locked while the vault
+    /// stays unlocked. Dropping the future closes the dialog.
+    pub async fn confirm_password(self: &Arc<Self>, requester: &Scope) -> UnlockOutcome {
+        let _gate = self.dialog_gate.lock().await;
+        let who = display(requester);
+        let mut error = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let req = PinRequest {
+                title: "Unlock collection".into(),
+                description: format!(
+                    "{who} wants to unlock one of its locked collections. Enter your keyring password to allow it."
+                ),
+                prompt: "Password:".into(),
+                error: error.take(),
+                repeat: None,
+            };
+            let password = match pinentry::ask(&self.pinentry, &req).await {
+                Ok(PinOutcome::Entered(p)) => p,
+                Ok(PinOutcome::Cancelled) => return UnlockOutcome::Cancelled,
+                Err(e) => return UnlockOutcome::Failed(e.to_string()),
+            };
+            let wrap = match self.vault.lock().unwrap().vault.as_ref().map(Vault::key_wrap) {
+                Some(Ok(w)) => w,
+                Some(Err(e)) => return UnlockOutcome::Failed(e.to_string()),
+                None => return UnlockOutcome::Failed("no vault".into()),
+            };
+            match tokio::task::spawn_blocking(move || VaultKey::unwrap(&wrap, password.as_bytes()).map(drop)).await {
+                Ok(Ok(())) => return UnlockOutcome::Unlocked,
+                Ok(Err(crate::crypto::CryptoError::Unwrap)) => error = Some("Wrong password. Try again.".into()),
+                Ok(Err(e)) => return UnlockOutcome::Failed(e.to_string()),
+                Err(e) => return UnlockOutcome::Failed(e.to_string()),
+            }
+        }
+        UnlockOutcome::Cancelled
+    }
+
     async fn dialog(&self, who: &str) -> UnlockOutcome {
+        let _gate = self.dialog_gate.lock().await;
+        if self.vault.lock().unwrap().is_unlocked() {
+            return UnlockOutcome::Unlocked;
+        }
         let exists = self.vault.lock().unwrap().vault.is_some();
-        if exists { self.unlock_dialog(who).await } else { self.create_dialog(who).await }
+        let outcome = if exists { self.unlock_dialog(who).await } else { self.create_dialog(who).await };
+        if outcome == UnlockOutcome::Unlocked {
+            let _ = self.unlocked_tx.send(());
+        }
+        outcome
     }
 
     async fn unlock_dialog(&self, who: &str) -> UnlockOutcome {

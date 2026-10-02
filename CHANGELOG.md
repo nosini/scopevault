@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- The daemon: the complete Secret Service API on the encrypted vault,
+  with plain and encrypted transfer sessions, prompts and per-collection
+  locking.
+
 ## 0.2.0
 
 - The encrypted vault: Argon2id and XChaCha20-Poly1305 in SQLite, with a

@@ -1,0 +1,498 @@
+//! The full Secret Service API on the encrypted store, on a private
+//! bus, with `tests/support/fake-pinentry.sh` answering dialogs.
+//!
+//! Identity comes from a fixed table (see `common::service`); everything
+//! after identification is production code.
+
+mod common;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
+
+use common::service::*;
+use common::{PASSWORD, VaultFixture, VaultState};
+use scopevault::identity::Principal;
+use scopevault::service_api::dispatch::{MAX_PROMPTS_PER_CONNECTION, MAX_SESSIONS_PER_CONNECTION};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+
+const IS_LOCKED: &str = "org.freedesktop.Secret.Error.IsLocked";
+const NO_SESSION: &str = "org.freedesktop.Secret.Error.NoSession";
+const UNKNOWN_OBJECT: &str = "org.freedesktop.DBus.Error.UnknownObject";
+
+fn app_a() -> Principal {
+    flatpak("org.example.A")
+}
+
+fn app_b() -> Principal {
+    flatpak("org.example.B")
+}
+
+fn paths_of(v: OwnedValue) -> Vec<String> {
+    strings(v.try_into().unwrap())
+}
+
+async fn locked_prop(c: &zbus::Connection, path: &str, iface: &str) -> bool {
+    get(c, path, iface, "Locked").await.unwrap().try_into().unwrap()
+}
+
+/// Waits until the current dialog asks for a password; returns its PID.
+async fn dialog_waiting(v: &VaultFixture, dialogs: usize) -> i32 {
+    for _ in 0..250 {
+        if v.dialogs() >= dialogs && v.log().matches("GETPIN").count() >= dialogs {
+            return v.pinentry_pid().unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no dialog appeared: {}", v.log());
+}
+
+async fn process_gone(pid: i32) -> bool {
+    for _ in 0..150 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z") {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn item_lifecycle_with_plain_and_dh_sessions() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let a2 = fx.client(Some(app_a())).await;
+    collections(&a2).await;
+    let from = fx.service_name().await;
+    let col = create_collection(&a, "Login", "default").await;
+
+    for (n, dh) in [(0, false), (1, true)] {
+        let s = if dh { ClientSession::dh(&a).await } else { ClientSession::plain(&a).await };
+        let secrets: [&[u8]; 3] = [b"", "p\u{e4}ssw\u{f6}rd \u{1f511}".as_bytes(), &[0, 255, 1, 254, 0, 0, 7]];
+        for (k, secret) in secrets.iter().enumerate() {
+            let tag = format!("{n}-{k}");
+            let log = SignalLog::start(&a2, &from);
+            let item =
+                create_item(&a, &col, &s, "Entry", &[("user", "alice"), ("tag", &tag)], secret, true).await.unwrap();
+            assert!(item.starts_with(&format!("{col}/")), "items are children of their collection");
+            assert_eq!(get_secret(&a, &item, &s).await.unwrap(), (secret.to_vec(), "text/plain".into()));
+            assert!(log.wait_for(&col, "ItemCreated", Duration::from_secs(2)).await.is_some(), "{:?}", log.names());
+
+            // Found by attributes, through the service and the collection.
+            assert_eq!(search(&a, &[("tag", &tag)]).await.unwrap(), (vec![item.clone()], vec![]));
+            let attrs: HashMap<&str, &str> = [("tag", tag.as_str())].into();
+            let m = call(&a, &col, COL_IFACE, "SearchItems", &(attrs,)).await.unwrap();
+            let (found,): (Vec<OwnedObjectPath>,) = m.body().deserialize().unwrap();
+            assert_eq!(strings(found), std::slice::from_ref(&item));
+
+            // GetSecrets: keyed by the path the client used; unknown paths skipped.
+            let alias_path = item.replace("/collection/login/", "/aliases/default/");
+            let m = call(
+                &a,
+                SERVICE,
+                SVC_IFACE,
+                "GetSecrets",
+                &(vec![obj(&item), obj(&alias_path), obj(&format!("{col}/ffff"))], &s.path),
+            )
+            .await
+            .unwrap();
+            let (map,): (HashMap<OwnedObjectPath, WireSecret>,) = m.body().deserialize().unwrap();
+            assert_eq!(map.len(), 2);
+            assert_eq!(s.decode(&map[&obj(&alias_path)]).0, secret.to_vec());
+
+            // Replacing an item with the same attributes keeps its path.
+            let same =
+                create_item(&a, &col, &s, "Entry", &[("user", "alice"), ("tag", &tag)], b"new", true).await.unwrap();
+            assert_eq!(same, item);
+            assert_eq!(get_secret(&a, &item, &s).await.unwrap().0, b"new");
+            let other =
+                create_item(&a, &col, &s, "Entry", &[("user", "alice"), ("tag", &tag)], b"x", false).await.unwrap();
+            assert_ne!(other, item);
+            call(&a, &other, ITEM_IFACE, "Delete", &()).await.unwrap();
+
+            // SetSecret, Label, Attributes.
+            call(&a, &item, ITEM_IFACE, "SetSecret", &(s.encode(secret, "application/octet-stream"),)).await.unwrap();
+            assert_eq!(get_secret(&a, &item, &s).await.unwrap(), (secret.to_vec(), "application/octet-stream".into()));
+            call(&a, &item, PROPS, "Set", &(ITEM_IFACE, "Label", Value::from("Renamed"))).await.unwrap();
+            let label: String = get(&a, &item, ITEM_IFACE, "Label").await.unwrap().try_into().unwrap();
+            assert_eq!(label, "Renamed");
+            let new_attrs: HashMap<&str, &str> = [("tag", "changed")].into();
+            call(&a, &item, PROPS, "Set", &(ITEM_IFACE, "Attributes", Value::from(new_attrs))).await.unwrap();
+            assert_eq!(search(&a, &[("tag", &tag)]).await.unwrap().0, Vec::<String>::new());
+            assert_eq!(search(&a, &[("tag", "changed")]).await.unwrap().0, std::slice::from_ref(&item));
+            let e = call(&a, &item, PROPS, "Set", &(ITEM_IFACE, "Attributes", Value::from("x"))).await.unwrap_err();
+            assert_eq!(e.0, "org.freedesktop.DBus.Error.InvalidArgs");
+
+            // Delete.
+            let log = SignalLog::start(&a2, &from);
+            call(&a, &item, ITEM_IFACE, "Delete", &()).await.unwrap();
+            assert_eq!(get_secret(&a, &item, &s).await.unwrap_err().0, UNKNOWN_OBJECT);
+            assert!(!paths_of(get(&a, &col, COL_IFACE, "Items").await.unwrap()).contains(&item));
+            assert!(log.wait_for(&col, "ItemDeleted", Duration::from_secs(2)).await.is_some());
+        }
+    }
+
+    // Collection deletion takes its items and aliases with it.
+    call(&a, &col, COL_IFACE, "Delete", &()).await.unwrap();
+    assert!(collections(&a).await.is_empty());
+    let m = call(&a, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap();
+    assert_eq!(m.body().deserialize::<(OwnedObjectPath,)>().unwrap().0.as_str(), "/");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_belong_to_their_connection() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a1 = fx.client(Some(app_a())).await;
+    let a2 = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    let col = create_collection(&a1, "Login", "").await;
+    let s1 = ClientSession::plain(&a1).await;
+    let item = create_item(&a1, &col, &s1, "x", &[("k", "v")], b"secret", false).await.unwrap();
+
+    // Another connection of the *same app* cannot use a1's session either.
+    let wire = s1.encode(b"forged", "text/plain");
+    for c in [&a2, &b] {
+        let e = call(c, &item, ITEM_IFACE, "GetSecret", &(&s1.path,)).await.unwrap_err();
+        // b cannot see the item at all; a2 sees it but not the session.
+        let expected = if std::ptr::eq(c, &a2) { NO_SESSION } else { UNKNOWN_OBJECT };
+        assert_eq!(e.0, expected);
+        let e = call(c, SERVICE, SVC_IFACE, "GetSecrets", &(vec![obj(&item)], &s1.path)).await.unwrap_err();
+        assert_eq!(e.0, NO_SESSION);
+        let e = call(c, &s1.path, "org.freedesktop.Secret.Session", "Close", &()).await.unwrap_err();
+        assert_eq!(e.0, UNKNOWN_OBJECT);
+        assert!(introspect_children(c, "/org/freedesktop/secrets/session").await.unwrap().is_empty());
+    }
+    let mut props: HashMap<&str, Value> = HashMap::new();
+    props.insert("org.freedesktop.Secret.Item.Label", Value::from("forged"));
+    let e = call(&a2, &col, COL_IFACE, "CreateItem", &(props, wire, false)).await.unwrap_err();
+    assert_eq!(e.0, NO_SESSION);
+    let e = call(&a2, &item, ITEM_IFACE, "GetSecret", &(obj("/not/a/session"),)).await.unwrap_err();
+    assert_eq!(e.0, NO_SESSION);
+    assert_eq!(get_secret(&a1, &item, &s1).await.unwrap().0, b"secret");
+
+    // Closing ends the session.
+    call(&a1, &s1.path, "org.freedesktop.Secret.Session", "Close", &()).await.unwrap();
+    assert_eq!(get_secret(&a1, &item, &s1).await.unwrap_err().0, NO_SESSION);
+
+    // Unsupported algorithms and malformed DH input.
+    let e = call(&a1, SERVICE, SVC_IFACE, "OpenSession", &("rot13", Value::from(""))).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.NotSupported");
+    let e =
+        call(&a1, SERVICE, SVC_IFACE, "OpenSession", &("dh-ietf1024-sha256-aes128-cbc-pkcs7", Value::from(vec![1u8])))
+            .await
+            .unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.InvalidArgs");
+
+    // Sessions per connection are limited.
+    let mut open = Vec::new();
+    for _ in 0..MAX_SESSIONS_PER_CONNECTION {
+        open.push(ClientSession::plain(&a2).await);
+    }
+    let e = call(&a2, SERVICE, SVC_IFACE, "OpenSession", &("plain", Value::from(""))).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded");
+    assert_eq!(introspect_children(&a2, "/org/freedesktop/secrets/session").await.unwrap().len(), open.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn foreign_objects_inside_arrays_are_ignored() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    let col_a = create_collection(&a, "Alpha Keys", "").await;
+    let col_b = create_collection(&b, "Beta Keys", "").await;
+    let sa = ClientSession::plain(&a).await;
+    let sb = ClientSession::plain(&b).await;
+    let item_a = create_item(&a, &col_a, &sa, "a", &[("k", "v")], b"alpha", false).await.unwrap();
+    let item_b = create_item(&b, &col_b, &sb, "b", &[("k", "v")], b"beta", false).await.unwrap();
+
+    // Identical attributes: each app finds only its own item.
+    assert_eq!(search(&a, &[("k", "v")]).await.unwrap().0, std::slice::from_ref(&item_a));
+    assert_eq!(search(&b, &[("k", "v")]).await.unwrap().0, std::slice::from_ref(&item_b));
+
+    let m = call(&b, SERVICE, SVC_IFACE, "GetSecrets", &(vec![obj(&item_a), obj(&item_b)], &sb.path)).await.unwrap();
+    let (map,): (HashMap<OwnedObjectPath, WireSecret>,) = m.body().deserialize().unwrap();
+    assert_eq!(map.keys().map(|k| k.to_string()).collect::<Vec<_>>(), std::slice::from_ref(&item_b));
+    assert_eq!(sb.decode(&map[&obj(&item_b)]).0, b"beta");
+
+    assert_eq!(xlock(&b, "Lock", &[&col_a, &item_a]).await.unwrap(), (vec![], "/".into()));
+    assert!(!locked_prop(&a, &col_a, COL_IFACE).await, "B must not lock A's collection");
+    assert_eq!(xlock(&b, "Unlock", &[&col_a, &item_a]).await.unwrap(), (vec![], "/".into()));
+    assert_eq!(get_secret(&a, &item_a, &sa).await.unwrap().0, b"alpha");
+
+    // Mixed arrays: B's own objects are handled, A's are not mentioned.
+    assert_eq!(xlock(&b, "Lock", &[&item_a, &item_b]).await.unwrap(), (vec![item_b.clone()], "/".into()));
+    assert!(locked_prop(&b, &col_b, COL_IFACE).await);
+    assert!(!locked_prop(&a, &col_a, COL_IFACE).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logical_lock_affects_one_collection_and_needs_the_password_again() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let a2 = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    collections(&a2).await;
+    let from = fx.service_name().await;
+    let sa = ClientSession::plain(&a).await;
+    let sb = ClientSession::plain(&b).await;
+    let work = create_collection(&a, "Work", "").await;
+    let home = create_collection(&a, "Home", "").await;
+    let col_b = create_collection(&b, "Work", "").await;
+    assert_eq!(work, col_b, "same readable path in two scopes");
+    let item = create_item(&a, &work, &sa, "w", &[("k", "v")], b"work secret", false).await.unwrap();
+    let home_item = create_item(&a, &home, &sa, "h", &[("k", "v")], b"home secret", false).await.unwrap();
+    let item_b = create_item(&b, &col_b, &sb, "b", &[("k", "v")], b"b secret", false).await.unwrap();
+
+    let log = SignalLog::start(&a2, &from);
+    assert_eq!(xlock(&a, "Lock", &[&work]).await.unwrap(), (vec![work.clone()], "/".into()));
+    assert!(log.wait_for(&work, "PropertiesChanged", Duration::from_secs(2)).await.is_some());
+    assert!(locked_prop(&a, &work, COL_IFACE).await);
+    assert!(locked_prop(&a, &item, ITEM_IFACE).await);
+    assert_eq!(get_secret(&a, &item, &sa).await.unwrap_err().0, IS_LOCKED);
+    assert_eq!(search(&a, &[("k", "v")]).await.unwrap(), (vec![home_item.clone()], vec![item.clone()]));
+    let m = call(&a, SERVICE, SVC_IFACE, "GetSecrets", &(vec![obj(&item), obj(&home_item)], &sa.path)).await.unwrap();
+    assert_eq!(m.body().deserialize::<(HashMap<OwnedObjectPath, WireSecret>,)>().unwrap().0.len(), 1);
+    assert_eq!(create_item(&a, &work, &sa, "n", &[], b"n", false).await.unwrap_err().0, IS_LOCKED);
+    let e = call(&a, &item, ITEM_IFACE, "SetSecret", &(sa.encode(b"x", "text/plain"),)).await.unwrap_err();
+    assert_eq!(e.0, IS_LOCKED);
+
+    // The other collection of the same app and the other app are unaffected.
+    assert_eq!(get_secret(&a, &home_item, &sa).await.unwrap().0, b"home secret");
+    assert!(!locked_prop(&b, &col_b, COL_IFACE).await);
+    assert_eq!(get_secret(&b, &item_b, &sb).await.unwrap().0, b"b secret");
+
+    // Unlocking returns what is already open and a prompt for the rest.
+    let (open, prompt) = xlock(&a, "Unlock", &[&item, &home]).await.unwrap();
+    assert_eq!(open, std::slice::from_ref(&home));
+    assert_ne!(prompt, "/");
+    fx.vault.set_pins(&["CANCEL"]);
+    let (dismissed, result) = run_prompt(&a, &from, &prompt).await;
+    assert!(dismissed);
+    assert!(paths_of(result).is_empty());
+    assert!(locked_prop(&a, &work, COL_IFACE).await);
+
+    let (_, prompt) = xlock(&a, "Unlock", &[&item, &home]).await.unwrap();
+    fx.vault.set_pins(&["wrong", PASSWORD]);
+    let (dismissed, result) = run_prompt(&a, &from, &prompt).await;
+    assert!(!dismissed);
+    assert_eq!(paths_of(result), [home.clone(), item.clone()]);
+    assert!(!locked_prop(&a, &work, COL_IFACE).await);
+    assert_eq!(get_secret(&a, &item, &sa).await.unwrap().0, b"work secret");
+    assert!(fx.vault.log().contains("locked collections"), "the confirmation dialog explains itself");
+    // One pinentry run per attempt: cancel, wrong, right.
+    assert_eq!(fx.vault.dialogs(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn locked_vault_unlocks_on_demand() {
+    let fx = fixture(VaultState::Locked).await;
+    let a = fx.client(Some(app_a())).await;
+    fx.vault.set_pins(&[PASSWORD]);
+    // A request that needs the vault opens the shared dialog and waits.
+    assert_eq!(search(&a, &[("k", "v")]).await.unwrap(), (vec![], vec![]));
+    assert!(fx.vault.unlocked());
+    assert_eq!(fx.vault.dialogs(), 1);
+    assert!(fx.vault.log().contains("org.example.A"), "the dialog names the requesting app");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_vault_is_created_on_first_use() {
+    let fx = fixture(VaultState::Missing).await;
+    let host = fx.client(Some(Principal::Host)).await;
+    fx.vault.set_pins(&["new password"]);
+    assert!(collections(&host).await.is_empty());
+    assert!(fx.vault.unlocked());
+    assert!(fx.vault.log().contains("SETREPEAT"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_unlock_gives_is_locked_and_a_cooldown() {
+    let fx = fixture(VaultState::Locked).await;
+    let a = fx.client(Some(app_a())).await;
+    fx.vault.set_pins(&["CANCEL"]);
+    assert_eq!(search(&a, &[]).await.unwrap_err().0, IS_LOCKED);
+    assert_eq!(fx.vault.dialogs(), 1);
+    // Retries during the cooldown fail at once, without another dialog.
+    for _ in 0..3 {
+        assert_eq!(get(&a, SERVICE, SVC_IFACE, "Collections").await.unwrap_err().0, IS_LOCKED);
+        let m = call(&a, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await;
+        assert_eq!(m.unwrap_err().0, IS_LOCKED);
+    }
+    // CreateItem and Lock never open a dialog.
+    let s = ClientSession::plain(&a).await;
+    let e = create_item(&a, "/org/freedesktop/secrets/aliases/default", &s, "x", &[], b"x", true).await.unwrap_err();
+    assert_eq!(e.0, IS_LOCKED);
+    assert_eq!(xlock(&a, "Lock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap(), (vec![], "/".into()));
+    assert_eq!(fx.vault.dialogs(), 1);
+    assert!(!fx.vault.unlocked());
+
+    // An explicit Unlock prompt is not subject to the cooldown.
+    let (open, prompt) = xlock(&a, "Unlock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap();
+    assert!(open.is_empty());
+    fx.vault.set_pins(&[PASSWORD]);
+    let (dismissed, result) = run_prompt(&a, &fx.service_name().await, &prompt).await;
+    assert!(!dismissed);
+    assert!(paths_of(result).is_empty(), "there is no default collection yet");
+    assert!(fx.vault.unlocked());
+    assert_eq!(fx.vault.dialogs(), 2);
+}
+
+/// The sequence libsecret's `secret_password_store` performs against a
+/// locked keyring (`secret-methods.c`, `on_store_create`).
+#[tokio::test(flavor = "multi_thread")]
+async fn libsecret_store_sequence_on_a_locked_vault() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let from = fx.service_name().await;
+    let host = fx.client(Some(Principal::Host)).await;
+    let watcher = fx.client(Some(Principal::Host)).await;
+    let col = create_collection(&host, "Default keyring", "default").await;
+    let s = ClientSession::dh(&host).await;
+    create_item(&host, &col, &s, "old", &[("service", "mail")], b"old", true).await.unwrap();
+    collections(&watcher).await;
+    fx.vault.lock_vault();
+
+    let default = "/org/freedesktop/secrets/aliases/default";
+    let e = create_item(&host, default, &s, "new", &[("service", "mail")], b"new", true).await.unwrap_err();
+    assert_eq!(e.0, IS_LOCKED);
+    let (open, prompt) = xlock(&host, "Unlock", &[default]).await.unwrap();
+    assert!(open.is_empty());
+    let log = SignalLog::start(&watcher, &from);
+    fx.vault.set_pins(&[PASSWORD]);
+    let (dismissed, result) = run_prompt(&host, &from, &prompt).await;
+    assert!(!dismissed);
+    assert_eq!(paths_of(result), std::slice::from_ref(&col), "canonical path of the aliased collection");
+    // Other connections of the scope learn that its collections are back.
+    assert!(log.wait_for(SERVICE, "PropertiesChanged", Duration::from_secs(2)).await.is_some());
+
+    // Transfer sessions survive a vault lock; the retry succeeds.
+    let item = create_item(&host, default, &s, "new", &[("service", "mail")], b"new", true).await.unwrap();
+    assert_eq!(get_secret(&host, &item, &s).await.unwrap().0, b"new");
+    assert_eq!(search(&host, &[("service", "mail")]).await.unwrap().0.len(), 1, "replaced, not added");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_collection_on_a_locked_vault_uses_a_prompt() {
+    let fx = fixture(VaultState::Locked).await;
+    let from = fx.service_name().await;
+    let a = fx.client(Some(app_a())).await;
+    let (col, prompt) = try_create_collection(&a, "Work", "").await.unwrap();
+    assert_eq!(col, "/");
+    assert_eq!(fx.vault.dialogs(), 0, "no dialog before Prompt()");
+    fx.vault.set_pins(&[PASSWORD]);
+    let (dismissed, result) = run_prompt(&a, &from, &prompt).await;
+    assert!(!dismissed);
+    let path: OwnedObjectPath = result.try_into().unwrap();
+    assert_eq!(path.as_str(), "/org/freedesktop/secrets/collection/work");
+    assert_eq!(collections(&a).await, [path.to_string()]);
+    // The prompt is gone once completed.
+    let e = call(&a, &prompt, PROMPT_IFACE, "Prompt", &("",)).await.unwrap_err();
+    assert_eq!(e.0, UNKNOWN_OBJECT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompts_belong_to_their_connection_and_complete_only_there() {
+    let fx = fixture(VaultState::Locked).await;
+    let from = fx.service_name().await;
+    let a1 = fx.client(Some(app_a())).await;
+    let a2 = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    for c in [&a2, &b] {
+        ClientSession::plain(c).await; // identified, so eligible for signals
+    }
+    let (_, prompt) = xlock(&a1, "Unlock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap();
+    for c in [&a2, &b] {
+        for m in ["Prompt", "Dismiss"] {
+            let e = if m == "Prompt" {
+                call(c, &prompt, PROMPT_IFACE, m, &("",)).await
+            } else {
+                call(c, &prompt, PROMPT_IFACE, m, &()).await
+            };
+            assert_eq!(e.unwrap_err().0, UNKNOWN_OBJECT);
+        }
+        assert!(introspect_children(c, "/org/freedesktop/secrets/prompt").await.unwrap().is_empty());
+    }
+    assert_eq!(introspect_children(&a1, "/org/freedesktop/secrets/prompt").await.unwrap().len(), 1);
+
+    let logs = [SignalLog::start(&a2, &from), SignalLog::start(&b, &from)];
+    fx.vault.set_pins(&[PASSWORD]);
+    let (dismissed, _) = run_prompt(&a1, &from, &prompt).await;
+    assert!(!dismissed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for log in &logs {
+        assert!(log.find(&prompt, "Completed").is_none(), "{:?}", log.names());
+    }
+
+    // Pending prompts per connection are limited.
+    fx.vault.lock_vault();
+    for _ in 0..MAX_PROMPTS_PER_CONNECTION {
+        xlock(&a1, "Unlock", &["/org/freedesktop/secrets/aliases/x"]).await.unwrap();
+    }
+    let e = xlock(&a1, "Unlock", &["/org/freedesktop/secrets/aliases/x"]).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dismissing_a_prompt_closes_its_dialog() {
+    let fx = fixture(VaultState::Locked).await;
+    let from = fx.service_name().await;
+    let a = fx.client(Some(app_a())).await;
+
+    // Dismissed before Prompt(): typed empty result, no dialog.
+    let (_, prompt) = try_create_collection(&a, "Work", "").await.unwrap();
+    let log = SignalLog::start(&a, &from);
+    call(&a, &prompt, PROMPT_IFACE, "Dismiss", &()).await.unwrap();
+    let m = log.wait_for(&prompt, "Completed", Duration::from_secs(2)).await.unwrap();
+    let (dismissed, result): (bool, OwnedValue) = m.body().deserialize().unwrap();
+    assert!(dismissed);
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap().as_str(), "/");
+
+    // Dismissed while the dialog is open: the dialog goes away.
+    fx.vault.set_pins(&["HANG"]);
+    let (_, prompt) = xlock(&a, "Unlock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap();
+    call(&a, &prompt, PROMPT_IFACE, "Prompt", &("",)).await.unwrap();
+    let pid = dialog_waiting(&fx.vault, 1).await;
+    call(&a, &prompt, PROMPT_IFACE, "Dismiss", &()).await.unwrap();
+    let m = log.wait_for(&prompt, "Completed", Duration::from_secs(2)).await.unwrap();
+    let (dismissed, result): (bool, OwnedValue) = m.body().deserialize().unwrap();
+    assert!(dismissed);
+    assert!(paths_of(result).is_empty());
+    assert!(process_gone(pid).await, "pinentry still running after Dismiss");
+    assert!(!fx.vault.unlocked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_owner_disconnecting_closes_its_dialog() {
+    let fx = fixture(VaultState::Locked).await;
+    let a = fx.client(Some(app_a())).await;
+    fx.vault.set_pins(&["HANG"]);
+    let (_, prompt) = xlock(&a, "Unlock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap();
+    call(&a, &prompt, PROMPT_IFACE, "Prompt", &("",)).await.unwrap();
+    let pid = dialog_waiting(&fx.vault, 1).await;
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    a.close().await.unwrap();
+    assert!(process_gone(pid).await, "pinentry still running after its requester left");
+    assert!(!fx.vault.unlocked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_collection_lives_in_memory_only() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    let col = create_collection(&a, "Temporary", "session").await;
+    assert_eq!(col, "/org/freedesktop/secrets/collection/session");
+    let s = ClientSession::plain(&a).await;
+    let item = create_item(&a, "/org/freedesktop/secrets/aliases/session", &s, "t", &[("k", "v")], b"temp", false)
+        .await
+        .unwrap();
+    assert_eq!(get_secret(&a, &item, &s).await.unwrap().0, b"temp");
+    let m = call(&b, SERVICE, SVC_IFACE, "ReadAlias", &("session",)).await.unwrap();
+    assert_eq!(m.body().deserialize::<(OwnedObjectPath,)>().unwrap().0.as_str(), "/", "per scope");
+
+    // Gone after a global lock and unlock.
+    fx.vault.lock_vault();
+    fx.vault.set_pins(&[PASSWORD]);
+    assert!(collections(&a).await.is_empty());
+    assert_eq!(get_secret(&a, &item, &s).await.unwrap_err().0, UNKNOWN_OBJECT);
+}

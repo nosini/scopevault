@@ -94,3 +94,102 @@ impl Drop for TestBus {
 pub fn support_script(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support").join(name)
 }
+
+pub mod service;
+
+/// Password of vaults made by [`VaultFixture`].
+pub const PASSWORD: &str = "correct horse";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultState {
+    Unlocked,
+    Locked,
+    Missing,
+}
+
+/// A vault in a temporary directory, with an unlocker whose dialogs are
+/// answered by `tests/support/fake-pinentry.sh`. Each fixture gets its own
+/// wrapper script, so tests using it can run in parallel.
+pub struct VaultFixture {
+    pub tmp: tempdir::TempDir,
+    pub unlocker: std::sync::Arc<scopevault::prompts::unlock::Unlocker>,
+}
+
+impl VaultFixture {
+    pub fn new(state: VaultState) -> Self {
+        use scopevault::crypto::KdfParams;
+        use scopevault::prompts::unlock::{Unlocker, VaultSlot};
+        use scopevault::store::Vault;
+
+        let tmp = tempdir::TempDir::new("vault");
+        let fake = tmp.path().join("pinentry");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::write(fake.join("pins"), "").unwrap();
+        let wrapper = tmp.path().join("pinentry.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_PINENTRY_DIR='{}' exec '{}' \"$@\"\n",
+                fake.display(),
+                support_script("fake-pinentry.sh").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+
+        let dir = tmp.path().join("vault");
+        let slot = match state {
+            VaultState::Unlocked => {
+                VaultSlot { vault: Some(Vault::create(&dir, PASSWORD.as_bytes(), KdfParams::MINIMUM).unwrap()), dir }
+            }
+            // Locked in memory rather than closed and reopened: a child
+            // forked meanwhile by a parallel test could briefly hold the
+            // vault's `flock` (see `store_crash.rs`).
+            VaultState::Locked => {
+                let mut v = Vault::create(&dir, PASSWORD.as_bytes(), KdfParams::MINIMUM).unwrap();
+                v.lock();
+                VaultSlot { vault: Some(v), dir }
+            }
+            VaultState::Missing => VaultSlot::open(dir).unwrap(),
+        };
+        let config =
+            scopevault::prompts::pinentry::PinentryConfig { program: wrapper, timeout: Duration::from_secs(20) };
+        let unlocker = Unlocker::new(std::sync::Arc::new(std::sync::Mutex::new(slot)), config, KdfParams::MINIMUM);
+        VaultFixture { tmp, unlocker }
+    }
+
+    fn fake(&self) -> PathBuf {
+        self.tmp.path().join("pinentry")
+    }
+
+    /// Sets the answers for the next dialogs (one per `GETPIN`).
+    pub fn set_pins(&self, pins: &[&str]) {
+        std::fs::write(self.fake().join("pins"), pins.join("\n") + "\n").unwrap();
+        let _ = std::fs::remove_file(self.fake().join("count"));
+    }
+
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.fake().join("log")).unwrap_or_default()
+    }
+
+    /// Number of dialogs started so far.
+    pub fn dialogs(&self) -> usize {
+        self.log().matches("STARTED").count()
+    }
+
+    /// PID of the most recently started pinentry.
+    pub fn pinentry_pid(&self) -> Option<i32> {
+        std::fs::read_to_string(self.fake().join("pid")).ok()?.trim().parse().ok()
+    }
+
+    pub fn unlocked(&self) -> bool {
+        self.unlocker.vault().lock().unwrap().is_unlocked()
+    }
+
+    /// Global lock, as the administrative interface would do it.
+    pub fn lock_vault(&self) {
+        if let Some(v) = self.unlocker.vault().lock().unwrap().vault.as_mut() {
+            v.lock();
+        }
+    }
+}

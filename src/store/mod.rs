@@ -44,6 +44,8 @@ pub const MAX_ATTRIBUTE_NAME_BYTES: usize = 256;
 pub const MAX_ATTRIBUTE_VALUE_BYTES: usize = 4096;
 pub const MAX_SECRET_BYTES: usize = 512 * 1024;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 128;
+/// Alias (and collection name) of the per-scope in-memory collection.
+pub const SESSION_ALIAS: &str = "session";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -130,6 +132,11 @@ struct CollectionEntry {
     created: u64,
     modified: u64,
     items: BTreeMap<RecordId, ItemEntry>,
+    /// The scope's `session` collection: kept in memory only, never
+    /// written to disk, gone after a global lock or restart.
+    ephemeral: bool,
+    /// Secrets of an ephemeral collection (persistent ones are on disk).
+    secrets: HashMap<RecordId, Secret>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,12 +222,17 @@ fn build_index(cipher: &RecordCipher, records: &[RawRecord]) -> Result<HashMap<S
         if !paths::is_valid_element(&p.name) || ns.collections.contains_key(&p.name) {
             return Err(corrupt(format!("collection {} has an invalid or duplicate name", hex(&r.id))));
         }
+        if p.name == SESSION_ALIAS {
+            return Err(corrupt(format!("collection {} uses a reserved name", hex(&r.id))));
+        }
         let entry = CollectionEntry {
             id: r.id,
             label: p.label,
             created: p.created,
             modified: p.modified,
             items: BTreeMap::new(),
+            ephemeral: false,
+            secrets: HashMap::new(),
         };
         ns.collections.insert(p.name, entry);
         collection_ns.insert(r.id, r.namespace);
@@ -400,7 +412,7 @@ fn validate_secret(s: &Secret) -> Result<(), StoreError> {
 fn collection_name_for(label: &str, existing: &BTreeMap<String, CollectionEntry>) -> String {
     let mut base: String =
         label.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).take(32).collect();
-    if base.bytes().all(|b| b == b'_') {
+    if base.bytes().all(|b| b == b'_') || base == SESSION_ALIAS {
         base = "collection".into();
     }
     if !existing.contains_key(&base) {
@@ -438,7 +450,12 @@ impl ScopedVault<'_> {
     fn namespace_record(&self, ns: &NamespaceEntry) -> Result<RawRecord, StoreError> {
         let p = NamespacePayload {
             scope: self.scope.to_string(),
-            aliases: ns.aliases.iter().map(|(a, id)| (a.clone(), hex(id))).collect(),
+            aliases: ns
+                .aliases
+                .iter()
+                .filter(|(_, id)| ns.collection_by_id(id).is_some_and(|(_, c)| !c.ephemeral))
+                .map(|(a, id)| (a.clone(), hex(id)))
+                .collect(),
         };
         seal(&self.state().cipher, KIND_NAMESPACE, ns.id, ns.id, &payload::encode(&p))
     }
@@ -560,6 +577,9 @@ impl ScopedVault<'_> {
         if self.state().locked.contains(&c.id) {
             return Err(StoreError::Locked);
         }
+        if c.ephemeral {
+            return c.secrets.get(&id).cloned().ok_or(StoreError::NoSuchObject);
+        }
         let ns_id = self.ns().expect("collection exists").id;
         let raw = self
             .vault
@@ -611,17 +631,30 @@ impl ScopedVault<'_> {
         if !alias.is_empty() && ns.aliases.len() >= MAX_ALIASES_PER_SCOPE && !ns.aliases.contains_key(alias) {
             return Err(StoreError::Limit("too many aliases"));
         }
-        let name = collection_name_for(label, &ns.collections);
+        let ephemeral = alias == SESSION_ALIAS;
+        let name = if ephemeral { SESSION_ALIAS.to_owned() } else { collection_name_for(label, &ns.collections) };
         let t = now();
-        let entry =
-            CollectionEntry { id: new_id()?, label: label.to_owned(), created: t, modified: t, items: BTreeMap::new() };
-        let mut writes = vec![self.collection_record(ns.id, &name, &entry)?];
+        let entry = CollectionEntry {
+            id: new_id()?,
+            label: label.to_owned(),
+            created: t,
+            modified: t,
+            items: BTreeMap::new(),
+            ephemeral,
+            secrets: HashMap::new(),
+        };
+        let mut writes = Vec::new();
+        if !ephemeral {
+            writes.push(self.collection_record(ns.id, &name, &entry)?);
+        }
         if !alias.is_empty() {
             ns.aliases.insert(alias.to_owned(), entry.id);
         }
         ns.collections.insert(name.clone(), entry);
-        // Always rewrite the namespace record: it may be new, and aliases may change.
-        writes.push(self.namespace_record(&ns)?);
+        if !ephemeral {
+            // The namespace record may be new, and its aliases may change.
+            writes.push(self.namespace_record(&ns)?);
+        }
         self.commit(ns, &writes, &[])?;
         Ok((name, true))
     }
@@ -629,13 +662,16 @@ impl ScopedVault<'_> {
     pub fn delete_collection(&mut self, name: &str) -> Result<(), StoreError> {
         let mut ns = self.ns().cloned().ok_or(StoreError::NoSuchObject)?;
         let c = ns.collections.remove(name).ok_or(StoreError::NoSuchObject)?;
-        let mut deletes = vec![(c.id, KIND_COLLECTION)];
-        for id in c.items.keys() {
-            deletes.push((*id, KIND_ITEM));
-            deletes.push((*id, KIND_SECRET));
+        let mut deletes = Vec::new();
+        if !c.ephemeral {
+            deletes.push((c.id, KIND_COLLECTION));
+            for id in c.items.keys() {
+                deletes.push((*id, KIND_ITEM));
+                deletes.push((*id, KIND_SECRET));
+            }
         }
         ns.aliases.retain(|_, target| *target != c.id);
-        let writes = vec![self.namespace_record(&ns)?];
+        let writes = if c.ephemeral { Vec::new() } else { vec![self.namespace_record(&ns)?] };
         self.commit(ns, &writes, &deletes)?;
         self.vault.unlocked.as_mut().expect("unlocked").locked.remove(&c.id);
         Ok(())
@@ -671,7 +707,8 @@ impl ScopedVault<'_> {
         let c = ns.collections.get_mut(name).ok_or(StoreError::NoSuchObject)?;
         c.label = label.to_owned();
         c.modified = now();
-        let writes = vec![self.collection_record(ns.id, name, &ns.collections[name])?];
+        let writes =
+            if c.ephemeral { Vec::new() } else { vec![self.collection_record(ns.id, name, &ns.collections[name])?] };
         self.commit(ns, &writes, &[])
     }
 
@@ -714,12 +751,17 @@ impl ScopedVault<'_> {
             }
         };
         c.modified = t;
-        let item = c.items[&id].clone();
-        let writes = vec![
-            self.item_record(ns_id, &cid, id, &item)?,
-            self.secret_record(ns_id, id, secret)?,
-            self.collection_record(ns_id, collection, &ns.collections[collection])?,
-        ];
+        let writes = if c.ephemeral {
+            c.secrets.insert(id, secret.clone());
+            Vec::new()
+        } else {
+            let item = c.items[&id].clone();
+            vec![
+                self.item_record(ns_id, &cid, id, &item)?,
+                self.secret_record(ns_id, id, secret)?,
+                self.collection_record(ns_id, collection, &ns.collections[collection])?,
+            ]
+        };
         self.commit(ns, &writes, &[])?;
         Ok((item_name(&id), created))
     }
@@ -735,7 +777,7 @@ impl ScopedVault<'_> {
         f(entry);
         entry.modified = now();
         let entry = entry.clone();
-        let writes = vec![self.item_record(ns_id, &cid, id, &entry)?];
+        let writes = if c.ephemeral { Vec::new() } else { vec![self.item_record(ns_id, &cid, id, &entry)?] };
         self.commit(ns, &writes, &[])
     }
 
@@ -765,7 +807,12 @@ impl ScopedVault<'_> {
         let entry = c.items.get_mut(&id).expect("item exists");
         entry.modified = now();
         let entry = entry.clone();
-        let writes = vec![self.item_record(ns_id, &cid, id, &entry)?, self.secret_record(ns_id, id, secret)?];
+        let writes = if c.ephemeral {
+            c.secrets.insert(id, secret.clone());
+            Vec::new()
+        } else {
+            vec![self.item_record(ns_id, &cid, id, &entry)?, self.secret_record(ns_id, id, secret)?]
+        };
         self.commit(ns, &writes, &[])
     }
 
@@ -776,6 +823,10 @@ impl ScopedVault<'_> {
         let c = ns.collections.get_mut(collection).expect("item exists");
         c.items.remove(&id);
         c.modified = now();
+        if c.ephemeral {
+            c.secrets.remove(&id);
+            return self.commit(ns, &[], &[]);
+        }
         let writes = vec![self.collection_record(ns.id, collection, &ns.collections[collection])?];
         self.commit(ns, &writes, &[(id, KIND_ITEM), (id, KIND_SECRET)])
     }
