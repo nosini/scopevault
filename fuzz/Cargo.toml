@@ -1,0 +1,53 @@
+# Coverage-guided fuzzing of scopevault's byte-level decoders with
+# cargo-fuzz (libFuzzer). Needs a nightly toolchain:
+#
+#   cargo +nightly fuzz run flatpak_info
+#
+# Targets: flatpak_info, transfer, object_path, records. The D-Bus surface
+# as a whole is fuzzed by tests/fuzz_dbus.rs against a live service.
+[package]
+name = "scopevault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+scopevault = { path = ".." }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+zeroize = "1.9"
+
+[[bin]]
+name = "flatpak_info"
+path = "fuzz_targets/flatpak_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transfer"
+path = "fuzz_targets/transfer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "object_path"
+path = "fuzz_targets/object_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "records"
+path = "fuzz_targets/records.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the main package's workspace.
+[workspace]
+members = ["."]

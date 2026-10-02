@@ -178,6 +178,10 @@ After a dialog was cancelled or failed, requests that would open another
 one fail at once for 30 seconds, so an app retrying in a loop cannot keep
 the dialog coming back. An explicit unlock prompt still shows it.
 
+An app can also ask for a dialog explicitly. If it gets three of those
+cancelled within two minutes, its further prompts are dismissed without a
+dialog for a while. Other apps still get theirs.
+
 An app can lock its own collections. That locks them for every connection
 of its scope, and reading secrets from them then needs the master password
 again. Other collections and other scopes are not affected.

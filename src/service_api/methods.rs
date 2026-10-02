@@ -601,7 +601,24 @@ impl<R: CallerResolver> SecretService<R> {
             UnlockOutcome::Failed(why) => Err(Some(why)),
         };
         let fail = |f: Fault| Some(f.message);
-        outcome(self.unlocker.ensure_unlocked(&scope).await)?;
+        // Each dialog is subject to the scope's refusal limit; a prompt over
+        // the limit is dismissed without one.
+        let dialog = |o: UnlockOutcome| {
+            if o != UnlockOutcome::Unlocked {
+                self.unlocker.record_explicit_refusal(&scope);
+            }
+            outcome(o)
+        };
+        let over_limit = || {
+            tracing::info!(scope = %scope, "prompt dismissed: too many cancelled dialogs recently");
+            Err(None)
+        };
+        if !self.vault_unlocked() {
+            if !self.unlocker.explicit_dialog_allowed(&scope) {
+                return over_limit();
+            }
+            dialog(self.unlocker.ensure_unlocked(&scope).await)?;
+        }
         let event = |path: OwnedObjectPath, interface: &'static str, member: &'static str, body: SignalBody| Event {
             target: Target::Scope(scope.clone()),
             path,
@@ -622,7 +639,10 @@ impl<R: CallerResolver> SecretService<R> {
                     })
                     .map_err(fail)?;
                 if !locked_collections.is_empty() {
-                    outcome(self.unlocker.confirm_password(&scope).await)?;
+                    if !self.unlocker.explicit_dialog_allowed(&scope) {
+                        return over_limit();
+                    }
+                    dialog(self.unlocker.confirm_password(&scope).await)?;
                     for c in &locked_collections {
                         // The collection may have been deleted meanwhile.
                         if self.with_vault(principal, |v| Ok(v.set_collection_locked(c, false)?)).is_ok() {

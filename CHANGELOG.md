@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- Limits on request sizes, connections per app and repeatedly cancelled
+  prompts.
+- A request waiting for the unlock dialog is dropped when its client
+  disconnects, together with everything the client had queued.
+- Adversarial tests, fuzzing, and checks with real Flatpak sandboxes.
+
 ## 0.3.0
 
 - The daemon: the complete Secret Service API on the encrypted vault,

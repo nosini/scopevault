@@ -475,6 +475,64 @@ async fn a_prompt_owner_disconnecting_closes_its_dialog() {
     assert!(!fx.vault.unlocked());
 }
 
+/// A client that disconnects while its request waits for the unlock dialog:
+/// the wait ends (closing the dialog, since nobody else waits), and requests
+/// it had queued behind it are dropped rather than run for a connection that
+/// no longer exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_departed_connection_leaves_no_dialog_or_state_behind() {
+    let fx = fixture(VaultState::Locked).await;
+    let a = fx.client(Some(app_a())).await;
+    let watcher = fx.client(Some(app_a())).await;
+    fx.vault.set_pins(&["HANG"]);
+    let waiting = {
+        let a = a.clone();
+        tokio::spawn(async move { search(&a, &[("k", "v")]).await })
+    };
+    let pid = dialog_waiting(&fx.vault, 1).await;
+    // Queued behind the waiting search; sent without waiting for replies.
+    for _ in 0..3 {
+        let m = zbus::message::Message::method_call(SERVICE, "OpenSession")
+            .unwrap()
+            .destination(DEST)
+            .unwrap()
+            .interface(SVC_IFACE)
+            .unwrap()
+            .build(&("plain", Value::from("")))
+            .unwrap();
+        a.send(&m).await.unwrap();
+    }
+    let alias = "/org/freedesktop/secrets/aliases/default";
+    let m = zbus::message::Message::method_call(SERVICE, "Unlock")
+        .unwrap()
+        .destination(DEST)
+        .unwrap()
+        .interface(SVC_IFACE)
+        .unwrap()
+        .build(&(vec![obj(alias)],))
+        .unwrap();
+    a.send(&m).await.unwrap();
+    a.close().await.unwrap();
+    waiting.abort();
+
+    assert!(process_gone(pid).await, "pinentry still running after its only requester left");
+    for _ in 0..100 {
+        if fx.service.active_connections() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give a (wrongly) surviving worker time to run the queued requests.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(fx.service.open_sessions(), 0);
+    assert_eq!(fx.service.pending_prompts(), 0);
+    assert_eq!(fx.service.active_connections(), 0);
+    assert_eq!(fx.vault.dialogs(), 1);
+    // The service still works for others: a later request gets a new dialog.
+    fx.vault.set_pins(&[PASSWORD]);
+    assert!(search(&watcher, &[("k", "v")]).await.is_ok());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_session_collection_lives_in_memory_only() {
     let fx = fixture(VaultState::Unlocked).await;
@@ -495,4 +553,135 @@ async fn the_session_collection_lives_in_memory_only() {
     fx.vault.set_pins(&[PASSWORD]);
     assert!(collections(&a).await.is_empty());
     assert_eq!(get_secret(&a, &item, &s).await.unwrap_err().0, UNKNOWN_OBJECT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_and_excess_queued_requests_are_refused() {
+    use scopevault::service_api::dispatch::{MAX_QUEUED_BYTES, MAX_REQUEST_BYTES};
+    let fx = fixture(VaultState::Locked).await;
+    let a = fx.client(Some(app_a())).await;
+    let e = search(&a, &[("k", &"x".repeat(MAX_REQUEST_BYTES))]).await.unwrap_err();
+    assert_eq!(e, ("org.freedesktop.DBus.Error.LimitsExceeded".into(), "Request too large".into()));
+
+    // Requests queue up behind one waiting for the dialog. Big ones from
+    // several connections exhaust the shared budget; then the rest are
+    // refused at once instead of being held in memory.
+    fx.vault.set_pins(&["HANG"]);
+    let big = "x".repeat(MAX_REQUEST_BYTES - 4096);
+    let per_conn = 20;
+    let conns = MAX_QUEUED_BYTES / (per_conn * big.len()) + 1;
+    let mut pending = Vec::new();
+    for _ in 0..conns {
+        let c = fx.client(Some(app_a())).await;
+        for _ in 0..per_conn {
+            let c = c.clone();
+            let big = big.clone();
+            pending.push(tokio::spawn(async move {
+                let attrs: HashMap<&str, &str> = [("k", big.as_str())].into();
+                match c.call_method(Some(DEST), SERVICE, Some(SVC_IFACE), "SearchItems", &(attrs,)).await {
+                    Ok(_) => "ok".to_owned(),
+                    Err(zbus::Error::MethodError(n, msg, _)) => format!("{n}: {}", msg.unwrap_or_default()),
+                    Err(other) => format!("transport: {other}"),
+                }
+            }));
+        }
+    }
+    dialog_waiting(&fx.vault, 1).await;
+    // Everything beyond the budget is answered while the dialog is still up.
+    let mut refused = 0;
+    for _ in 0..250 {
+        refused = pending.iter().filter(|t| t.is_finished()).count();
+        if refused > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused > 0, "nothing was refused");
+    let pid = fx.vault.pinentry_pid().unwrap();
+    rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), rustix::process::Signal::KILL).unwrap();
+    let mut outcomes: HashMap<String, usize> = HashMap::new();
+    for t in pending {
+        *outcomes.entry(t.await.unwrap()).or_default() += 1;
+    }
+    assert!(
+        outcomes.get("org.freedesktop.DBus.Error.LimitsExceeded: Too many requests").copied().unwrap_or(0) >= 1,
+        "{outcomes:?}"
+    );
+    assert!(outcomes.keys().all(|k| k.starts_with("org.freedesktop")), "{outcomes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unidentified_connections_hold_no_slots_and_scopes_have_a_cap() {
+    use scopevault::service_api::dispatch::MAX_CONNECTIONS_PER_SCOPE;
+    let fx = fixture(VaultState::Unlocked).await;
+    let mut strangers = Vec::new();
+    for _ in 0..40 {
+        let c = fx.client(None).await;
+        let e = call(&c, SERVICE, "org.freedesktop.DBus.Peer", "Ping", &()).await.unwrap_err();
+        assert_eq!(e.0, "org.freedesktop.DBus.Error.AccessDenied");
+        strangers.push(c);
+    }
+    for _ in 0..100 {
+        if fx.service.active_connections() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fx.service.active_connections(), 0, "denied connections are not tracked while idle");
+    // Still denied on their next request.
+    let e = call(&strangers[0], SERVICE, "org.freedesktop.DBus.Peer", "Ping", &()).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.AccessDenied");
+
+    let mut a = Vec::new();
+    for _ in 0..MAX_CONNECTIONS_PER_SCOPE {
+        let c = fx.client(Some(app_a())).await;
+        collections(&c).await;
+        a.push(c);
+    }
+    let extra = fx.client(Some(app_a())).await;
+    let e = call(&extra, SERVICE, PROPS, "Get", &(SVC_IFACE, "Collections")).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded");
+    // Other scopes are unaffected.
+    let b = fx.client(Some(app_b())).await;
+    collections(&b).await;
+    // Room again once one of A's connections leaves.
+    a.pop().unwrap().close().await.unwrap();
+    for _ in 0..100 {
+        if call(&extra, SERVICE, PROPS, "Get", &(SVC_IFACE, "Collections")).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("a slot did not free up");
+}
+
+/// An app whose dialogs keep being cancelled cannot reopen them at once
+/// through new prompts; another app still gets its dialog.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeatedly_cancelled_prompts_stop_showing_dialogs_for_that_app() {
+    use scopevault::prompts::unlock::EXPLICIT_REFUSAL_LIMIT;
+    let fx = fixture(VaultState::Locked).await;
+    let from = fx.service_name().await;
+    let a = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    let alias = "/org/freedesktop/secrets/aliases/default";
+    fx.vault.set_pins(&["CANCEL"; EXPLICIT_REFUSAL_LIMIT]);
+    for n in 1..=EXPLICIT_REFUSAL_LIMIT {
+        let (_, prompt) = xlock(&a, "Unlock", &[alias]).await.unwrap();
+        let (dismissed, _) = run_prompt(&a, &from, &prompt).await;
+        assert!(dismissed);
+        assert_eq!(fx.vault.dialogs(), n);
+    }
+    // Over the limit: dismissed without a dialog, for A only.
+    let (_, prompt) = xlock(&a, "Unlock", &[alias]).await.unwrap();
+    let (dismissed, result) = run_prompt(&a, &from, &prompt).await;
+    assert!(dismissed);
+    assert!(paths_of(result).is_empty());
+    assert_eq!(fx.vault.dialogs(), EXPLICIT_REFUSAL_LIMIT);
+    fx.vault.set_pins(&[PASSWORD]);
+    let (_, prompt) = xlock(&b, "Unlock", &[alias]).await.unwrap();
+    let (dismissed, _) = run_prompt(&b, &from, &prompt).await;
+    assert!(!dismissed);
+    assert_eq!(fx.vault.dialogs(), EXPLICIT_REFUSAL_LIMIT + 1);
+    assert!(fx.vault.unlocked());
 }

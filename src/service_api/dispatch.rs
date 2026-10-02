@@ -34,13 +34,18 @@
 //! the prompt's owner).
 //!
 //! Requests from one connection are handled in order by a per-connection
-//! worker; a bounded queue per connection limits resource use.
+//! worker. Resource limits: request size, queued requests per connection and
+//! queued bytes overall, connections overall and per scope. Connections
+//! whose caller cannot be identified hold no worker while idle. When a
+//! connection closes, its queued requests are dropped and a request of it
+//! waiting for the unlock dialog stops waiting.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zbus::message::{Flags, Header, Message, Type as MessageType};
 use zbus::names::{OwnedUniqueName, UniqueName};
@@ -57,8 +62,17 @@ use super::transfer::Algorithm;
 
 /// Requests queued per connection before further ones are refused.
 pub const MAX_QUEUED_PER_CONNECTION: usize = 32;
-/// Simultaneously served client connections.
+/// Largest request accepted. The largest legitimate one, `CreateItem` with a
+/// secret, label and attributes at their limits, is well under 1 MiB.
+pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+/// Bytes of requests queued, all connections together.
+pub const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+/// Simultaneously served client connections. Connections whose caller could
+/// not be identified hold a slot only while they have requests queued.
 pub const MAX_CONNECTIONS: usize = 1024;
+/// Identified connections per scope, so one app cannot take every slot.
+/// Host applications share one scope.
+pub const MAX_CONNECTIONS_PER_SCOPE: usize = 128;
 /// Open transfer sessions per connection.
 pub const MAX_SESSIONS_PER_CONNECTION: usize = 16;
 /// Pending prompts per connection.
@@ -187,10 +201,24 @@ pub(crate) struct Event {
 
 /// Bookkeeping for one client connection. The principal is filled in once
 /// the connection has been identified; only identified connections get
-/// signals.
-#[derive(Default)]
+/// signals. `gone` turns true when the bus reports the connection closed.
 struct Peer {
     principal: OnceLock<Principal>,
+    gone: watch::Sender<bool>,
+}
+
+impl Peer {
+    fn new() -> Self {
+        Peer { principal: OnceLock::new(), gone: watch::Sender::new(false) }
+    }
+
+    fn is_gone(&self) -> bool {
+        *self.gone.borrow()
+    }
+
+    async fn wait_gone(&self) {
+        let _ = self.gone.subscribe().wait_for(|g| *g).await;
+    }
 }
 
 pub(crate) struct TransferSession {
@@ -245,6 +273,35 @@ impl Call<'_> {
 
 pub type CallResult = Result<Message, Fault>;
 
+/// A request waiting for its connection's worker, with its size charged to
+/// the shared queue budget until it is dropped.
+struct Queued {
+    msg: Message,
+    _charge: Charge,
+}
+
+struct Charge {
+    budget: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Charge {
+    fn take(budget: &Arc<AtomicUsize>, bytes: usize) -> Option<Charge> {
+        budget
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|n| *n <= MAX_QUEUED_BYTES)
+            })
+            .ok()
+            .map(|_| Charge { budget: budget.clone(), bytes })
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 pub(crate) fn value<'a>(v: impl Into<Value<'a>>) -> Result<OwnedValue, Fault> {
     OwnedValue::try_from(v.into()).map_err(internal)
 }
@@ -261,6 +318,7 @@ pub struct SecretService<R: CallerResolver> {
     machine_id: Option<String>,
     pub(crate) sessions: Mutex<HashMap<String, TransferSession>>,
     pub(crate) prompts: Mutex<HashMap<String, PromptEntry>>,
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 impl<R: CallerResolver> SecretService<R> {
@@ -278,6 +336,7 @@ impl<R: CallerResolver> SecretService<R> {
             machine_id,
             sessions: Mutex::default(),
             prompts: Mutex::default(),
+            queued_bytes: Arc::default(),
         })
     }
 
@@ -313,7 +372,7 @@ impl<R: CallerResolver> SecretService<R> {
     }
 
     async fn serve(self: Arc<Self>, mut stream: MessageStream) -> zbus::Result<()> {
-        let mut workers: HashMap<OwnedUniqueName, mpsc::Sender<Message>> = HashMap::new();
+        let mut workers: HashMap<OwnedUniqueName, mpsc::Sender<Queued>> = HashMap::new();
         while let Some(msg) = stream.next().await {
             let msg = msg?;
             let hdr = msg.header();
@@ -326,13 +385,37 @@ impl<R: CallerResolver> SecretService<R> {
                 }
                 MessageType::MethodCall => {
                     let Some(sender) = hdr.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else { continue };
-                    if !workers.contains_key(&sender) && workers.len() >= MAX_CONNECTIONS {
-                        self.spawn_fault(&msg, Fault::limits("Too many connections"));
+                    if msg.data().len() > MAX_REQUEST_BYTES {
+                        self.spawn_fault(&msg, Fault::limits("Request too large"));
                         continue;
                     }
+                    let Some(charge) = Charge::take(&self.queued_bytes, msg.data().len()) else {
+                        self.spawn_fault(&msg, Fault::limits("Too many requests"));
+                        continue;
+                    };
+                    // Workers of unidentified callers stop when idle.
+                    if workers.get(&sender).is_some_and(mpsc::Sender::is_closed) {
+                        workers.remove(&sender);
+                    }
+                    if !workers.contains_key(&sender) && workers.len() >= MAX_CONNECTIONS {
+                        workers.retain(|_, tx| !tx.is_closed());
+                        if workers.len() >= MAX_CONNECTIONS {
+                            self.spawn_fault(&msg, Fault::limits("Too many connections"));
+                            continue;
+                        }
+                    }
                     let tx = workers.entry(sender.clone()).or_insert_with(|| self.spawn_worker(&sender));
-                    if let Err(mpsc::error::TrySendError::Full(m)) = tx.try_send(msg) {
-                        self.spawn_fault(&m, Fault::limits("Too many requests"));
+                    match tx.try_send(Queued { msg, _charge: charge }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(q)) => {
+                            self.spawn_fault(&q.msg, Fault::limits("Too many requests"))
+                        }
+                        // The worker stopped since the check above.
+                        Err(mpsc::error::TrySendError::Closed(q)) => {
+                            let tx = self.spawn_worker(&sender);
+                            let _ = tx.try_send(q);
+                            workers.insert(sender, tx);
+                        }
                     }
                 }
                 _ => {}
@@ -341,10 +424,20 @@ impl<R: CallerResolver> SecretService<R> {
         Ok(())
     }
 
-    /// Drops everything bound to a connection that went away. Aborting its
-    /// prompt tasks closes their dialogs unless another request waits too.
+    /// Drops everything bound to a connection that went away. Its worker
+    /// stops waiting for the vault and skips requests still queued; aborting
+    /// its prompt tasks closes their dialogs unless another request waits
+    /// too.
     fn forget_connection(&self, gone: &OwnedUniqueName) {
-        self.peers.lock().unwrap().remove(gone);
+        if let Some(peer) = self.peers.lock().unwrap().remove(gone) {
+            // Before the cleanup below, so a request that creates a session
+            // or prompt concurrently sees the flag afterwards (see `handle`).
+            peer.gone.send_replace(true);
+        }
+        self.drop_connection_state(gone);
+    }
+
+    fn drop_connection_state(&self, gone: &OwnedUniqueName) {
         self.sessions.lock().unwrap().retain(|_, s| &s.owner != gone);
         self.prompts.lock().unwrap().retain(|_, p| {
             let keep = &p.owner != gone;
@@ -355,14 +448,31 @@ impl<R: CallerResolver> SecretService<R> {
         });
     }
 
-    fn spawn_worker(self: &Arc<Self>, sender: &OwnedUniqueName) -> mpsc::Sender<Message> {
-        let (tx, mut rx) = mpsc::channel::<Message>(MAX_QUEUED_PER_CONNECTION);
-        let peer = Arc::new(Peer::default());
+    fn spawn_worker(self: &Arc<Self>, sender: &OwnedUniqueName) -> mpsc::Sender<Queued> {
+        let (tx, mut rx) = mpsc::channel::<Queued>(MAX_QUEUED_PER_CONNECTION);
+        let peer = Arc::new(Peer::new());
         self.peers.lock().unwrap().insert(sender.clone(), peer.clone());
         let this = self.clone();
+        let sender = sender.clone();
         tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                this.handle(&msg, &peer).await;
+            while let Some(q) = rx.recv().await {
+                let identified = this.handle(&q.msg, &peer).await;
+                drop(q);
+                // An unidentified caller keeps no worker or connection slot
+                // while idle; its next request starts a new worker. Closing
+                // first means nothing sent meanwhile is lost: it is either
+                // drained here or refused to the sender, which respawns.
+                if !identified && rx.is_empty() {
+                    rx.close();
+                    while let Some(q) = rx.recv().await {
+                        this.handle(&q.msg, &peer).await;
+                    }
+                    let mut peers = this.peers.lock().unwrap();
+                    if peers.get(&sender).is_some_and(|p| Arc::ptr_eq(p, &peer)) {
+                        peers.remove(&sender);
+                    }
+                    break;
+                }
             }
         });
         tx
@@ -391,16 +501,32 @@ impl<R: CallerResolver> SecretService<R> {
         }
     }
 
-    async fn handle(self: &Arc<Self>, msg: &Message, peer: &Peer) {
+    /// Handles one request. Returns whether the caller was identified.
+    async fn handle(self: &Arc<Self>, msg: &Message, peer: &Peer) -> bool {
         let hdr = msg.header();
-        let Some(sender) = hdr.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else { return };
+        let Some(sender) = hdr.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else { return false };
+        // Queued before the connection closed: nobody is left to answer.
+        if peer.is_gone() {
+            return true;
+        }
         let principal = match &*self.resolver.resolve(&sender).await {
             Ok(p) => p.clone(),
-            Err(_) => return self.send_reply(msg, Err(Fault::access_denied())).await,
+            Err(_) => {
+                self.send_reply(msg, Err(Fault::access_denied())).await;
+                return false;
+            }
         };
-        let _ = peer.principal.set(principal.clone());
+        if peer.principal.get().is_none() && !self.admit(peer, &principal) {
+            self.send_reply(msg, Err(Fault::limits("Too many connections for this application"))).await;
+            return true;
+        }
         let mut call = Call { hdr, msg, sender, principal, events: Vec::new() };
-        let result = self.dispatch(&mut call).await;
+        let result = self.dispatch(&mut call, peer).await;
+        // The connection may have closed while this request ran, after its
+        // state was dropped; drop whatever the request added since.
+        if peer.is_gone() {
+            self.drop_connection_state(&call.sender);
+        }
         // Names only: arguments may contain secrets and are never logged.
         tracing::debug!(
             sender = %call.sender,
@@ -420,6 +546,20 @@ impl<R: CallerResolver> SecretService<R> {
         for e in std::mem::take(&mut call.events) {
             self.emit(e).await;
         }
+        true
+    }
+
+    /// Records a newly identified connection's principal, unless its scope
+    /// already has [`MAX_CONNECTIONS_PER_SCOPE`] connections.
+    fn admit(&self, peer: &Peer, principal: &Principal) -> bool {
+        let peers = self.peers.lock().unwrap();
+        let scope = principal.scope();
+        let same = peers.values().filter(|p| p.principal.get().map(Principal::scope).as_ref() == Some(&scope)).count();
+        if same >= MAX_CONNECTIONS_PER_SCOPE {
+            return false;
+        }
+        let _ = peer.principal.set(principal.clone());
+        true
     }
 
     pub(crate) fn vault_unlocked(&self) -> bool {
@@ -438,7 +578,7 @@ impl<R: CallerResolver> SecretService<R> {
         f(&mut scoped)
     }
 
-    async fn dispatch(self: &Arc<Self>, call: &mut Call<'_>) -> CallResult {
+    async fn dispatch(self: &Arc<Self>, call: &mut Call<'_>, peer: &Peer) -> CallResult {
         let path = call.hdr.path().ok_or_else(Fault::unknown_object)?.to_owned();
         let member = call.hdr.member().ok_or_else(|| Fault::unknown_method(""))?.to_string();
         let interface = call.hdr.interface().map(|i| i.to_string());
@@ -460,7 +600,14 @@ impl<R: CallerResolver> SecretService<R> {
                 return call.reply(&(Vec::<OwnedObjectPath>::new(), paths::none()));
             }
             tracing::debug!(sender = %call.sender, member = %member, "waiting for the vault to be unlocked");
-            match self.unlocker.ensure_unlocked_implicit(&call.scope()).await {
+            // A client that leaves stops waiting, so the dialog closes
+            // unless someone else waits for it too.
+            let scope = call.scope();
+            let outcome = tokio::select! {
+                o = self.unlocker.ensure_unlocked_implicit(&scope) => o,
+                () = peer.wait_gone() => return Err(Fault::is_locked()),
+            };
+            match outcome {
                 UnlockOutcome::Unlocked => {}
                 UnlockOutcome::Cancelled => return Err(Fault::is_locked()),
                 UnlockOutcome::Failed(why) => {
@@ -650,6 +797,16 @@ impl<R: CallerResolver> SecretService<R> {
     /// Client connections currently tracked (for diagnostics and tests).
     pub fn active_connections(&self) -> usize {
         self.peers.lock().unwrap().len()
+    }
+
+    /// Open transfer sessions, all connections together.
+    pub fn open_sessions(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    /// Prompts not yet completed or dismissed, all connections together.
+    pub fn pending_prompts(&self) -> usize {
+        self.prompts.lock().unwrap().len()
     }
 }
 

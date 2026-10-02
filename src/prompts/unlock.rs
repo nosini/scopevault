@@ -13,6 +13,7 @@
 //! The slow key derivation runs on a blocking thread and does not hold the
 //! vault lock, so other requests are not stalled by it.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,14 @@ pub const MAX_ATTEMPTS: usize = 3;
 /// that need the vault but did not ask for a prompt) fail at once for this
 /// long, so an app retrying in a loop cannot reopen the dialog over and over.
 pub const IMPLICIT_COOLDOWN: Duration = Duration::from_secs(30);
+/// Explicit prompts (an app's `Unlock` or `CreateCollection`) always show a
+/// dialog, but once a scope's dialogs were cancelled or failed this many
+/// times within [`EXPLICIT_REFUSAL_WINDOW`], its further prompts are
+/// dismissed without one until the oldest of those refusals is that old.
+/// An app cannot reopen the dialog after every cancel; other apps are not
+/// affected.
+pub const EXPLICIT_REFUSAL_LIMIT: usize = 3;
+pub const EXPLICIT_REFUSAL_WINDOW: Duration = Duration::from_secs(120);
 
 /// The vault, or the place where it will be created.
 pub struct VaultSlot {
@@ -78,6 +87,7 @@ pub struct Unlocker {
     /// Held while any dialog is shown, so dialogs never overlap.
     dialog_gate: tokio::sync::Mutex<()>,
     cooldown_until: Mutex<Option<Instant>>,
+    explicit_refusals: Mutex<HashMap<Scope, VecDeque<Instant>>>,
     unlocked_tx: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -118,6 +128,7 @@ impl Unlocker {
             next_id: AtomicU64::new(1),
             dialog_gate: tokio::sync::Mutex::new(()),
             cooldown_until: Mutex::new(None),
+            explicit_refusals: Mutex::default(),
             unlocked_tx: tokio::sync::broadcast::channel(4).0,
         })
     }
@@ -189,6 +200,31 @@ impl Unlocker {
             return UnlockOutcome::Cancelled;
         }
         self.ensure_unlocked(requester).await
+    }
+
+    /// Whether an explicit prompt of `scope` may show a dialog now (see
+    /// [`EXPLICIT_REFUSAL_LIMIT`]).
+    pub fn explicit_dialog_allowed(&self, scope: &Scope) -> bool {
+        let mut all = self.explicit_refusals.lock().unwrap();
+        let Some(times) = all.get_mut(scope) else { return true };
+        while times.front().is_some_and(|t| t.elapsed() >= EXPLICIT_REFUSAL_WINDOW) {
+            times.pop_front();
+        }
+        if times.is_empty() {
+            all.remove(scope);
+            return true;
+        }
+        times.len() < EXPLICIT_REFUSAL_LIMIT
+    }
+
+    /// Records that an explicit prompt's dialog was cancelled or failed.
+    pub fn record_explicit_refusal(&self, scope: &Scope) {
+        let mut all = self.explicit_refusals.lock().unwrap();
+        let times = all.entry(scope.clone()).or_default();
+        times.push_back(Instant::now());
+        while times.len() > EXPLICIT_REFUSAL_LIMIT {
+            times.pop_front();
+        }
     }
 
     /// Asks for the master password and checks it, without changing the
