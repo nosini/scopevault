@@ -82,33 +82,40 @@ pub fn negotiate(algorithm: &str, input: &zbus::zvariant::Value<'_>) -> Result<(
 
 /// Performs the server side of the key agreement. Returns the AES key and
 /// our public value.
-fn dh_agree(peer: &[u8]) -> Result<(Zeroizing<[u8; 16]>, Vec<u8>), Fault> {
+/// Parses and checks a peer's public value: 1 < y < p - 1.
+fn parse_public(peer: &[u8]) -> Result<U1024, Fault> {
     let trimmed: &[u8] = &peer[peer.iter().position(|&b| b != 0).unwrap_or(peer.len())..];
     if trimmed.len() > PRIME_BYTES {
         return Err(Fault::invalid_args("public key too long"));
     }
-    let p = prime();
     let y = U1024::from_be_slice(&{
         let mut buf = [0u8; PRIME_BYTES];
         buf[PRIME_BYTES - trimmed.len()..].copy_from_slice(trimmed);
         buf
     });
-    // Reject 0, 1, p-1 and anything >= p: they force a predictable secret.
-    let p_minus_1 = p.wrapping_sub(&U1024::ONE);
+    let p_minus_1 = prime().wrapping_sub(&U1024::ONE);
     if y <= U1024::ONE || y >= p_minus_1 {
         return Err(Fault::invalid_args("invalid public key"));
     }
+    Ok(y)
+}
 
+fn params() -> FixedMontyParams<{ U1024::LIMBS }> {
+    FixedMontyParams::new_vartime(Odd::new(prime()).expect("the prime is odd"))
+}
+
+/// A random private exponent below 2^1023 (< p).
+fn random_exponent() -> Result<U1024, Fault> {
     let mut x_bytes = Zeroizing::new([0u8; PRIME_BYTES]);
     getrandom::fill(x_bytes.as_mut()).map_err(|_| Fault::failed("randomness unavailable"))?;
-    x_bytes[0] &= 0x7f; // below 2^1023 < p
-    let mut x = U1024::from_be_slice(x_bytes.as_ref());
+    x_bytes[0] &= 0x7f;
+    Ok(U1024::from_be_slice(x_bytes.as_ref()))
+}
 
-    let params = FixedMontyParams::new_vartime(Odd::new(p).expect("the prime is odd"));
-    let ours = FixedMontyForm::new(&U1024::from_u8(2), &params).pow(&x).retrieve();
-    let mut shared = FixedMontyForm::new(&y, &params).pow(&x).retrieve();
-    x.zeroize();
-
+/// The AES key both sides derive: HKDF-SHA256 of the shared value, no salt,
+/// no info (libsecret's choice).
+fn derive_key(y: &U1024, x: &U1024) -> Zeroizing<[u8; 16]> {
+    let mut shared = FixedMontyForm::new(y, &params()).pow(x).retrieve();
     let mut ikm = Zeroizing::new([0u8; PRIME_BYTES]);
     ikm.copy_from_slice(shared.to_be_bytes().as_ref());
     shared.zeroize();
@@ -116,7 +123,48 @@ fn dh_agree(peer: &[u8]) -> Result<(Zeroizing<[u8; 16]>, Vec<u8>), Fault> {
     hkdf::Hkdf::<sha2::Sha256>::new(None, ikm.as_ref())
         .expand(&[], key.as_mut())
         .expect("16 bytes is a valid HKDF-SHA256 length");
-    Ok((key, minimal_be(&ours)))
+    key
+}
+
+fn public_value(x: &U1024) -> Vec<u8> {
+    minimal_be(&FixedMontyForm::new(&U1024::from_u8(2), &params()).pow(x).retrieve())
+}
+
+/// The service side: our public value and the session key.
+fn dh_agree(peer: &[u8]) -> Result<(Zeroizing<[u8; 16]>, Vec<u8>), Fault> {
+    let y = parse_public(peer)?;
+    let mut x = random_exponent()?;
+    let ours = public_value(&x);
+    let key = derive_key(&y, &x);
+    x.zeroize();
+    Ok((key, ours))
+}
+
+/// The client side of `dh-ietf1024-sha256-aes128-cbc-pkcs7`, for talking to
+/// another Secret Service provider (migration and rollback).
+pub struct ClientDh {
+    x: U1024,
+}
+
+impl Drop for ClientDh {
+    fn drop(&mut self) {
+        self.x.zeroize();
+    }
+}
+
+impl ClientDh {
+    /// A new exchange and the public value to send with `OpenSession`.
+    pub fn start() -> Result<(Self, Vec<u8>), Fault> {
+        let x = random_exponent()?;
+        let public = public_value(&x);
+        Ok((ClientDh { x }, public))
+    }
+
+    /// The session's algorithm, from the service's `OpenSession` output.
+    pub fn finish(self, server_public: &[u8]) -> Result<Algorithm, Fault> {
+        let y = parse_public(server_public)?;
+        Ok(Algorithm::DhAes(derive_key(&y, &self.x)))
+    }
 }
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -166,27 +214,12 @@ pub(crate) mod tests {
     use super::*;
 
     /// The client side, as libsecret does it, for tests.
-    pub fn client_agree(server_public: &[u8], x: &U1024) -> [u8; 16] {
-        let p = prime();
-        let params = FixedMontyParams::new_vartime(Odd::new(p).unwrap());
-        let mut buf = [0u8; PRIME_BYTES];
-        buf[PRIME_BYTES - server_public.len()..].copy_from_slice(server_public);
-        let shared = FixedMontyForm::new(&U1024::from_be_slice(&buf), &params).pow(x).retrieve();
-        let mut key = [0u8; 16];
-        hkdf::Hkdf::<sha2::Sha256>::new(None, shared.to_be_bytes().as_ref()).expand(&[], &mut key).unwrap();
-        key
-    }
-
-    pub fn client_public(x: &U1024) -> Vec<u8> {
-        let params = FixedMontyParams::new_vartime(Odd::new(prime()).unwrap());
-        minimal_be(&FixedMontyForm::new(&U1024::from_u8(2), &params).pow(x).retrieve())
-    }
-
     #[test]
     fn both_sides_agree_and_roundtrip() {
-        let x = U1024::from_be_hex(&format!("01{}ff", "5a".repeat(126)));
-        let (key, server_pub) = dh_agree(&client_public(&x)).unwrap();
-        assert_eq!(client_agree(&server_pub, &x), *key);
+        let (client, client_pub) = ClientDh::start().unwrap();
+        let (key, server_pub) = dh_agree(&client_pub).unwrap();
+        let Algorithm::DhAes(client_key) = client.finish(&server_pub).unwrap() else { panic!("not DH") };
+        assert_eq!(*client_key, *key);
 
         let algo = Algorithm::DhAes(key);
         for secret in [&b""[..], b"x", b"exactly sixteen!", &[0xffu8; 1000][..]] {

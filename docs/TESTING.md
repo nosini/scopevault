@@ -104,3 +104,13 @@ offers a second run on the same vault with the daemon restarted, to check
 that the app finds what it stored. `scripts/sandbox-secret-check.sh`
 stores, reads, searches and deletes a test secret from a shell inside a
 sandbox, for apps that have a terminal.
+
+### Migration and rollback
+
+`scripts/host-migration-check.sh` fills a private gnome-keyring with
+three items, imports them into a new vault, adds a fourth in scopevault
+and exports everything back.
+
+`scripts/activation-check.sh` is read-only. It shows who serves the
+Secret Service in your real session, what is queued for the name, and
+which files decide that.

@@ -1,6 +1,6 @@
 [package]
 name = "scopevault"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -12,8 +12,9 @@ crypto-bigint = { version = "=0.7.5", features = ["zeroize"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
 hkdf = "=0.13.0"
+libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
-rustix = { version = "1.1.5", features = ["process", "fs", "pipe", "thread", "param", "event"] }
+rustix = { version = "1.1.5", features = ["process", "fs", "pipe", "thread", "param", "event", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "=0.11.0"
@@ -23,3 +24,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 zeroize = "1.9"
+
+# Argon2 is about ten times slower unoptimised, which makes key derivation
+# with real parameters take seconds in debug builds and tests.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

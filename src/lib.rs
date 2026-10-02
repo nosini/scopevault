@@ -1,6 +1,7 @@
 //! Scoped Secret Service: a Secret Service provider that keeps each Flatpak
 //! application's secrets in its own namespace.
 
+pub mod admin;
 pub mod crypto;
 pub mod hardening;
 pub mod identity;

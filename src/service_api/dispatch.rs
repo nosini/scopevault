@@ -774,12 +774,7 @@ impl<R: CallerResolver> SecretService<R> {
     /// After the vault is unlocked, tells every identified connection that
     /// its scope's collections are now visible.
     async fn announce_unlock(&self) {
-        let principals: Vec<Principal> = {
-            let peers = self.peers.lock().unwrap();
-            let mut seen = std::collections::HashSet::new();
-            peers.values().filter_map(|p| p.principal.get()).filter(|p| seen.insert(p.scope())).cloned().collect()
-        };
-        for p in principals {
+        for p in self.active_principals() {
             let Ok(cols) = self.with_vault(&p, |v| Ok(v.collection_names())) else { continue };
             let paths: Vec<OwnedObjectPath> = cols.iter().map(|c| paths::collection(c)).collect();
             let Ok(v) = value(paths) else { continue };
@@ -794,6 +789,57 @@ impl<R: CallerResolver> SecretService<R> {
             })
             .await;
         }
+    }
+
+    /// One identified principal per scope with a connection.
+    fn active_principals(&self) -> Vec<Principal> {
+        let peers = self.peers.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        peers.values().filter_map(|p| p.principal.get()).filter(|p| seen.insert(p.scope())).cloned().collect()
+    }
+
+    /// Global lock, for the administrative interface: drops the vault key
+    /// and all decrypted metadata, so nothing is returned until the next
+    /// unlock dialog succeeds. Connections are told that their collections
+    /// are locked. Returns false if the vault was not unlocked.
+    ///
+    /// Transfer sessions stay open. They protect secrets in transit to
+    /// their own connection only, and libsecret opens one session per
+    /// process and never reopens it, so dropping them would break every
+    /// running application until it restarts.
+    pub fn global_lock(self: &Arc<Self>) -> bool {
+        let principals = self.active_principals();
+        let mut locked: Vec<(Scope, Vec<String>)> = Vec::new();
+        {
+            let mut slot = self.unlocker.vault().lock().unwrap();
+            let Some(v) = slot.vault.as_mut().filter(|v| v.is_unlocked()) else { return false };
+            for p in &principals {
+                if let Ok(s) = v.scoped(p) {
+                    locked.push((p.scope(), s.collection_names()));
+                }
+            }
+            v.lock();
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            for (scope, collections) in locked {
+                for c in collections {
+                    let Ok(v) = value(true) else { continue };
+                    this.emit(Event {
+                        target: Target::Scope(scope.clone()),
+                        path: paths::collection(&c),
+                        interface: interfaces::PROPERTIES.name,
+                        member: "PropertiesChanged",
+                        body: SignalBody::PropertiesChanged(
+                            interfaces::COLLECTION.name,
+                            BTreeMap::from([("Locked", v)]),
+                        ),
+                    })
+                    .await;
+                }
+            }
+        });
+        true
     }
 
     /// Client connections currently tracked (for diagnostics and tests).

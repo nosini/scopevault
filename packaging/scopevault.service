@@ -1,0 +1,23 @@
+# systemd user unit for scopevault-daemon. Install as
+# ~/.config/systemd/user/scopevault.service (see docs/INSTALL.md).
+#
+# No namespace sandboxing (ProtectSystem, ProtectHome, PrivateTmp and the
+# like): it would put the daemon in its own mount namespace, and then every
+# host caller fails the same-namespace check and is refused.
+
+[Unit]
+Description=scopevault Secret Service
+# Take the name before applications and autostart entries run. If
+# gnome-keyring's secrets component starts first (the Secret portal backend
+# starts it), it owns the name and this unit fails.
+Before=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart=%h/.local/bin/scopevault-daemon --pinentry /usr/bin/pinentry-gnome3
+Environment=RUST_LOG=scopevault=info
+
+[Install]
+WantedBy=graphical-session-pre.target

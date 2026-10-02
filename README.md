@@ -13,10 +13,10 @@ including the passwords of all other apps.
 
 ## Status
 
-The daemon implements the whole Secret Service API on an encrypted vault,
-and works with libsecret, `secret-tool`, Seahorse and Python's
-`secretstorage`. It can be tried on a private bus, but there is no
-installation or migration from gnome-keyring yet.
+The daemon implements the whole Secret Service API on an encrypted vault
+and has been tested with real Flatpak apps. It can replace gnome-keyring
+on a GNOME desktop, with migration and a way back. The Secret portal
+still comes from gnome-keyring.
 
 It is written in Rust and needs a session bus that hands out process file
 descriptors, which dbus-broker does.
@@ -31,6 +31,9 @@ descriptors, which dbus-broker does.
   through pinentry.
 - Each scope gets a `login` collection as its default, like
   gnome-keyring's login keyring.
+- `scopevault-admin` manages the vault across scopes: moving items between
+  apps, resetting a scope, backups, and importing from or exporting to
+  gnome-keyring.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains
@@ -41,6 +44,8 @@ what it does protect and why.
 - [docs/DESIGN.md](docs/DESIGN.md): how callers are identified, how scopes
   work, and the limits.
 - [docs/STORE.md](docs/STORE.md): the encrypted vault.
+- [docs/INSTALL.md](docs/INSTALL.md): switching from gnome-keyring, and
+  back.
 - [docs/TESTING.md](docs/TESTING.md): the tests, and checking scopevault
   against real Flatpak apps without touching your keyring.
 - [CHANGELOG.md](CHANGELOG.md)

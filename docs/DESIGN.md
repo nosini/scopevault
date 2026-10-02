@@ -52,6 +52,7 @@ A Flatpak app ID names an installed app, not its publisher. An update keeps
 the scope. A different program installed later under the same ID inherits
 it, unless the scope is reset. Uninstalling an app does not delete its
 secrets.
+`scopevault-admin reset-scope` does that on request.
 
 ## Identifying callers
 
@@ -192,6 +193,55 @@ dialog for a while. Other apps still get theirs.
 An app can lock its own collections. That locks them for every connection
 of its scope, and reading secrets from them then needs the master password
 again. Other collections and other scopes are not affected.
+Locking the whole vault is only possible through the administrative
+interface.
+
+A global lock keeps transfer sessions open. libsecret opens one session per
+process and never opens another, so closing them would break every running
+application until it restarts. A session only protects secrets on their
+way to its own connection, so keeping it gives nothing away.
+
+## Administration
+
+Ordinary Secret Service requests from host programs stay limited to
+`host`, Seahorse included. Working across scopes needs the administrative
+interface: a Unix socket in `$XDG_RUNTIME_DIR/scopevault/`, used by
+`scopevault-admin`. Its peers are identified the same way as D-Bus callers,
+and only host programs are served. A socket with mode 0600 alone would not
+be enough, since Flatpak apps run as the same user.
+
+Commands that hand secrets to another scope or destroy data, such as
+`move` and `reset-scope`, ask for the master password in the daemon's own
+dialog. No password ever passes through the CLI or the socket.
+
+`restore`, `import` and `export` work on the vault file directly and need
+the daemon stopped.
+
+### Moving from gnome-keyring
+
+`scopevault-admin import` reads everything from gnome-keyring through its
+Secret Service API, not its files, and puts it into `host`.
+scopevault never guesses which item belongs to which app from labels or
+attributes, since apps control those. Moving items to an app's scope is a
+deliberate `scopevault-admin move`. There is also no fallback from an app's
+scope to `host` when something is missing: that would undo the isolation.
+
+`scopevault-admin export` goes the other way, for switching back. It writes
+what gnome-keyring doesn't have and skips what it has.
+
+### gnome-keyring and the bus name
+
+Only one process can own `org.freedesktop.secrets`. gnome-keyring's login
+daemon, started by PAM, only claims the name when something asks for its
+`secrets` component: its autostart entry, its D-Bus activation file, its
+Secret portal backend or its own systemd units. The installation hides or
+overrides the first two and masks the units.
+
+gnome-keyring asks for the name in a way that puts it in the bus's queue
+while scopevault owns it. If scopevault then stops, the bus hands the name
+to gnome-keyring at once, and applications start storing secrets there
+without anyone noticing. The daemon checks the queue once a minute and logs
+a warning while anything waits in it.
 
 ## What scopevault does not protect against
 
@@ -222,3 +272,6 @@ again. Other collections and other scopes are not affected.
   client). Bitwarden could not be put through the private-bus test
   harness: it crashed there at startup, before talking to the daemon, so
   that test says nothing about it.
+- gnome-keyring reports the generic schema for schema-less items only
+  after reloading them from disk, so scopevault treats a missing schema
+  and the generic one as the same when comparing items.

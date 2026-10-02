@@ -53,10 +53,9 @@ EOF
     check "store and lookup" "$(echo "$out" | sed -n 's/^lookup=//p')" "$value"
     check "clear" "$(echo "$out" | sed -n 's/^after-clear=//p')" ""
 else
-    client=
-    for d in "$root/target/release" "$root/target/debug"; do
-        [ -x "$d/scopevault-client" ] && client=$d/scopevault-client && break
-    done
+    # The newer of the release and debug builds.
+    # shellcheck disable=SC2012 # two fixed paths
+    client=$(ls -t "$root/target/release/scopevault-client" "$root/target/debug/scopevault-client" 2>/dev/null | head -n 1)
     if [ -z "$client" ]; then
         echo "no client found: no secret-tool, no python3 with libsecret, no built scopevault-client" >&2
         exit 2

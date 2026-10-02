@@ -39,9 +39,11 @@ need dbus-broker-launch "install dbus-broker"
 [ -z "$seahorse" ] || need seahorse "install seahorse"
 activate=$(command -v systemd-socket-activate || echo /usr/lib/systemd/systemd-socket-activate)
 [ -x "$activate" ] || { echo "systemd-socket-activate not found" >&2; exit 2; }
-daemon=$root/target/release/scopevault-daemon
-[ -x "$daemon" ] || daemon=$root/target/debug/scopevault-daemon
-[ -x "$daemon" ] || { echo "build the daemon first: cargo build --bin scopevault-daemon" >&2; exit 2; }
+# The newer of the release and debug builds: a stale one must not win.
+# shellcheck disable=SC2012 # two fixed paths
+newest() { ls -t "$root/target/release/$1" "$root/target/debug/$1" 2>/dev/null | head -n 1; }
+daemon=$(newest scopevault-daemon)
+[ -n "$daemon" ] || { echo "build the daemon first: cargo build --bin scopevault-daemon" >&2; exit 2; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/scopevault-libsecret.XXXXXX")
 bus_pid=
@@ -108,6 +110,7 @@ if ! dbus NameHasOwner org.freedesktop.DBus >/dev/null 2>&1; then
     exit 1
 fi
 echo "private bus: $DBUS_SESSION_BUS_ADDRESS (dbus-broker)"
+echo "daemon: $daemon"
 
 # ---- the checks ----
 pass=0
@@ -128,7 +131,8 @@ pw="scopevault test"
 
 start() {
     RUST_LOG=${RUST_LOG:-scopevault=debug} \
-        "$daemon" --data-dir "$work/vault" --pinentry "$pinentry" 2>>"$work/daemon.log" &
+        "$daemon" --data-dir "$work/vault" --pinentry "$pinentry" --admin-socket "$work/admin/socket" \
+            2>>"$work/daemon.log" &
     daemon_pid=$!
     for _ in $(seq 100); do
         if dbus NameHasOwner org.freedesktop.secrets 2>/dev/null | grep -q true; then return 0; fi

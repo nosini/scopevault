@@ -28,6 +28,7 @@ export ROOT="$root" WORK="$work" PYTHON="$python"
     pins() { printf "%s\n" "$@" > "$WORK/pinentry/pins"; rm -f "$WORK/pinentry/count"; }
     run() {
         "$ROOT/target/debug/scopevault-daemon" --data-dir "$WORK/vault" --pinentry "$WORK/pinentry.sh" \
+            --admin-socket "$WORK/admin/socket" \
             2>>"$WORK/daemon.log" &
         pid=$!
         "$PYTHON" "$ROOT/scripts/interop/secretstorage_client.py" "$1" || { kill $pid; cat "$WORK/daemon.log" >&2; exit 1; }

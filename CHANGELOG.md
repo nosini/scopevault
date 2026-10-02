@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+- `scopevault-admin`: status, global lock, password change, listing
+  scopes and items, moving items between scopes, resetting a scope,
+  backup and restore.
+- Import from gnome-keyring and export back to it.
+- Installation files and instructions, and a warning when gnome-keyring
+  queues for the Secret Service name.
+
 ## 0.4.1
 
 - Each scope gets a `login` collection as its default, as with

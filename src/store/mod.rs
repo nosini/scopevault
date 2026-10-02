@@ -6,17 +6,26 @@
 //!
 //! Request handlers never get an unrestricted handle: they obtain a
 //! [`ScopedVault`] from an authenticated [`Principal`], and every operation
-//! on it is confined to that principal's scope.
+//! on it is confined to that principal's scope. Other scopes are reachable
+//! only with an [`AdminAuthority`], which the administrative interface
+//! creates after verifying its caller.
 //!
 //! Every change is one SQLite transaction; the index is updated only after
 //! the transaction commits, so a failed write leaves both unchanged.
+//! [`Vault::transaction`] groups several changes, possibly in several
+//! scopes, into one.
 //!
 //! Lock state has two layers: the vault is physically locked (no key, no
 //! index) or unlocked, and each collection is additionally logically locked
 //! or not. Locking a collection affects only that collection.
 
+mod admin;
 pub mod db;
 pub mod payload;
+
+pub use admin::{
+    CollectionListing, ImportReport, ItemListing, PortableCollection, PortableItem, ScopeSummary, same_attributes,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -24,6 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
+pub use crate::admin::AdminAuthority;
 use crate::crypto::{CryptoError, KdfParams, RecordAad, RecordCipher, VaultKey, random_array};
 use crate::identity::{Principal, Scope};
 use crate::service_api::paths;
@@ -162,6 +172,26 @@ struct Unlocked {
     namespaces: HashMap<Scope, NamespaceEntry>,
     /// Logically locked collections (by record ID).
     locked: HashSet<RecordId>,
+    /// Changes made inside [`Vault::transaction`], not yet applied.
+    staged: Option<Staged>,
+}
+
+impl Unlocked {
+    fn new(cipher: RecordCipher, namespaces: HashMap<Scope, NamespaceEntry>) -> Self {
+        Unlocked { cipher, namespaces, locked: HashSet::new(), staged: None }
+    }
+}
+
+/// Namespaces changed (`None`: removed) and record changes in order.
+#[derive(Default)]
+struct Staged {
+    namespaces: HashMap<Scope, Option<NamespaceEntry>>,
+    changes: Vec<Change>,
+}
+
+enum Change {
+    Put(RawRecord),
+    Delete(RecordId, u8),
 }
 
 pub struct Vault {
@@ -312,7 +342,7 @@ impl Vault {
             }
         };
         let cipher = key.record_cipher();
-        Ok(Vault { db, unlocked: Some(Unlocked { cipher, namespaces: HashMap::new(), locked: HashSet::new() }) })
+        Ok(Vault { db, unlocked: Some(Unlocked::new(cipher, HashMap::new())) })
     }
 
     /// Opens an existing vault, locked.
@@ -344,13 +374,32 @@ impl Vault {
         }
         let cipher = key.record_cipher();
         let namespaces = build_index(&cipher, &self.db.load_all()?)?;
-        self.unlocked = Some(Unlocked { cipher, namespaces, locked: HashSet::new() });
+        self.unlocked = Some(Unlocked::new(cipher, namespaces));
         Ok(())
     }
 
     /// Global lock: drops the key and all decrypted metadata.
     pub fn lock(&mut self) {
         self.unlocked = None;
+    }
+
+    /// Writes a copy of the encrypted database to `dest` (which must not
+    /// exist). It opens with the password current now. Works while locked.
+    pub fn backup_into(&self, dest: &Path) -> Result<(), StoreError> {
+        self.db.backup_into(dest)
+    }
+
+    /// Stores `new` in place of the key wrap `current`, if that is still the
+    /// stored one. For callers that derive keys without holding the vault.
+    pub fn replace_key_wrap(
+        &mut self,
+        current: &crate::crypto::KeyWrap,
+        new: &crate::crypto::KeyWrap,
+    ) -> Result<(), StoreError> {
+        if &self.db.key_wrap()? != current {
+            return Err(StoreError::Invalid("the password was changed meanwhile"));
+        }
+        self.db.set_key_wrap(new)
     }
 
     /// Rewraps the vault key under a new password. Requires the current
@@ -369,7 +418,47 @@ impl Vault {
         if self.unlocked.is_none() {
             return Err(StoreError::Locked);
         }
-        Ok(ScopedVault { vault: self, scope: principal.scope() })
+        Ok(ScopedVault { vault: self, scope: principal.scope(), admin: false })
+    }
+
+    /// Any scope's view, for the administrative interface. Logical
+    /// collection locks do not apply to it.
+    pub fn scoped_admin(&mut self, _authority: &AdminAuthority, scope: Scope) -> Result<ScopedVault<'_>, StoreError> {
+        if self.unlocked.is_none() {
+            return Err(StoreError::Locked);
+        }
+        Ok(ScopedVault { vault: self, scope, admin: true })
+    }
+
+    /// Runs `f`, then applies all its changes in one database transaction;
+    /// if `f` or the transaction fails, nothing changes.
+    pub fn transaction<T>(&mut self, f: impl FnOnce(&mut Vault) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let u = self.unlocked.as_mut().ok_or(StoreError::Locked)?;
+        if u.staged.is_some() {
+            return Err(StoreError::Invalid("nested transaction"));
+        }
+        u.staged = Some(Staged::default());
+        let result = f(self);
+        let staged = self.unlocked.as_mut().and_then(|u| u.staged.take());
+        let value = result?;
+        let staged = staged.ok_or(StoreError::Locked)?;
+        let ops: Vec<db::Op<'_>> = staged
+            .changes
+            .iter()
+            .map(|c| match c {
+                Change::Put(r) => db::Op::Put(r),
+                Change::Delete(id, kind) => db::Op::Delete(*id, *kind),
+            })
+            .collect();
+        self.db.apply_ops(&ops)?;
+        let u = self.unlocked.as_mut().expect("checked above");
+        for (scope, ns) in staged.namespaces {
+            match ns {
+                Some(ns) => u.namespaces.insert(scope, ns),
+                None => u.namespaces.remove(&scope),
+            };
+        }
+        Ok(value)
     }
 
     /// Scopes that have data. For the administrative interface.
@@ -386,6 +475,8 @@ impl Vault {
 pub struct ScopedVault<'a> {
     vault: &'a mut Vault,
     scope: Scope,
+    /// Opened with [`AdminAuthority`]: logical collection locks are ignored.
+    admin: bool,
 }
 
 fn validate_label(label: &str) -> Result<(), StoreError> {
@@ -439,7 +530,11 @@ impl ScopedVault<'_> {
     }
 
     fn ns(&self) -> Option<&NamespaceEntry> {
-        self.state().namespaces.get(&self.scope)
+        let st = self.state();
+        match st.staged.as_ref().and_then(|s| s.namespaces.get(&self.scope)) {
+            Some(staged) => staged.as_ref(),
+            None => st.namespaces.get(&self.scope),
+        }
     }
 
     fn collection_entry(&self, name: &str) -> Result<&CollectionEntry, StoreError> {
@@ -496,15 +591,36 @@ impl ScopedVault<'_> {
     }
 
     /// Writes to the database, then installs `ns` as the scope's index entry.
+    /// Inside [`Vault::transaction`] both are staged instead.
     fn commit(
         &mut self,
         ns: NamespaceEntry,
         writes: &[RawRecord],
         deletes: &[(RecordId, u8)],
     ) -> Result<(), StoreError> {
-        self.vault.db.apply(writes, deletes)?;
+        self.commit_ns(Some(ns), writes, deletes)
+    }
+
+    /// Like [`ScopedVault::commit`]; `None` removes the scope's entry.
+    fn commit_ns(
+        &mut self,
+        ns: Option<NamespaceEntry>,
+        writes: &[RawRecord],
+        deletes: &[(RecordId, u8)],
+    ) -> Result<(), StoreError> {
         let scope = self.scope.clone();
-        self.vault.unlocked.as_mut().expect("unlocked").namespaces.insert(scope, ns);
+        if let Some(st) = self.vault.unlocked.as_mut().expect("unlocked").staged.as_mut() {
+            st.changes.extend(writes.iter().cloned().map(Change::Put));
+            st.changes.extend(deletes.iter().map(|(id, kind)| Change::Delete(*id, *kind)));
+            st.namespaces.insert(scope, ns);
+            return Ok(());
+        }
+        self.vault.db.apply(writes, deletes)?;
+        let namespaces = &mut self.vault.unlocked.as_mut().expect("unlocked").namespaces;
+        match ns {
+            Some(ns) => namespaces.insert(scope, ns),
+            None => namespaces.remove(&scope),
+        };
         Ok(())
     }
 
@@ -578,18 +694,28 @@ impl ScopedVault<'_> {
     pub fn read_secret(&self, collection: &str, item: &str) -> Result<Secret, StoreError> {
         let id = self.item_id(collection, item)?;
         let c = self.collection_entry(collection)?;
-        if self.state().locked.contains(&c.id) {
+        if !self.admin && self.state().locked.contains(&c.id) {
             return Err(StoreError::Locked);
         }
         if c.ephemeral {
             return c.secrets.get(&id).cloned().ok_or(StoreError::NoSuchObject);
         }
         let ns_id = self.ns().expect("collection exists").id;
-        let raw = self
-            .vault
-            .db
-            .load_one(&id, KIND_SECRET)?
-            .ok_or_else(|| StoreError::Corrupt("missing secret record".into()))?;
+        // Inside a transaction the record may have been written just now.
+        let staged = self.state().staged.as_ref().and_then(|st| {
+            st.changes.iter().rev().find_map(|c| match c {
+                Change::Put(r) if r.id == id && r.kind == KIND_SECRET => Some(r.clone()),
+                _ => None,
+            })
+        });
+        let raw = match staged {
+            Some(r) => r,
+            None => self
+                .vault
+                .db
+                .load_one(&id, KIND_SECRET)?
+                .ok_or_else(|| StoreError::Corrupt("missing secret record".into()))?,
+        };
         if raw.namespace != ns_id {
             return Err(StoreError::Corrupt("secret record is misfiled".into()));
         }
@@ -611,7 +737,7 @@ impl ScopedVault<'_> {
 
     fn ensure_writable(&self, collection: &str) -> Result<(), StoreError> {
         let id = self.collection_entry(collection)?.id;
-        if self.state().locked.contains(&id) { Err(StoreError::Locked) } else { Ok(()) }
+        if !self.admin && self.state().locked.contains(&id) { Err(StoreError::Locked) } else { Ok(()) }
     }
 
     // ---- writing ----
@@ -689,7 +815,11 @@ impl ScopedVault<'_> {
         ns.aliases.retain(|_, target| *target != c.id);
         let writes = if c.ephemeral { Vec::new() } else { vec![self.namespace_record(&ns)?] };
         self.commit(ns, &writes, &deletes)?;
-        self.vault.unlocked.as_mut().expect("unlocked").locked.remove(&c.id);
+        // A stale ID left by a transaction is harmless: IDs are never reused.
+        let u = self.vault.unlocked.as_mut().expect("unlocked");
+        if u.staged.is_none() {
+            u.locked.remove(&c.id);
+        }
         Ok(())
     }
 

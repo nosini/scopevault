@@ -281,8 +281,23 @@ impl Db {
             .transpose()
     }
 
+    /// Writes a consistent copy of the database (ciphertext and key wrap,
+    /// as stored) to `dest`, which must not exist.
+    pub fn backup_into(&self, dest: &Path) -> Result<(), StoreError> {
+        let dest = dest.to_str().ok_or(StoreError::Invalid("backup path is not UTF-8"))?;
+        self.conn.execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
+    }
+
     /// Applies writes and deletes atomically.
     pub fn apply(&mut self, writes: &[RawRecord], deletes: &[(RecordId, u8)]) -> Result<(), StoreError> {
+        let ops: Vec<Op<'_>> =
+            writes.iter().map(Op::Put).chain(deletes.iter().map(|(id, k)| Op::Delete(*id, *k))).collect();
+        self.apply_ops(&ops)
+    }
+
+    /// Applies operations atomically, in order.
+    pub fn apply_ops(&mut self, ops: &[Op<'_>]) -> Result<(), StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut put = tx.prepare_cached(
@@ -290,15 +305,21 @@ impl Db {
                  ON CONFLICT (id, kind) DO UPDATE SET namespace = excluded.namespace,
                      nonce = excluded.nonce, ciphertext = excluded.ciphertext",
             )?;
-            for r in writes {
-                put.execute(params![&r.id[..], r.kind, &r.namespace[..], &r.nonce, &r.ciphertext])?;
-            }
             let mut del = tx.prepare_cached("DELETE FROM records WHERE id = ?1 AND kind = ?2")?;
-            for (id, kind) in deletes {
-                del.execute(params![&id[..], kind])?;
+            for op in ops {
+                match op {
+                    Op::Put(r) => put.execute(params![&r.id[..], r.kind, &r.namespace[..], &r.nonce, &r.ciphertext])?,
+                    Op::Delete(id, kind) => del.execute(params![&id[..], kind])?,
+                };
             }
         }
         tx.commit()?;
         Ok(())
     }
+}
+
+/// One change to the records table.
+pub enum Op<'a> {
+    Put(&'a RawRecord),
+    Delete(RecordId, u8),
 }

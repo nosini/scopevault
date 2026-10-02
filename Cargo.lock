@@ -773,7 +773,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "scopevault"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes",
  "argon2",
@@ -783,6 +783,7 @@ dependencies = [
  "futures-util",
  "getrandom",
  "hkdf",
+ "libc",
  "rusqlite",
  "rustix",
  "serde",

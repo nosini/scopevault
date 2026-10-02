@@ -57,14 +57,14 @@ need gdbus "install glib2-tools"
 need dbus-broker-launch "install dbus-broker"
 activate=$(command -v systemd-socket-activate || echo /usr/lib/systemd/systemd-socket-activate)
 [ -x "$activate" ] || { echo "systemd-socket-activate not found" >&2; exit 2; }
-bindir=
-for d in "$root/target/release" "$root/target/debug"; do
-    if [ -x "$d/scopevault-daemon" ] && [ -x "$d/scopevault-client" ] && [ -x "$d/scopevault-probe" ]; then
-        bindir=$d
-        break
-    fi
-done
-[ -n "$bindir" ] || { echo "build the binaries first: cargo build --bins" >&2; exit 2; }
+# The newer of the release and debug builds: a stale one must not win.
+# shellcheck disable=SC2012 # two fixed paths
+newest() { ls -t "$root/target/release/$1" "$root/target/debug/$1" 2>/dev/null | head -n 1; }
+bindir=$(dirname "$(newest scopevault-daemon)")
+if ! [ -x "$bindir/scopevault-client" ] || ! [ -x "$bindir/scopevault-probe" ]; then
+    echo "build the binaries first: cargo build --bins" >&2
+    exit 2
+fi
 for a in "$@" $app; do
     flatpak info "$a" >/dev/null 2>&1 || { echo "$a is not an installed Flatpak (see 'flatpak list --app')" >&2; exit 2; }
 done
@@ -185,7 +185,8 @@ fi
 # ---- the daemon ----
 start() {
     RUST_LOG=${RUST_LOG:-scopevault=debug} \
-        "$bindir/scopevault-daemon" --data-dir "$work/vault" --pinentry "$pinentry" 2>>"$work/daemon.log" &
+        "$bindir/scopevault-daemon" --data-dir "$work/vault" --pinentry "$pinentry" --admin-socket "$work/admin/socket" \
+            2>>"$work/daemon.log" &
     daemon_pid=$!
     wait_name org.freedesktop.secrets || { echo "daemon did not start:" >&2; cat "$work/daemon.log" >&2; exit 1; }
 }

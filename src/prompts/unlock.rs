@@ -111,6 +111,9 @@ impl Drop for WaiterGuard {
     }
 }
 
+/// How dialogs name the administrative tool.
+const ADMIN: &str = "The keyring administration tool (scopevault-admin)";
+
 fn display(scope: &Scope) -> String {
     match scope {
         Scope::Host => "An application on your computer".into(),
@@ -145,6 +148,16 @@ impl Unlocker {
     /// Returns once the vault is unlocked, the user cancelled, or unlocking
     /// failed. `requester` is only used for the dialog text.
     pub async fn ensure_unlocked(self: &Arc<Self>, requester: &Scope) -> UnlockOutcome {
+        self.ensure_unlocked_as(display(requester)).await
+    }
+
+    /// [`Unlocker::ensure_unlocked`] for the administrative interface.
+    pub async fn ensure_unlocked_admin(self: &Arc<Self>) -> UnlockOutcome {
+        self.ensure_unlocked_as(ADMIN.into()).await
+    }
+
+    /// `who` names the requester in the dialog, if one is started.
+    async fn ensure_unlocked_as(self: &Arc<Self>, who: String) -> UnlockOutcome {
         if self.vault.lock().unwrap().is_unlocked() {
             return UnlockOutcome::Unlocked;
         }
@@ -157,7 +170,6 @@ impl Unlocker {
                     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                     let (tx, rx) = watch::channel(None);
                     let this = self.clone();
-                    let who = display(requester);
                     let task = tokio::spawn(async move {
                         let outcome = this.dialog(&who).await;
                         let _ = tx.send(Some(outcome));
@@ -231,15 +243,26 @@ impl Unlocker {
     /// vault. Used to reopen a collection its owner locked while the vault
     /// stays unlocked. Dropping the future closes the dialog.
     pub async fn confirm_password(self: &Arc<Self>, requester: &Scope) -> UnlockOutcome {
-        let _gate = self.dialog_gate.lock().await;
         let who = display(requester);
+        let description =
+            format!("{who} wants to unlock one of its locked collections. Enter your keyring password to allow it.");
+        self.confirm("Unlock collection", &description).await
+    }
+
+    /// Asks for the master password to allow an administrative action,
+    /// described by `action` ("move 2 items from ... to ...").
+    pub async fn confirm_admin(self: &Arc<Self>, action: &str) -> UnlockOutcome {
+        let description = format!("{ADMIN} wants to {action}. Enter your keyring password to allow it.");
+        self.confirm("Allow keyring administration", &description).await
+    }
+
+    async fn confirm(self: &Arc<Self>, title: &str, description: &str) -> UnlockOutcome {
+        let _gate = self.dialog_gate.lock().await;
         let mut error = None;
         for _ in 0..MAX_ATTEMPTS {
             let req = PinRequest {
-                title: "Unlock collection".into(),
-                description: format!(
-                    "{who} wants to unlock one of its locked collections. Enter your keyring password to allow it."
-                ),
+                title: title.into(),
+                description: description.into(),
                 prompt: "Password:".into(),
                 error: error.take(),
                 repeat: None,
@@ -262,6 +285,76 @@ impl Unlocker {
             }
         }
         UnlockOutcome::Cancelled
+    }
+
+    /// Asks for the current password, then a new one (twice), and rewraps
+    /// the vault key. The passwords go only to this process. The slow key
+    /// derivations run without holding the vault.
+    pub async fn change_password(self: &Arc<Self>) -> UnlockOutcome {
+        let (key, old_wrap) = match self.current_key("Change keyring password").await {
+            Ok(k) => k,
+            Err(outcome) => return outcome,
+        };
+        let _gate = self.dialog_gate.lock().await;
+        let req = PinRequest {
+            title: "Change keyring password".into(),
+            description: "Choose a new keyring password.".into(),
+            prompt: "New password:".into(),
+            error: None,
+            repeat: Some("Repeat:".into()),
+        };
+        let new = match pinentry::ask(&self.pinentry, &req).await {
+            Ok(PinOutcome::Entered(p)) if p.is_empty() => return UnlockOutcome::Cancelled,
+            Ok(PinOutcome::Entered(p)) => p,
+            Ok(PinOutcome::Cancelled) => return UnlockOutcome::Cancelled,
+            Err(e) => return UnlockOutcome::Failed(e.to_string()),
+        };
+        let kdf = self.new_vault_kdf;
+        let new_wrap = match tokio::task::spawn_blocking(move || key.wrap(new.as_bytes(), kdf)).await {
+            Ok(Ok(w)) => w,
+            Ok(Err(e)) => return UnlockOutcome::Failed(e.to_string()),
+            Err(e) => return UnlockOutcome::Failed(e.to_string()),
+        };
+        let mut slot = self.vault.lock().unwrap();
+        match slot.vault.as_mut().map(|v| v.replace_key_wrap(&old_wrap, &new_wrap)) {
+            Some(Ok(())) => UnlockOutcome::Unlocked,
+            Some(Err(e)) => UnlockOutcome::Failed(e.to_string()),
+            None => UnlockOutcome::Failed("no vault exists yet".into()),
+        }
+    }
+
+    /// Asks for the current master password until it is right; returns the
+    /// vault key and the wrap it came from.
+    async fn current_key(&self, title: &str) -> Result<(VaultKey, crate::crypto::KeyWrap), UnlockOutcome> {
+        let _gate = self.dialog_gate.lock().await;
+        let mut error = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let req = PinRequest {
+                title: title.into(),
+                description: format!("{ADMIN} wants to change the keyring password. Enter the current password."),
+                prompt: "Current password:".into(),
+                error: error.take(),
+                repeat: None,
+            };
+            let password = match pinentry::ask(&self.pinentry, &req).await {
+                Ok(PinOutcome::Entered(p)) => p,
+                Ok(PinOutcome::Cancelled) => return Err(UnlockOutcome::Cancelled),
+                Err(e) => return Err(UnlockOutcome::Failed(e.to_string())),
+            };
+            let wrap = match self.vault.lock().unwrap().vault.as_ref().map(Vault::key_wrap) {
+                Some(Ok(w)) => w,
+                Some(Err(e)) => return Err(UnlockOutcome::Failed(e.to_string())),
+                None => return Err(UnlockOutcome::Failed("no vault exists yet".into())),
+            };
+            let w = wrap.clone();
+            match tokio::task::spawn_blocking(move || VaultKey::unwrap(&w, password.as_bytes())).await {
+                Ok(Ok(key)) => return Ok((key, wrap)),
+                Ok(Err(crate::crypto::CryptoError::Unwrap)) => error = Some("Wrong password. Try again.".into()),
+                Ok(Err(e)) => return Err(UnlockOutcome::Failed(e.to_string())),
+                Err(e) => return Err(UnlockOutcome::Failed(e.to_string())),
+            }
+        }
+        Err(UnlockOutcome::Cancelled)
     }
 
     async fn dialog(&self, who: &str) -> UnlockOutcome {

@@ -96,6 +96,9 @@ items can't be changed, until the master password is entered again. That
 logical lock affects nothing else and is not saved; after a restart the
 whole vault is locked anyway.
 
+The whole vault is locked by `scopevault-admin lock`
+and when the daemon stops.
+
 Unlocking never changes who may see what.
 
 ## The `session` collection
