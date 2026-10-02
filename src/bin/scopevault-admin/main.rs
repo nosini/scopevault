@@ -32,6 +32,11 @@ Commands (the daemon must be running):
                               asks for the master password
   reset-scope SCOPE           delete everything SCOPE holds; asks for the
                               master password
+  portal init                 create the scope for the Secret portal keys if
+                              it does not exist yet
+  portal new-key APP-ID       create a portal key for APP-ID (refuses if it
+                              has one); a keyring file the app already has
+                              cannot be decrypted with the new key
   backup FILE                 write an encrypted copy of the vault to FILE;
                               it opens with the current master password
 
@@ -42,11 +47,15 @@ ask for its password with pinentry):
   import                      copy everything from the Secret Service provider
                               on the bus (for example gnome-keyring, before
                               switching) into scope `host`; creates the vault
-                              if needed. The provider is not changed.
+                              if needed. Portal keys (items with the
+                              org.freedesktop.portal.Secret schema) go into
+                              the `portal` scope. The provider is not changed.
   export                      copy scope `host` into the provider on the bus
                               (rollback); items it already has are skipped
 
-A SCOPE is `host` or `flatpak/APP-ID`.
+A SCOPE is `host`, `flatpak/APP-ID` or `portal`. With `export --scope
+portal`, the portal keys are written back into the provider's default
+collection.
 
   --socket PATH     the daemon's administrative socket
                     (default: $XDG_RUNTIME_DIR/scopevault/admin)
@@ -199,6 +208,8 @@ async fn run() -> ExitCode {
             (Request::Move { from: from.to_string(), to: to.to_string(), items }, false)
         }
         ("reset-scope", [scope]) => (Request::ResetScope { scope: scope.to_string() }, false),
+        ("portal", ["init"]) => (Request::PortalInit, false),
+        ("portal", ["new-key", app_id]) => (Request::PortalNewKey { app_id: app_id.to_string() }, false),
         ("backup", [file]) => {
             // Create the file first: nothing is asked of the daemon if it
             // cannot be written, and an existing file is never replaced.

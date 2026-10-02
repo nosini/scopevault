@@ -75,11 +75,16 @@ pub enum Principal {
 
 /// The storage namespace a principal acts in. Instance IDs and risk flags
 /// do not affect the scope: every instance of an app shares its scope.
+///
+/// `Portal` holds the Secret portal's per-app keys. No principal acts in
+/// it: only the portal backend, for the authenticated portal frontend
+/// ([`crate::portal_backend`]), and the administrative interface reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(tag = "kind", content = "app_id", rename_all = "kebab-case")]
 pub enum Scope {
     Host,
     Flatpak(AppId),
+    Portal,
 }
 
 impl Principal {
@@ -96,6 +101,7 @@ impl std::fmt::Display for Scope {
         match self {
             Scope::Host => f.write_str("host"),
             Scope::Flatpak(id) => write!(f, "flatpak/{id}"),
+            Scope::Portal => f.write_str("portal"),
         }
     }
 }
@@ -103,10 +109,12 @@ impl std::fmt::Display for Scope {
 impl std::str::FromStr for Scope {
     type Err = IdentityError;
 
-    /// Parses the [`Display`](std::fmt::Display) form: `host` or `flatpak/<app-id>`.
+    /// Parses the [`Display`](std::fmt::Display) form: `host`,
+    /// `flatpak/<app-id>` or `portal`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "host" => Ok(Scope::Host),
+            "portal" => Ok(Scope::Portal),
             _ => s.strip_prefix("flatpak/").map(AppId::parse).ok_or(IdentityError::InvalidAppId)?.map(Scope::Flatpak),
         }
     }

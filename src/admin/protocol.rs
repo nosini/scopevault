@@ -37,6 +37,13 @@ pub enum Request {
     ResetScope {
         scope: String,
     },
+    /// Creates the Secret portal's key scope if it does not exist yet.
+    PortalInit,
+    /// Creates a portal key for an application that has none, for example
+    /// after its keyring file appeared without an import.
+    PortalNewKey {
+        app_id: String,
+    },
     /// A copy of the encrypted database, which opens with the password
     /// current when it was made.
     Backup,

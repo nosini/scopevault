@@ -22,9 +22,13 @@
 mod admin;
 pub mod db;
 pub mod payload;
+mod portal;
 
 pub use admin::{
     CollectionListing, ImportReport, ItemListing, PortableCollection, PortableItem, ScopeSummary, same_attributes,
+};
+pub use portal::{
+    PORTAL_KEY_BYTES, PORTAL_SCHEMA, PortalImportReport, PortalSplit, is_valid_portal_app_id, split_portal_keys,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -89,6 +93,10 @@ pub enum StoreError {
     Limit(&'static str),
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
+    /// An imported portal key differs from the one already stored (see
+    /// `crate::store::portal`). Carries the app ID.
+    #[error("a different portal key exists for {0}")]
+    PortalConflict(String),
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("I/O error: {0}")]

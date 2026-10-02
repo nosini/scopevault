@@ -5,6 +5,7 @@ pub mod admin;
 pub mod crypto;
 pub mod hardening;
 pub mod identity;
+pub mod portal_backend;
 pub mod prompts;
 pub mod service_api;
 pub mod store;

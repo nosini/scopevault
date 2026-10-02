@@ -68,6 +68,15 @@ name, and it exits after two minutes.
    scope. gnome-keyring may ask you to unlock its collections first. It is
    not changed.
 
+   The Secret portal's keys ("Application key for <app-id>" in
+   gnome-keyring's default collection) go into the `portal` scope instead,
+   byte for byte, and the import lists the apps they belong to. Import as
+   the very last step before logging out: an app that uses the portal for
+   the first time before then gets a new key from gnome-keyring, which the
+   vault wouldn't have. Running the import again only adds what is new. If
+   it stops because gnome-keyring has several items for one app, delete
+   the wrong one in Seahorse and import again.
+
 4. Enable scopevault and mask gnome-keyring's units:
 
    ```sh
@@ -87,14 +96,18 @@ name, and it exits after two minutes.
   scopevault's unlock dialog and returns the secret.
 - The daemon logs to the journal: `journalctl --user -u scopevault`.
 
+On a desktop that never had gnome-keyring, run `scopevault-admin portal
+init` instead of importing. From then on every app without a keyring file
+of its own gets a new key when it first asks.
+
 ## Known risk
 
 Whenever something starts gnome-keyring's Secret Service, gnome-keyring
 waits in the bus queue for the name. If scopevault then stops or
 restarts, gnome-keyring gets the name immediately, and apps start storing
 new secrets there without telling you.
-The Secret portal backend is such a thing: it starts when a Flatpak app
-uses the portal, as long as gnome-keyring is the portal backend.
+With scopevault as the portal backend, the portal no longer does this,
+but gnome-keyring's own D-Bus name still does if a program asks for it.
 
 The daemon checks every minute and logs "another process is queued for
 org.freedesktop.secrets" when that happens, and

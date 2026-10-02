@@ -44,7 +44,7 @@ another ID, kind or namespace, or swapping two of them, fails.
 
 | Kind | What it holds, encrypted |
 | --- | --- |
-| 1, namespace | The scope (`host`, `flatpak/<app-id>`) and its aliases |
+| 1, namespace | The scope (`host`, `flatpak/<app-id>`, `portal`) and its aliases |
 | 2, collection | Name, label, creation and modification time |
 | 3, item | Its collection, label, attributes, creation and modification time |
 | 4, secret | Content type and value, under the same ID as its item |

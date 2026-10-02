@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use common::tempdir::TempDir;
 use scopevault::crypto::KdfParams;
 use scopevault::identity::{AppId, Principal, Scope};
-use scopevault::store::{AdminAuthority, PortableCollection, PortableItem, Secret, StoreError, Vault};
+use scopevault::store::{
+    AdminAuthority, PortableCollection, PortableItem, Secret, StoreError, Vault, split_portal_keys,
+};
 
 const PW: &[u8] = b"correct horse battery staple";
 const KDF: KdfParams = KdfParams::MINIMUM;
@@ -238,4 +240,176 @@ fn a_failing_import_leaves_nothing_behind() {
     assert!(matches!(v.import(&auth, &Scope::Host, &cols), Err(StoreError::Limit(_))));
     let mut v = reopen(&dir, v);
     assert!(v.scope_summaries(&auth).unwrap().is_empty());
+}
+
+// ---- the Secret portal's keys ----
+
+/// A portal key as gnome-keyring keeps it.
+fn portal_item(app_id: &str, byte: u8) -> PortableItem {
+    PortableItem {
+        label: format!("Application key for {app_id}"),
+        attributes: attrs(&[("app_id", app_id), ("xdg:schema", "org.freedesktop.portal.Secret")]),
+        secret: Secret::new(vec![byte; 64], "application/octet-stream"),
+        created: 1_600_000_000,
+        modified: 1_700_000_000,
+    }
+}
+
+#[test]
+fn splitting_portal_keys_takes_only_the_default_collection() {
+    let key = portal_item("org.example.A", 1);
+    let ordinary = PortableItem {
+        label: "Ordinary".into(),
+        attributes: attrs(&[("app_id", "org.example.B")]),
+        secret: text("ordinary"),
+        created: 0,
+        modified: 0,
+    };
+    let no_schema = PortableItem {
+        label: "No schema".into(),
+        attributes: attrs(&[("app_id", "org.example.B"), ("xdg:schema", "org.example.Other")]),
+        secret: text("x"),
+        created: 0,
+        modified: 0,
+    };
+    let invalid = PortableItem {
+        label: "Bad id".into(),
+        attributes: attrs(&[("app_id", "a/b"), ("xdg:schema", "org.freedesktop.portal.Secret")]),
+        secret: text("y"),
+        created: 0,
+        modified: 0,
+    };
+    let elsewhere = portal_item("org.example.D", 2);
+    let cols = vec![
+        PortableCollection {
+            label: "Login".into(),
+            aliases: vec!["default".into()],
+            items: vec![key.clone(), ordinary, no_schema, invalid],
+        },
+        PortableCollection { label: "Work".into(), aliases: vec![], items: vec![elsewhere.clone()] },
+    ];
+    let split = split_portal_keys(cols).unwrap();
+    assert_eq!(split.keys, vec![key], "the portal key, unchanged");
+    assert_eq!(split.keys[0].created, 1_600_000_000, "timestamps travel with it");
+    assert_eq!(split.notes.len(), 3, "{:?}", split.notes);
+    assert!(split.notes.iter().any(|n| n.contains("org.example.B")), "{:?}", split.notes);
+    assert!(split.notes.iter().any(|n| n.contains("Bad id")), "{:?}", split.notes);
+    assert_eq!(split.collections[0].items.len(), 3, "the noted items stay where they are");
+    assert_eq!(split.collections[1].items, vec![elsewhere], "only the default collection is examined");
+}
+
+#[test]
+fn an_ambiguous_app_id_stops_the_import() {
+    let cols = vec![PortableCollection {
+        label: "Login".into(),
+        aliases: vec!["default".into()],
+        items: vec![
+            portal_item("org.example.Dup", 1),
+            portal_item("org.example.Dup", 2),
+            portal_item("org.example.Fine", 3),
+        ],
+    }];
+    let err = split_portal_keys(cols).unwrap_err();
+    assert!(err.contains("org.example.Dup"), "{err}");
+    assert!(!err.contains("org.example.Fine"), "{err}");
+}
+
+#[test]
+fn importing_portal_keys_is_repeatable_and_detects_conflicts() {
+    let tmp = TempDir::new("admin");
+    let dir = tmp.path().join("vault");
+    let mut v = Vault::create(&dir, PW, KDF).unwrap();
+    let auth = AdminAuthority::offline();
+    let key = portal_item("org.example.A", 1);
+
+    let r = v.import_portal_keys(&auth, std::slice::from_ref(&key)).unwrap();
+    assert_eq!((r.imported, r.skipped), (1, 0));
+    assert!(v.portal_initialised().unwrap());
+    let again = v.import_portal_keys(&auth, std::slice::from_ref(&key)).unwrap();
+    assert_eq!((again.imported, again.skipped), (0, 1), "the same key is skipped");
+
+    let exported = v.export(&auth, &Scope::Portal).unwrap();
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].aliases, ["default"]);
+    let item = &exported[0].items[0];
+    assert_eq!((item.label.as_str(), item.created, item.modified), (key.label.as_str(), key.created, key.modified));
+    assert_eq!(item.secret, key.secret);
+
+    // Different bytes for the same app ID are a conflict, and change nothing.
+    let before = v.export(&auth, &Scope::Portal).unwrap();
+    let r = v.import_portal_keys(&auth, &[portal_item("org.example.A", 2), portal_item("org.example.B", 3)]);
+    assert!(matches!(r, Err(StoreError::PortalConflict(ref id)) if id == "org.example.A"), "{r:?}");
+    assert_eq!(v.export(&auth, &Scope::Portal).unwrap(), before, "nothing changed");
+
+    // A key without the portal schema or without a valid app ID is refused.
+    let mut wrong = portal_item("org.example.C", 4);
+    wrong.attributes.remove("xdg:schema");
+    assert!(matches!(v.import_portal_keys(&auth, &[wrong]), Err(StoreError::Invalid(_))));
+    let mut no_id = portal_item("org.example.C", 5);
+    no_id.attributes.remove("app_id");
+    assert!(matches!(v.import_portal_keys(&auth, &[no_id]), Err(StoreError::Invalid(_))));
+}
+
+#[test]
+fn portal_keys_cannot_be_moved_or_imported_as_ordinary_items() {
+    let tmp = TempDir::new("admin");
+    let dir = tmp.path().join("vault");
+    let (mut v, i1, _) = setup(&dir);
+    let auth = AdminAuthority::offline();
+
+    let r = v.move_items(&auth, &Scope::Host, std::slice::from_ref(&i1), &Scope::Portal);
+    assert!(matches!(r, Err(StoreError::Invalid("portal keys cannot be moved"))), "{r:?}");
+    let r = v.move_items(&auth, &Scope::Portal, &[i1], &Scope::Host);
+    assert!(matches!(r, Err(StoreError::Invalid("portal keys cannot be moved"))), "{r:?}");
+    let r = v.import(&auth, &Scope::Portal, &sample());
+    assert!(matches!(r, Err(StoreError::Invalid("use the portal key import for the portal scope"))), "{r:?}");
+
+    // The scope itself is managed normally: init, then reset uninitialises.
+    assert!(v.init_portal(&auth).unwrap());
+    assert!(!v.init_portal(&auth).unwrap(), "already initialised");
+    {
+        let s = v.scoped_admin(&auth, Scope::Portal).unwrap();
+        assert_eq!(s.collection_names(), ["portal"]);
+        assert_eq!(s.collection("portal").unwrap().label, "Portal");
+        assert_eq!(s.alias("default").as_deref(), Some("portal"));
+    }
+    v.reset_scope(&auth, &Scope::Portal).unwrap();
+    assert!(!v.portal_initialised().unwrap());
+    assert!(v.export(&auth, &Scope::Portal).unwrap().is_empty());
+}
+
+#[test]
+fn portal_keys_are_created_only_once_per_app() {
+    let tmp = TempDir::new("admin");
+    let dir = tmp.path().join("vault");
+    let mut v = Vault::create(&dir, PW, KDF).unwrap();
+    let auth = AdminAuthority::offline();
+
+    assert!(
+        matches!(
+            v.admin_create_portal_key(&auth, "org.example.A"),
+            Err(StoreError::Invalid("the Secret portal keys were neither imported nor initialised"))
+        ),
+        "not initialised yet"
+    );
+    v.init_portal(&auth).unwrap();
+
+    let key = v.admin_create_portal_key(&auth, "org.example.A").unwrap();
+    assert_eq!(key.value.len(), scopevault::store::PORTAL_KEY_BYTES);
+    assert_eq!(key.content_type, "application/octet-stream");
+    assert!(matches!(
+        v.admin_create_portal_key(&auth, "org.example.A"),
+        Err(StoreError::Invalid("the app already has a portal key"))
+    ));
+    for id in ["", ".", "..", "a/b", "../x", "x".repeat(256).as_str()] {
+        assert!(matches!(v.admin_create_portal_key(&auth, id), Err(StoreError::Invalid("invalid app ID"))), "{id:?}");
+    }
+
+    let exported = v.export(&auth, &Scope::Portal).unwrap();
+    assert_eq!(exported.len(), 1);
+    let item = &exported[0].items[0];
+    assert_eq!(item.label, "Application key for org.example.A");
+    assert_eq!(item.attributes.get("app_id").map(String::as_str), Some("org.example.A"));
+    assert_eq!(item.attributes.get("xdg:schema").map(String::as_str), Some("org.freedesktop.portal.Secret"));
+    assert_eq!(item.secret, key, "the stored key is the returned one");
 }

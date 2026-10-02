@@ -157,6 +157,38 @@ fn host_items(dir: &Path, password: &str) -> Vec<(String, String, Vec<u8>)> {
     out
 }
 
+fn portal_items(dir: &Path, password: &str) -> Vec<(String, String, Vec<u8>)> {
+    let mut v = Vault::open(dir).unwrap();
+    v.unlock(password.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    for c in v.export(&AdminAuthority::offline(), &Scope::Portal).unwrap() {
+        for i in c.items {
+            out.push((c.label.clone(), i.label, i.secret.value.to_vec()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Creates the portal key item gnome-keyring would keep, in `scope`'s
+/// default collection (the host scope's, for the old provider).
+fn add_portal_key(v: &mut Vault, scope: &Scope, app_id: &str, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let mut s = v.scoped_admin(&AdminAuthority::offline(), scope.clone())?;
+    s.ensure_namespace()?;
+    s.create_item(
+        "login",
+        &format!("Application key for {app_id}"),
+        [
+            ("app_id".to_owned(), app_id.to_owned()),
+            ("xdg:schema".to_owned(), "org.freedesktop.portal.Secret".to_owned()),
+        ]
+        .into(),
+        &Secret::new(vec![byte; 64], "application/octet-stream"),
+        false,
+    )?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_then_rollback() {
     let old = old_provider(VaultState::Unlocked).await;
@@ -310,4 +342,132 @@ async fn restore_checks_the_backup_and_keeps_the_old_vault() {
         .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("vault.before-restore-"))
         .expect("the previous vault is kept");
     assert_eq!(host_items(&kept, TARGET_PW).len(), 2);
+}
+
+// ---- the Secret portal's keys ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn portal_keys_migrate_separately() {
+    const APP: &str = "org.example.PortalApp";
+    let old = old_provider(VaultState::Unlocked).await;
+    // The provider's default collection holds a portal key (as gnome-keyring
+    // keeps one) and an ordinary item.
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        add_portal_key(v, &Scope::Host, APP, 0x5a).unwrap();
+        let mut s = v.scoped_admin(&AdminAuthority::offline(), Scope::Host).unwrap();
+        s.ensure_namespace().unwrap();
+        s.create_item(
+            "login",
+            "Mail",
+            [("service".to_owned(), "mail".to_owned())].into(),
+            &Secret::new(b"mail-pw".to_vec(), "text/plain"),
+            false,
+        )
+        .unwrap();
+    }
+    let tmp = TempDir::new("migrate");
+    let dir = tmp.path().join("vault");
+    drop(Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap());
+    let pins = Pins::new();
+
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["import"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("found 2 items in 1 collections"), "{}", out.stdout);
+    assert!(out.stdout.contains("portal keys for org.example.PortalApp: 1 imported, 0 skipped"), "{}", out.stdout);
+    let host = host_items(&dir, TARGET_PW);
+    assert_eq!(host, [("Login".into(), "Mail".into(), b"mail-pw".to_vec())], "the key did not go into host");
+    let portal = portal_items(&dir, TARGET_PW);
+    assert_eq!(portal, [("Portal".into(), format!("Application key for {APP}"), vec![0x5a; 64])]);
+
+    // Again: nothing new, and the key is skipped.
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["import"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("imported 0 items into host (1 already there"), "{}", out.stdout);
+    assert!(out.stdout.contains("portal keys for org.example.PortalApp: 0 imported, 1 skipped"), "{}", out.stdout);
+    assert_eq!(portal_items(&dir, TARGET_PW).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_portal_keys_stop_the_import() {
+    let old = old_provider(VaultState::Unlocked).await;
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        for byte in [1u8, 2] {
+            add_portal_key(v, &Scope::Host, "org.example.Dup", byte).unwrap();
+        }
+    }
+    let tmp = TempDir::new("migrate");
+    let dir = tmp.path().join("vault");
+    let pins = Pins::new();
+
+    pins.set(&[]);
+    let out = admin(&["import"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(!out.ok);
+    assert!(out.stderr.contains("org.example.Dup"), "{}", out.stderr);
+    assert!(!Vault::exists(&dir), "the import failed before creating the vault");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn portal_keys_rollback_into_the_default_collection() {
+    const APP: &str = "org.example.PortalApp";
+    let tmp = TempDir::new("migrate");
+    let dir = tmp.path().join("vault");
+    {
+        let mut v = Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap();
+        let mut s = v.scoped_admin(&AdminAuthority::offline(), Scope::Portal).unwrap();
+        s.create_collection("Portal", "default").unwrap();
+        s.create_item(
+            "portal",
+            "Application key for org.example.PortalApp",
+            [
+                ("app_id".to_owned(), APP.to_owned()),
+                ("xdg:schema".to_owned(), "org.freedesktop.portal.Secret".to_owned()),
+            ]
+            .into(),
+            &Secret::new(vec![7u8; 64], "application/octet-stream"),
+            false,
+        )
+        .unwrap();
+    }
+    let pins = Pins::new();
+
+    // An empty old provider: the key lands in its default collection.
+    let old = old_provider(VaultState::Unlocked).await;
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export", "--scope", "portal"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        let s = v.scoped_admin(&AdminAuthority::offline(), Scope::Host).unwrap();
+        let found = s.search(&[("app_id".to_owned(), APP.to_owned())].into());
+        assert_eq!(found.len(), 1, "{found:?}");
+        let secret = s.read_secret(&found[0].0, &found[0].1).unwrap();
+        assert_eq!(secret.value.as_slice(), vec![7u8; 64].as_slice(), "byte for byte");
+    }
+
+    // A different key for the same app in the provider stops the export
+    // before anything is written.
+    let old = old_provider(VaultState::Unlocked).await;
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        add_portal_key(v, &Scope::Host, APP, 9).unwrap();
+    }
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export", "--scope", "portal"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(!out.ok);
+    assert!(out.stderr.contains(APP), "{}", out.stderr);
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        let s = v.scoped_admin(&AdminAuthority::offline(), Scope::Host).unwrap();
+        let found = s.search(&[("app_id".to_owned(), APP.to_owned())].into());
+        assert_eq!(found.len(), 1, "only the provider's own key is there: {found:?}");
+    }
 }

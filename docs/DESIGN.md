@@ -27,6 +27,8 @@ sandbox prefers the Secret portal: the app gets one key from the portal and
 encrypts its own file under `~/.var/app/<app-id>/` with it. Those apps are
 already separated from each other, and scopevault adds little isolation for
 them.
+What it does add is that their keys live in scopevault's vault, out of
+reach of host applications that use the Secret Service.
 
 It is password storage, not a hardware keystore. An app that can read its
 own secret can also leak it. Code running unsandboxed as your user is
@@ -43,6 +45,9 @@ to exactly one scope.
 | A Flatpak app, identified reliably | `flatpak/<app-id>`, its own |
 | An unsandboxed host program, positively identified as one | `host`, shared by all host programs |
 | Anything else: unknown sandboxes, malformed metadata, processes that cannot be inspected | none, refused |
+
+There is also a reserved scope, `portal`, that holds the Secret portal's
+per-app keys. No caller is ever put into it.
 
 `host` is shared on purpose. Host programs can read each other's memory and
 files anyway, so separating them in the keyring would only break things
@@ -221,6 +226,8 @@ the daemon stopped.
 
 `scopevault-admin import` reads everything from gnome-keyring through its
 Secret Service API, not its files, and puts it into `host`.
+The Secret portal's per-app keys are the exception: they go into
+`portal`, byte for byte.
 scopevault never guesses which item belongs to which app from labels or
 attributes, since apps control those. Moving items to an app's scope is a
 deliberate `scopevault-admin move`. There is also no fallback from an app's
@@ -242,6 +249,42 @@ while scopevault owns it. If scopevault then stops, the bus hands the name
 to gnome-keyring at once, and applications start storing secrets there
 without anyone noticing. The daemon checks the queue once a minute and logs
 a warning while anything waits in it.
+
+## The Secret portal backend
+
+Flatpak apps that use the Secret portal get one key per app from
+xdg-desktop-portal, which in turn asks a backend. Normally that is
+gnome-keyring. scopevault can be the backend instead, so the keys live in
+its vault, in the `portal` scope where no Secret Service caller can reach
+them.
+
+- Only xdg-desktop-portal is served. The caller must own
+  `org.freedesktop.portal.Desktop` at that moment and be identified as a
+  host program; everyone else is refused before anything is read or
+  written. There is no check of the portal's executable: it would break
+  during package updates and would not stop host code anyway. A host
+  program that replaces xdg-desktop-portal does become the frontend for
+  every app, but host code is trusted.
+- The backend has its own bus name, `page.codeberg.nosini.ScopeVault.Portal`, on a
+  separate connection. A Flatpak app allowed to talk to
+  `org.freedesktop.secrets` can therefore not reach it through the same
+  connection.
+- Keys are moved from gnome-keyring byte for byte. A new key for an app
+  that already has encrypted data would make that data unreadable, so no
+  key is created until the keys were imported or `scopevault-admin portal
+  init` was run, and none for an app that already has a libsecret keyring
+  file of its own. `scopevault-admin portal new-key` overrides that
+  explicitly.
+- If gnome-keyring has several candidate keys for one app, the import
+  stops and changes nothing: which one gnome-keyring hands out is not
+  defined.
+
+A key gnome-keyring creates during a session can't be read through its
+Secret Service until gnome-keyring restarts. An import that hits one fails
+cleanly; logging out and back in first avoids it.
+
+The app's encrypted files stay in its own directory. They need to be
+backed up together with the vault.
 
 ## What scopevault does not protect against
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0
+
+- scopevault can be the Secret portal backend. Per-app portal keys live in
+  a reserved `portal` scope, and `import` moves gnome-keyring's keys there
+  unchanged.
+- `scopevault-admin portal init` and `portal new-key`.
+
 ## 0.5.0
 
 - `scopevault-admin`: status, global lock, password change, listing

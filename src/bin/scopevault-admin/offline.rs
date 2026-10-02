@@ -16,7 +16,9 @@ use scopevault::admin::provider::Provider;
 use scopevault::crypto::KdfParams;
 use scopevault::identity::Scope;
 use scopevault::prompts::pinentry::{self, PinOutcome, PinRequest, PinentryConfig};
-use scopevault::store::{AdminAuthority, PortableCollection, PortableItem, StoreError, Vault};
+use scopevault::store::{
+    AdminAuthority, DEFAULT_ALIAS, PortableCollection, PortableItem, StoreError, Vault, split_portal_keys,
+};
 use zeroize::Zeroizing;
 
 use super::fail;
@@ -46,7 +48,9 @@ pub fn parse(args: &[&str]) -> Result<(Options, Vec<String>), String> {
             "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
             "--pinentry" => program = PathBuf::from(value()?),
             "--bus" => bus = Some(value()?),
-            "--scope" => scope = value()?.parse().map_err(|_| "--scope is host or flatpak/APP-ID".to_owned())?,
+            "--scope" => {
+                scope = value()?.parse().map_err(|_| "--scope is host, flatpak/APP-ID or portal".to_owned())?
+            }
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             s => rest.push(s.to_owned()),
         }
@@ -117,7 +121,12 @@ fn summarize(cols: &[PortableCollection]) {
 
 /// Migration: copies everything from the provider on the bus into a scope
 /// (default `host`) of the vault, creating the vault if there is none.
+/// Portal keys are split out first and go into the `portal` scope, byte for
+/// byte.
 pub async fn import(opts: Options) -> ExitCode {
+    if opts.scope == Scope::Portal {
+        return fail("the portal keys are imported into their own scope; import with a different --scope");
+    }
     let dir = &opts.data_dir;
     // Fail on a running daemon before showing the provider's dialog.
     let existing = if Vault::exists(dir) {
@@ -139,6 +148,15 @@ pub async fn import(opts: Options) -> ExitCode {
     };
     println!("found {} items in {} collections:", source.iter().map(|c| c.items.len()).sum::<usize>(), source.len());
     summarize(&source);
+    // Split the portal keys out before anything is unlocked or created: an
+    // ambiguous one stops the import (see `split_portal_keys`).
+    let split = match split_portal_keys(source) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("the import failed and changed nothing: {e}")),
+    };
+    for note in &split.notes {
+        println!("note: {note}");
+    }
 
     let mut vault = match existing {
         Some(mut v) => {
@@ -155,7 +173,7 @@ pub async fn import(opts: Options) -> ExitCode {
         },
     };
     let auth = AdminAuthority::offline();
-    let report = match vault.import(&auth, &opts.scope, &source) {
+    let (report, portal) = match vault.import_with_portal_keys(&auth, &opts.scope, &split.collections, &split.keys) {
         Ok(r) => r,
         Err(e) => return fail(format!("the import failed and changed nothing: {e}")),
     };
@@ -164,7 +182,7 @@ pub async fn import(opts: Options) -> ExitCode {
         Ok(s) => s,
         Err(e) => return fail(format!("cannot read the vault back: {e}")),
     };
-    let (found, total) = found_in(&stored, &source);
+    let (found, total) = found_in(&stored, &split.collections);
     println!(
         "imported {} items into {} ({} already there, {} new collections{})",
         report.items_imported,
@@ -173,6 +191,24 @@ pub async fn import(opts: Options) -> ExitCode {
         report.collections_created,
         if report.aliases_set.is_empty() { String::new() } else { format!(", set {}", report.aliases_set.join(", ")) }
     );
+    if !split.keys.is_empty() {
+        let ids: Vec<&str> = split.keys.iter().map(|k| k.attributes["app_id"].as_str()).collect();
+        println!("portal keys for {}: {} imported, {} skipped", ids.join(", "), portal.imported, portal.skipped);
+    }
+    let portal_stored = match vault.export(&auth, &Scope::Portal) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("cannot read the vault back: {e}")),
+    };
+    for key in &split.keys {
+        let id = key.attributes["app_id"].as_str();
+        let ok = portal_stored
+            .iter()
+            .flat_map(|c| &c.items)
+            .any(|i| i.attributes.get("app_id").map(String::as_str) == Some(id) && i.secret.value == key.secret.value);
+        if !ok {
+            return fail(format!("verification failed: the portal key for {id} did not read back identically"));
+        }
+    }
     if found != total {
         return fail(format!("verification failed: only {found} of {total} items read back identically"));
     }
@@ -200,7 +236,9 @@ async fn create(dir: &Path, cfg: &PinentryConfig) -> Result<Vault, String> {
 }
 
 /// Rollback: copies a scope (default `host`) into the provider on the bus.
-/// Items the provider already has are skipped.
+/// Items the provider already has are skipped. The portal keys (with
+/// `--scope portal`) are written back into the provider's default
+/// collection, where gnome-keyring looks for them.
 pub async fn export(opts: Options) -> ExitCode {
     let dir = &opts.data_dir;
     let mut vault = match open(dir) {
@@ -228,6 +266,22 @@ pub async fn export(opts: Options) -> ExitCode {
         Err(e) => return fail(e),
     };
     println!("writing to {} ...", provider.owner().await);
+    if opts.scope == Scope::Portal {
+        // A key must never land beside a different one for the same app:
+        // the app's own files stay encrypted with the old key. Read
+        // everything first, and refuse before writing anything.
+        let there = match provider.read_all().await {
+            Ok(t) => t,
+            Err(e) => return fail(format!("cannot read the provider: {e}")),
+        };
+        let conflicts = portal_conflicts(&cols, &there);
+        if !conflicts.is_empty() {
+            return fail(format!(
+                "the provider's default collection holds different portal keys for {}; move them away there first",
+                conflicts.join(", ")
+            ));
+        }
+    }
     let report = match provider.write(&cols).await {
         Ok(r) => r,
         Err(e) => return fail(format!("{e} (items written before this remain in the provider)")),
@@ -246,6 +300,27 @@ pub async fn export(opts: Options) -> ExitCode {
     }
     println!("verified: all {total} items are in the provider. The vault was not changed.");
     ExitCode::SUCCESS
+}
+
+/// App IDs for which the provider's default collection holds an item whose
+/// secret bytes differ from the key that would be written.
+fn portal_conflicts(cols: &[PortableCollection], there: &[PortableCollection]) -> Vec<String> {
+    let Some(default) = there.iter().find(|c| c.aliases.iter().any(|a| a == DEFAULT_ALIAS)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for key in cols.iter().flat_map(|c| &c.items) {
+        let Some(id) = key.attributes.get("app_id") else { continue };
+        if out.contains(id) {
+            continue;
+        }
+        if default.items.iter().any(|i| {
+            i.attributes.get("app_id").map(String::as_str) == Some(id.as_str()) && i.secret.value != key.secret.value
+        }) {
+            out.push(id.clone());
+        }
+    }
+    out
 }
 
 /// Replaces the vault with a backup, after checking that the backup opens

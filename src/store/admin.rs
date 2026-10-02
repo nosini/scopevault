@@ -126,6 +126,11 @@ impl Vault {
         if from == to {
             return Err(StoreError::Invalid("source and target scope are the same"));
         }
+        // The portal keys belong to their app and their scope; a move would
+        // hand one to whoever owns the target scope.
+        if from == &Scope::Portal || to == &Scope::Portal {
+            return Err(StoreError::Invalid("portal keys cannot be moved"));
+        }
         self.transaction(|v| {
             let mut moved = Vec::new();
             for spec in items {
@@ -166,36 +171,50 @@ impl Vault {
         scope: &Scope,
         collections: &[PortableCollection],
     ) -> Result<ImportReport, StoreError> {
-        self.transaction(|v| {
-            let mut s = v.scoped_admin(authority, scope.clone())?;
-            let mut report = ImportReport::default();
-            for pc in collections {
-                let existing = s.listing().into_iter().find(|c| c.label == pc.label && c.name != SESSION_ALIAS);
-                let name = match existing {
-                    Some(c) => c.name,
-                    None => {
-                        report.collections_created += 1;
-                        s.create_collection(&pc.label, "")?.0
-                    }
-                };
-                for item in &pc.items {
-                    if s.has_identical(&name, item)? {
-                        report.items_skipped += 1;
-                        continue;
-                    }
-                    let (id, _) = s.create_item(&name, &item.label, item.attributes.clone(), &item.secret, false)?;
-                    s.set_item_times(&name, &id, item.created, item.modified)?;
-                    report.items_imported += 1;
+        self.transaction(|v| v.import_body(authority, scope, collections))
+    }
+
+    /// The body of [`Vault::import`], without its transaction, so
+    /// [`Vault::import_with_portal_keys`] can run it inside one bigger
+    /// one. Refuses the portal scope: its keys go through
+    /// [`Vault::import_portal_keys`].
+    pub(super) fn import_body(
+        &mut self,
+        authority: &AdminAuthority,
+        scope: &Scope,
+        collections: &[PortableCollection],
+    ) -> Result<ImportReport, StoreError> {
+        if scope == &Scope::Portal {
+            return Err(StoreError::Invalid("use the portal key import for the portal scope"));
+        }
+        let mut s = self.scoped_admin(authority, scope.clone())?;
+        let mut report = ImportReport::default();
+        for pc in collections {
+            let existing = s.listing().into_iter().find(|c| c.label == pc.label && c.name != SESSION_ALIAS);
+            let name = match existing {
+                Some(c) => c.name,
+                None => {
+                    report.collections_created += 1;
+                    s.create_collection(&pc.label, "")?.0
                 }
-                for alias in &pc.aliases {
-                    if alias != SESSION_ALIAS && s.alias(alias).is_none() {
-                        s.set_alias(alias, Some(&name))?;
-                        report.aliases_set.push(alias.clone());
-                    }
+            };
+            for item in &pc.items {
+                if s.has_identical(&name, item)? {
+                    report.items_skipped += 1;
+                    continue;
+                }
+                let (id, _) = s.create_item(&name, &item.label, item.attributes.clone(), &item.secret, false)?;
+                s.set_item_times(&name, &id, item.created, item.modified)?;
+                report.items_imported += 1;
+            }
+            for alias in &pc.aliases {
+                if alias != SESSION_ALIAS && s.alias(alias).is_none() {
+                    s.set_alias(alias, Some(&name))?;
+                    report.aliases_set.push(alias.clone());
                 }
             }
-            Ok(report)
-        })
+        }
+        Ok(report)
     }
 
     /// A scope's persistent collections with their items and secrets, for
@@ -259,7 +278,15 @@ impl ScopedVault<'_> {
         Ok(name)
     }
 
-    fn set_item_times(&mut self, collection: &str, item: &str, created: u64, modified: u64) -> Result<(), StoreError> {
+    /// Restores an imported item's timestamps. Visible to `store::portal`,
+    /// which imports keys the same way.
+    pub(super) fn set_item_times(
+        &mut self,
+        collection: &str,
+        item: &str,
+        created: u64,
+        modified: u64,
+    ) -> Result<(), StoreError> {
         let id = self.item_id(collection, item)?;
         let mut ns = self.ns().cloned().expect("item exists");
         let ns_id = ns.id;

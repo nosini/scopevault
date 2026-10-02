@@ -118,6 +118,7 @@ fn display(scope: &Scope) -> String {
     match scope {
         Scope::Host => "An application on your computer".into(),
         Scope::Flatpak(id) => format!("The application {id}"),
+        Scope::Portal => "The Secret portal".into(),
     }
 }
 
@@ -212,6 +213,26 @@ impl Unlocker {
             return UnlockOutcome::Cancelled;
         }
         self.ensure_unlocked(requester).await
+    }
+
+    /// [`Unlocker::ensure_unlocked_implicit`] for the Secret portal backend:
+    /// the dialog names the application whose key is wanted. `app_id` is
+    /// validated before this is called. Without a vault it fails without a
+    /// dialog: the portal never creates one.
+    pub async fn ensure_unlocked_portal(self: &Arc<Self>, app_id: &str) -> UnlockOutcome {
+        {
+            let slot = self.vault.lock().unwrap();
+            if slot.vault.is_none() {
+                return UnlockOutcome::Failed("no vault".into());
+            }
+            if slot.is_unlocked() {
+                return UnlockOutcome::Unlocked;
+            }
+        }
+        if self.cooldown_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
+            return UnlockOutcome::Cancelled;
+        }
+        self.ensure_unlocked_as(format!("The application {app_id}")).await
     }
 
     /// Whether an explicit prompt of `scope` may show a dialog now (see

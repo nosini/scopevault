@@ -27,7 +27,7 @@ use super::peer::peer_credentials;
 use super::protocol::{MAX_LINE, Reply, Request, Status, VaultState, read_line, write_json};
 use crate::identity::{BusCredentials, IdentityError, Principal, Scope};
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
-use crate::store::StoreError;
+use crate::store::{StoreError, is_valid_portal_app_id};
 
 /// Administrative connections served at once; more are closed at once.
 const MAX_CLIENTS: usize = 4;
@@ -133,7 +133,7 @@ fn store_error(e: StoreError) -> Reply {
 }
 
 fn parse_scope(s: &str) -> Result<Scope, Reply> {
-    s.parse().map_err(|_| Reply::error(format!("not a scope: {s:?} (host or flatpak/APP-ID)")))
+    s.parse().map_err(|_| Reply::error(format!("not a scope: {s:?} (host, flatpak/APP-ID or portal)")))
 }
 
 impl AdminServer {
@@ -350,6 +350,38 @@ impl AdminServer {
                 Ok(Reply::Reset { collections, items })
             }
             Request::Backup => unreachable!("handled before"),
+            Request::PortalInit => {
+                self.unlocked().await?;
+                let mut slot = vault.lock().unwrap();
+                let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
+                let created = v.init_portal(authority).map_err(store_error)?;
+                Ok(Reply::Done {
+                    message: if created {
+                        "initialised the Secret portal keys".into()
+                    } else {
+                        "the Secret portal keys were already initialised".into()
+                    },
+                })
+            }
+            Request::PortalNewKey { app_id } => {
+                if !is_valid_portal_app_id(&app_id) {
+                    return Err(Reply::error(format!("not a valid application ID: {app_id:?}")));
+                }
+                self.unlocked().await?;
+                {
+                    let mut slot = vault.lock().unwrap();
+                    let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
+                    v.admin_create_portal_key(authority, &app_id).map_err(store_error)?;
+                }
+                tracing::info!(app_id = %app_id, "admin: created a portal key");
+                Ok(Reply::Done {
+                    message: format!(
+                        "created a portal key for {app_id}. If the application already has its own keyring file \
+                         (~/.var/app/{app_id}/data/keyrings/default.keyring), that file cannot be decrypted with \
+                         the new key; move it away before the application stores anything new."
+                    ),
+                })
+            }
         }
     }
 

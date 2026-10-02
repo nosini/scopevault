@@ -1,9 +1,13 @@
 //! The Scoped Secret Service daemon.
 //!
 //! Serves `org.freedesktop.secrets` on the session bus from the encrypted
-//! vault. It refuses to start if another process owns the name; it never
-//! replaces a running keyring. It exits when the bus connection closes,
-//! because identity caches are valid for one bus connection only.
+//! vault, the Secret portal backend (page.codeberg.nosini.ScopeVault.Portal,
+//! the `org.freedesktop.impl.portal.Secret` backend for xdg-desktop-portal)
+//! from a second bus connection, and the administrative interface
+//! (scopevault-admin) on a Unix socket. It refuses to start if another
+//! process owns one of the names; it never replaces a running keyring. It
+//! exits when a bus connection closes, because identity caches are valid
+//! for one bus connection only.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,6 +18,7 @@ use scopevault::admin::default_data_dir;
 use scopevault::admin::server::{AdminServer, PeerClassifier, default_socket_path};
 use scopevault::crypto::KdfParams;
 use scopevault::identity::{BusIdentityResolver, Classifier, IdentityPolicy};
+use scopevault::portal_backend::{BACKEND_NAME, PortalBackend};
 use scopevault::prompts::pinentry::PinentryConfig;
 use scopevault::prompts::unlock::{Unlocker, VaultSlot};
 use scopevault::service_api::SecretService;
@@ -28,7 +33,8 @@ const QUEUE_CHECK: Duration = Duration::from_secs(60);
 const USAGE: &str = "\
 usage: scopevault-daemon [--data-dir DIR] [--pinentry PROGRAM] [--admin-socket PATH]
 
-Serves org.freedesktop.secrets on the session bus, and the administrative
+Serves org.freedesktop.secrets on the session bus, the Secret portal
+backend (page.codeberg.nosini.ScopeVault.Portal), and the administrative
 interface (scopevault-admin) on a Unix socket.
 
   --data-dir DIR        vault directory (default: $XDG_DATA_HOME/scopevault)
@@ -216,7 +222,38 @@ async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
     }
     tracing::info!("serving {NAME}");
 
-    // After taking the name: a daemon that lost the name to another one
+    // The Secret portal backend, on a second bus connection: its callers are
+    // identified on that connection, and its name is independent of
+    // org.freedesktop.secrets (see `portal_backend`). Classification is
+    // shared; only the per-connection caches are not.
+    let home = match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home),
+        None => return Err("HOME is not set; cannot find the applications' data directories".into()),
+    };
+    let portal_conn = zbus::connection::Builder::session()
+        .map_err(|e| format!("cannot find the session bus: {e}"))?
+        .build()
+        .await
+        .map_err(|e| format!("cannot connect to the session bus: {e}"))?;
+    let portal_resolver = BusIdentityResolver::new(&portal_conn, resolver.shared_classifier())
+        .await
+        .map_err(|e| format!("cannot start the portal identity resolver: {e}"))?;
+    let backend =
+        PortalBackend::new(portal_conn.clone(), portal_resolver, unlocker.clone(), home.join(".var").join("app"));
+    backend.start().await.map_err(|e| format!("cannot start the portal backend: {e}"))?;
+    match portal_conn.request_name_with_flags(BACKEND_NAME, RequestNameFlags::DoNotQueue.into()).await {
+        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {}
+        Ok(_) | Err(zbus::Error::NameTaken) => {
+            return Err(format!(
+                "{BACKEND_NAME} is already owned by another process (another Secret portal backend?). \
+                 This daemon never replaces a running one."
+            ));
+        }
+        Err(e) => return Err(format!("cannot own {BACKEND_NAME}: {e}")),
+    }
+    tracing::info!("serving {BACKEND_NAME}");
+
+    // After taking the names: a daemon that lost one of them to another one
     // must not touch that one's socket.
     let socket = scopevault::admin::server::bind(&opts.admin_socket)
         .map_err(|e| format!("cannot create the administrative socket {}: {e}", opts.admin_socket.display()))?;
@@ -236,6 +273,7 @@ async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
             Ok(()) => Err("the session bus connection closed".into()),
             Err(e) => Err(format!("the session bus connection failed: {e}")),
         },
+        () = portal_conn.closed() => Err("the portal bus connection closed".into()),
         _ = term.recv() => Ok(()),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }

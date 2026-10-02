@@ -33,7 +33,7 @@ pub struct BusIdentityResolver {
 }
 
 impl BusIdentityResolver {
-    pub async fn new(conn: &zbus::Connection, classifier: Classifier) -> zbus::Result<Arc<Self>> {
+    pub async fn new(conn: &zbus::Connection, classifier: impl Into<Arc<Classifier>>) -> zbus::Result<Arc<Self>> {
         let dbus = DBusProxy::new(conn).await?;
         let cache: Arc<Cache> = Arc::default();
 
@@ -51,11 +51,17 @@ impl BusIdentityResolver {
             }
         });
 
-        Ok(Arc::new(BusIdentityResolver { dbus, classifier: Arc::new(classifier), cache }))
+        Ok(Arc::new(BusIdentityResolver { dbus, classifier: classifier.into(), cache }))
     }
 
     pub fn classifier(&self) -> &Classifier {
         &self.classifier
+    }
+
+    /// The classifier, shared with another resolver (the portal backend's
+    /// connection has its own cache, but classification is per process).
+    pub fn shared_classifier(&self) -> Arc<Classifier> {
+        Arc::clone(&self.classifier)
     }
 
     /// Classifies without caching, returning the evidence too. For the probe.
