@@ -46,6 +46,10 @@ pub const MAX_SECRET_BYTES: usize = 512 * 1024;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 128;
 /// Alias (and collection name) of the per-scope in-memory collection.
 pub const SESSION_ALIAS: &str = "session";
+/// The collection a new scope starts with, which the `default` alias points
+/// to, as gnome-keyring's login keyring. Some clients assume it exists.
+pub const LOGIN_COLLECTION: &str = "login";
+pub const DEFAULT_ALIAS: &str = "default";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -657,6 +661,18 @@ impl ScopedVault<'_> {
         }
         self.commit(ns, &writes, &[])?;
         Ok((name, true))
+    }
+
+    /// Gives a scope without data its `login` collection, aliased `default`.
+    /// A scope that has data keeps what it has, also after deleting all its
+    /// collections.
+    pub fn ensure_namespace(&mut self) -> Result<(), StoreError> {
+        if self.ns().is_some() {
+            return Ok(());
+        }
+        let (name, _) = self.create_collection("Login", DEFAULT_ALIAS)?;
+        debug_assert_eq!(name, LOGIN_COLLECTION);
+        Ok(())
     }
 
     pub fn delete_collection(&mut self, name: &str) -> Result<(), StoreError> {

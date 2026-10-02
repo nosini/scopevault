@@ -301,7 +301,7 @@ async fn a_missing_vault_is_created_on_first_use() {
     let fx = fixture(VaultState::Missing).await;
     let host = fx.client(Some(Principal::Host)).await;
     fx.vault.set_pins(&["new password"]);
-    assert!(collections(&host).await.is_empty());
+    assert_eq!(collections(&host).await, ["/org/freedesktop/secrets/collection/login"]);
     assert!(fx.vault.unlocked());
     assert!(fx.vault.log().contains("SETREPEAT"));
 }
@@ -333,7 +333,7 @@ async fn cancelled_unlock_gives_is_locked_and_a_cooldown() {
     fx.vault.set_pins(&[PASSWORD]);
     let (dismissed, result) = run_prompt(&a, &fx.service_name().await, &prompt).await;
     assert!(!dismissed);
-    assert!(paths_of(result).is_empty(), "there is no default collection yet");
+    assert_eq!(paths_of(result), ["/org/freedesktop/secrets/collection/login"], "the scope's own login collection");
     assert!(fx.vault.unlocked());
     assert_eq!(fx.vault.dialogs(), 2);
 }
@@ -384,7 +384,7 @@ async fn create_collection_on_a_locked_vault_uses_a_prompt() {
     assert!(!dismissed);
     let path: OwnedObjectPath = result.try_into().unwrap();
     assert_eq!(path.as_str(), "/org/freedesktop/secrets/collection/work");
-    assert_eq!(collections(&a).await, [path.to_string()]);
+    assert_eq!(collections(&a).await, ["/org/freedesktop/secrets/collection/login".to_owned(), path.to_string()]);
     // The prompt is gone once completed.
     let e = call(&a, &prompt, PROMPT_IFACE, "Prompt", &("",)).await.unwrap_err();
     assert_eq!(e.0, UNKNOWN_OBJECT);
@@ -551,8 +551,56 @@ async fn the_session_collection_lives_in_memory_only() {
     // Gone after a global lock and unlock.
     fx.vault.lock_vault();
     fx.vault.set_pins(&[PASSWORD]);
-    assert!(collections(&a).await.is_empty());
+    assert_eq!(collections(&a).await, ["/org/freedesktop/secrets/collection/login"]);
     assert_eq!(get_secret(&a, &item, &s).await.unwrap_err().0, UNKNOWN_OBJECT);
+}
+
+/// Cryptomator's Secret Service library (`purejava/secret-service`, used by
+/// cryptomator/integrations-linux 1.7.0) never creates a collection: it
+/// expects `default`, or else `/collection/login`, to exist, as with
+/// gnome-keyring.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_scope_starts_with_a_login_collection() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    let login = "/org/freedesktop/secrets/collection/login";
+    let default = "/org/freedesktop/secrets/aliases/default";
+    let m = call(&a, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap();
+    assert_eq!(m.body().deserialize::<(OwnedObjectPath,)>().unwrap().0.as_str(), login);
+    let label: String = get(&a, default, COL_IFACE, "Label").await.unwrap().try_into().unwrap();
+    assert_eq!(label, "Login");
+
+    // Cryptomator's storePassphrase, then loadPassphrase after a restart.
+    let attrs = HashMap::from([("Vault", "v1")]);
+    let found = |c: &zbus::Connection| {
+        let (c, attrs) = (c.clone(), attrs.clone());
+        async move {
+            let m = call(&c, default, COL_IFACE, "SearchItems", &(attrs,)).await.unwrap();
+            strings(m.body().deserialize::<(Vec<OwnedObjectPath>,)>().unwrap().0)
+        }
+    };
+    assert!(found(&a).await.is_empty());
+    assert_eq!(xlock(&a, "Unlock", &[default]).await.unwrap(), (vec![login.to_owned()], "/".into()));
+    let s = ClientSession::dh(&a).await;
+    let item =
+        create_item(&a, default, &s, "Cryptomator", &[("Vault", "v1"), ("Name", "test")], b"pw", false).await.unwrap();
+    fx.vault.lock_vault();
+    fx.vault.set_pins(&[PASSWORD]);
+    assert_eq!(found(&a).await, std::slice::from_ref(&item));
+    let s = ClientSession::dh(&a).await;
+    assert_eq!(get_secret(&a, &item, &s).await.unwrap().0, b"pw");
+    // B has its own, empty, login collection under the same path.
+    assert!(found(&b).await.is_empty());
+
+    // A scope that deletes its login collection does not get it back.
+    call(&b, login, COL_IFACE, "Delete", &()).await.unwrap();
+    assert!(collections(&b).await.is_empty());
+    fx.vault.lock_vault();
+    fx.vault.set_pins(&[PASSWORD]);
+    assert!(collections(&b).await.is_empty());
+    let m = call(&b, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap();
+    assert_eq!(m.body().deserialize::<(OwnedObjectPath,)>().unwrap().0.as_str(), "/");
 }
 
 #[tokio::test(flavor = "multi_thread")]

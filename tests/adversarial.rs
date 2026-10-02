@@ -253,9 +253,9 @@ async fn foreign_paths_look_exactly_like_missing_ones() {
         assert_eq!(out.ok(9), "", "nothing foreign is locked");
         assert_eq!(out.ok(15), "");
         if matches!(who, Who::Host) {
-            // The host has no collections at all.
-            assert_eq!(out.ok(6), "");
-            assert_eq!(out.err(7), UNKNOWN_OBJECT);
+            // The host has only its own, empty, login collection.
+            assert_eq!(out.ok(6), "login");
+            assert_eq!(out.ok(7), "");
             assert_eq!(out.ok(8), "");
             assert_eq!(out.ok(14), " | ");
         } else {

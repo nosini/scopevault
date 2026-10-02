@@ -275,7 +275,9 @@ async fn random_requests_are_answered_and_change_nothing_foreign() {
     let b = fx.client(Some(flatpak("org.example.B"))).await;
 
     // The victim's data.
-    let b_col = create_collection(&b, B_COLLECTION_LABEL, "default").await;
+    let b_col = create_collection(&b, B_COLLECTION_LABEL, "").await;
+    let target = zbus::zvariant::OwnedObjectPath::try_from(b_col.clone()).unwrap();
+    call(&b, SERVICE, SVC_IFACE, "SetAlias", &("default", target)).await.unwrap();
     let bs = ClientSession::plain(&b).await;
     let b_item =
         create_item(&b, &b_col, &bs, B_LABEL, &[("marker", B_ATTR)], B_SECRET.as_bytes(), false).await.unwrap();
@@ -393,7 +395,7 @@ async fn random_requests_are_answered_and_change_nothing_foreign() {
     assert!(answered > errors.values().sum::<usize>(), "some requests should succeed: {errors:?}");
 
     // B's data is exactly as before.
-    assert_eq!(collections(&b).await, vec![b_col.clone()]);
+    assert_eq!(collections(&b).await, vec![b_col.clone(), "/org/freedesktop/secrets/collection/login".to_owned()]);
     assert_eq!(get(&b, &b_col, COL_IFACE, "Label").await.unwrap(), Value::from(B_COLLECTION_LABEL).try_into().unwrap());
     let items: Vec<zbus::zvariant::OwnedObjectPath> =
         get(&b, &b_col, COL_IFACE, "Items").await.unwrap().try_into().unwrap();

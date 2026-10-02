@@ -44,19 +44,18 @@ async fn collections_and_aliases_are_scoped() {
     let b = fx.client(Some(flatpak("org.example.B"))).await;
     let host = fx.client(Some(Principal::Host)).await;
 
+    // Each scope starts with its own login collection, aliased default, so
+    // these return it.
     let ca = create_collection(&a, "Login", "default").await;
     let cb = create_collection(&b, "Login", "default").await;
-    create_collection(&a, "Secret Project", "").await;
+    let cp = create_collection(&a, "Secret Project", "").await;
     // Same readable path in two scopes, but different objects.
     assert_eq!(ca, "/org/freedesktop/secrets/collection/login");
     assert_eq!(ca, cb);
 
-    assert_eq!(
-        collections(&a).await,
-        ["/org/freedesktop/secrets/collection/login", "/org/freedesktop/secrets/collection/secret_project"]
-    );
-    assert_eq!(collections(&b).await, ["/org/freedesktop/secrets/collection/login"]);
-    assert!(collections(&host).await.is_empty());
+    assert_eq!(collections(&a).await, [ca.as_str(), "/org/freedesktop/secrets/collection/secret_project"]);
+    assert_eq!(collections(&b).await, [ca.as_str()]);
+    assert_eq!(collections(&host).await, [ca.as_str()]);
 
     // Labels differ per scope through the same path and through the alias path.
     call(&b, &cb, PROPS, "Set", &(COL_IFACE, "Label", Value::from("B's login"))).await.unwrap();
@@ -67,12 +66,13 @@ async fn collections_and_aliases_are_scoped() {
     }
 
     // ReadAlias resolves within the caller's scope only.
-    let m = call(&host, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap();
-    let (p,): (OwnedObjectPath,) = m.body().deserialize().unwrap();
-    assert_eq!(p.as_str(), "/");
-    let m = call(&a, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap();
-    let (p,): (OwnedObjectPath,) = m.body().deserialize().unwrap();
-    assert_eq!(p.as_str(), ca);
+    let target = OwnedObjectPath::try_from(cp.clone()).unwrap();
+    call(&a, SERVICE, SVC_IFACE, "SetAlias", &("default", target)).await.unwrap();
+    for (who, expected) in [(&a, cp.as_str()), (&b, ca.as_str()), (&host, ca.as_str())] {
+        let m = call(who, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap();
+        let (p,): (OwnedObjectPath,) = m.body().deserialize().unwrap();
+        assert_eq!(p.as_str(), expected);
+    }
 
     // GetAll on the service shows only the caller's collections.
     let m = call(&b, SERVICE, PROPS, "GetAll", &(SVC_IFACE,)).await.unwrap();
@@ -121,7 +121,7 @@ async fn foreign_paths_are_indistinguishable_from_missing_ones() {
     // Deleting a foreign collection is impossible, and A still has it.
     let e = call(&b, &foreign, COL_IFACE, "Delete", &()).await.unwrap_err();
     assert_eq!(e.0, "org.freedesktop.DBus.Error.UnknownObject");
-    assert_eq!(collections(&a).await, [foreign]);
+    assert_eq!(collections(&a).await, ["/org/freedesktop/secrets/collection/login".to_owned(), foreign]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -129,15 +129,15 @@ async fn introspection_is_scoped() {
     let fx = fixture(VaultState::Unlocked).await;
     let a = fx.client(Some(flatpak("org.example.A"))).await;
     let b = fx.client(Some(flatpak("org.example.B"))).await;
-    create_collection(&a, "Alpha", "default").await;
+    create_collection(&a, "Alpha", "work").await;
     create_collection(&a, "Beta", "").await;
     create_collection(&b, "Gamma", "").await;
 
     let dir = "/org/freedesktop/secrets/collection";
-    assert_eq!(introspect_children(&a, dir).await.unwrap(), ["alpha", "beta"]);
-    assert_eq!(introspect_children(&b, dir).await.unwrap(), ["gamma"]);
-    assert_eq!(introspect_children(&a, "/org/freedesktop/secrets/aliases").await.unwrap(), ["default"]);
-    assert!(introspect_children(&b, "/org/freedesktop/secrets/aliases").await.unwrap().is_empty());
+    assert_eq!(introspect_children(&a, dir).await.unwrap(), ["alpha", "beta", "login"]);
+    assert_eq!(introspect_children(&b, dir).await.unwrap(), ["gamma", "login"]);
+    assert_eq!(introspect_children(&a, "/org/freedesktop/secrets/aliases").await.unwrap(), ["default", "work"]);
+    assert_eq!(introspect_children(&b, "/org/freedesktop/secrets/aliases").await.unwrap(), ["default"]);
     assert_eq!(introspect_children(&b, "/").await.unwrap(), ["org"]);
 }
 

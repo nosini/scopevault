@@ -29,6 +29,8 @@ descriptors, which dbus-broker does.
   the scope they concern.
 - Secrets are stored in one encrypted vault, opened with a master password
   through pinentry.
+- Each scope gets a `login` collection as its default, like
+  gnome-keyring's login keyring.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains

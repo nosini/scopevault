@@ -108,9 +108,10 @@ async fn real_identity_scopes_host_and_flatpak_callers() {
     assert_eq!(res[0], format!("ok {}", col("host_only")));
     assert_eq!(res[1], format!("ok {}", col("alpha_only")));
     // A second instance of the same app shares its scope.
-    assert_eq!(res[2], format!("ok {}", col("alpha_only")));
-    assert_eq!(res[3], "ok ");
-    assert_eq!(res[4], format!("ok {}", col("host_only")));
+    // Each scope also has its own login collection.
+    assert_eq!(res[2], format!("ok {},{}", col("alpha_only"), col("login")));
+    assert_eq!(res[3], format!("ok {}", col("login")));
+    assert_eq!(res[4], format!("ok {},{}", col("host_only"), col("login")));
     for denied in &res[5..] {
         assert_eq!(denied, "error org.freedesktop.DBus.Error.AccessDenied");
     }

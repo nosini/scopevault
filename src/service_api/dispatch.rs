@@ -566,7 +566,8 @@ impl<R: CallerResolver> SecretService<R> {
         self.unlocker.vault().lock().unwrap().is_unlocked()
     }
 
-    /// Runs `f` on the caller's scope of the unlocked vault.
+    /// Runs `f` on the caller's scope of the unlocked vault. A scope's first
+    /// use creates its `login` collection.
     pub(crate) fn with_vault<T>(
         &self,
         principal: &Principal,
@@ -575,6 +576,7 @@ impl<R: CallerResolver> SecretService<R> {
         let mut slot = self.unlocker.vault().lock().unwrap();
         let vault = slot.vault.as_mut().ok_or_else(Fault::is_locked)?;
         let mut scoped = vault.scoped(principal)?;
+        scoped.ensure_namespace()?;
         f(&mut scoped)
     }
 

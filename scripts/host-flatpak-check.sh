@@ -21,7 +21,9 @@
 #
 # --app APP_ID starts the real app on the private bus (close it first if it
 # is running: many apps hand over to a running instance). Use it, then quit
-# the app; the script summarises what the app asked the daemon.
+# the app; the script summarises what the app asked the daemon. It then
+# offers to restart the daemon and the app on the same vault, to check that
+# the app finds what it stored.
 #
 # Needs: flatpak, dbus-broker, systemd-socket-activate, gdbus, and built
 # binaries (cargo build --bins). The client must run inside Flatpak runtimes,
@@ -213,27 +215,50 @@ if [ -n "$app" ]; then
         echo "note: $app is already running; a new start may just hand over to that instance,"
         echo "      which uses the real session bus. Quit it first for a meaningful run."
     fi
-    echo "Starting $app on the private bus. Use it (log in, save a password...), then quit it."
-    echo "Services it may expect on the session bus (portals, notifications...) are absent here."
-    before=$(wc -l < "$work/daemon.log")
-    started=$(date +%s)
-    flatpak run "$app" $app_args >"$work/app.log" 2>&1 || true
-    # Some launchers return at once (handing over to a running instance, or
-    # leaving the app running in the background). Keep the daemon up until
-    # the user is done either way.
-    if [ $(($(date +%s) - started)) -lt 10 ]; then
-        echo "note: 'flatpak run' returned after less than 10 s."
-        echo "Running instances of $app: $(flatpak ps --columns=application 2>/dev/null | grep -cx "$app")"
-    fi
-    printf 'Press Enter once you have quit %s. ' "$app"
-    read -r _ </dev/tty || true
-    echo "--- requests to the daemon, by caller scope (daemon log):"
-    tail -n "+$((before + 1))" "$work/daemon.log" | grep -o 'scope=[^ ]* .*member=[^ ]* outcome=[^ ]*' \
-        | sed 's/interface=[^ ]* //; s/path=[^ ]* //' | sort | uniq -c | sort -rn | head -n 40 || true
-    echo "--- identification (denials would be listed here):"
-    tail -n "+$((before + 1))" "$work/daemon.log" | grep -E 'identified caller|denied caller' | sed 's/.*\(identified\|denied\)/\1/' | sort | uniq -c
-    echo "--- the app's own output (last 30 lines):"
-    tail -n 30 "$work/app.log"
+    run=1
+    while :; do
+        echo "Starting $app on the private bus (run $run). Use it (log in, save a password...), then quit it."
+        echo "Services it may expect on the session bus (portals, notifications...) are absent here."
+        before=$(wc -l < "$work/daemon.log")
+        started=$(date +%s)
+        flatpak run "$app" $app_args >"$work/app.log" 2>&1 || true
+        # Some launchers return at once (handing over to a running instance, or
+        # leaving the app running in the background). Keep the daemon up until
+        # the user is done either way.
+        if [ $(($(date +%s) - started)) -lt 10 ]; then
+            echo "note: 'flatpak run' returned after less than 10 s."
+            echo "Running instances of $app: $(flatpak ps --columns=application 2>/dev/null | grep -cx "$app")"
+        fi
+        printf 'Press Enter once you have quit %s. ' "$app"
+        read -r _ </dev/tty || true
+        tail -n "+$((before + 1))" "$work/daemon.log" > "$work/run.log"
+        echo "--- requests to the daemon, by caller scope (daemon log):"
+        grep -o 'scope=[^ ]* .*member=[^ ]* outcome=[^ ]*' "$work/run.log" \
+            | sed 's/interface=[^ ]* //; s/path=[^ ]* //' | sort | uniq -c | sort -rn | head -n 40 || true
+        echo "--- the same requests in order (first 60):"
+        grep -o 'sender=[^ ]* .*member=[^ ]* outcome=[^ ]*' "$work/run.log" \
+            | sed 's/scope=[^ ]* //; s/interface=[^ ]* //; s/path=Some(\("[^"]*"\))/\1/; s/member=Some(\("[^"]*"\))/\1/' \
+            | head -n 60 || true
+        echo "--- identification (denials would be listed here):"
+        grep -E 'identified caller|denied caller' "$work/run.log" | sed 's/.*\(identified\|denied\)/\1/' | sort | uniq -c
+        echo "--- the app's own output (last 30 lines):"
+        tail -n 30 "$work/app.log"
+        # A second run checks that the app finds what it stored: the daemon is
+        # restarted, so the vault is read back from disk and starts locked.
+        printf '\nRestart the daemon and start %s again on the same vault? [y/N] ' "$app"
+        read -r again </dev/tty || again=
+        case $again in [yY]*) ;; *) break ;; esac
+        kill "$daemon_pid"
+        wait "$daemon_pid" 2>/dev/null || true
+        for _ in $(seq 50); do
+            dbus NameHasOwner org.freedesktop.secrets 2>/dev/null | grep -q true || break
+            sleep 0.1
+        done
+        start
+        say "the existing vault: enter \"$pw\" when asked (once)"
+        run=$((run + 1))
+        echo
+    done
     exit 0
 fi
 

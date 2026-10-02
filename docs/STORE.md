@@ -105,6 +105,15 @@ lives in memory only: neither it nor its items or secrets are ever written
 to disk, and it is gone after a global lock or a restart. A stored
 collection with that name counts as corruption.
 
+## The `login` collection
+
+The first time a scope uses the unlocked vault, it gets a collection named
+`login`, labelled "Login", with its `default` alias pointing there, as
+gnome-keyring does with its login keyring. Some clients assume it exists:
+Cryptomator's Secret Service library never creates a collection. A scope
+that already has data is left as it is, so deleting `login` or moving
+`default` sticks, across restarts too.
+
 ## The unlock dialog
 
 The daemon runs `pinentry` as a child process and reads the password from

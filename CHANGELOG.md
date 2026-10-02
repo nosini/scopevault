@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Each scope gets a `login` collection as its default, as with
+  gnome-keyring. Cryptomator could not save passwords without it.
+
 ## 0.4.0
 
 - Limits on request sizes, connections per app and repeatedly cancelled

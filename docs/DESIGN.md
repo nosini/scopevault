@@ -164,6 +164,13 @@ Item, Session and Prompt, on the encrypted vault.
 - `GetSecrets` answers with the paths the client sent, aliases included,
   because libsecret looks results up by its own item paths.
 
+Each scope gets a `login` collection, set as its `default`, the first time
+it uses the vault, just as gnome-keyring creates a login keyring. Some
+clients rely on it. Cryptomator's Secret Service library never creates a
+collection: it points `default` at `/collection/login` and expects it to be
+there. A scope that already has data keeps it as it is, so deleting
+`login` or moving `default` sticks.
+
 ## Locking and unlocking
 
 The vault is one encrypted file with one master password. Unlocking it
@@ -210,3 +217,8 @@ again. Other collections and other scopes are not affected.
   from 1.15.8 on, and only when built where `SO_PEERPIDFD` is defined;
   openSUSE's `dbus-daemon` does not. On a bus without it every caller is
   refused.
+- Tested with real Flatpak apps using their own credential code: MongoDB
+  Compass (libsecret through Electron) and Cryptomator (its own Java
+  client). Bitwarden could not be put through the private-bus test
+  harness: it crashed there at startup, before talking to the daemon, so
+  that test says nothing about it.
