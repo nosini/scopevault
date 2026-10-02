@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::identity::{CallerResolver, Principal};
 use crate::prompts::unlock::UnlockOutcome;
-use crate::store::{ScopedVault, Secret};
+use crate::store::{SHARED_COLLECTION, ScopedVault, Secret};
 
 use super::dispatch::{
     Call, CallResult, Event, Fault, MAX_PROMPTS_PER_CONNECTION, MAX_SESSIONS_PER_CONNECTION, Node, PromptAction,
@@ -134,6 +134,21 @@ impl<R: CallerResolver> SecretService<R> {
             PROPERTIES_CHANGED,
             changed(interfaces::SERVICE.name, vec![("Collections", v)]),
         );
+        Ok(())
+    }
+
+    /// Signals the item's change to every scope it is shared with, with the
+    /// item's path in each grantee's view.
+    fn shared_changed(&self, call: &mut Call<'_>, c: &str, i: &str) -> Result<(), Fault> {
+        for (grantee, grant) in self.with_vault(&call.principal, |v| Ok(v.grantees_of(c, i)))? {
+            call.signal_for(
+                &grantee,
+                paths::collection(SHARED_COLLECTION),
+                interfaces::COLLECTION.name,
+                "ItemChanged",
+                SignalBody::Path(paths::item(SHARED_COLLECTION, &grant)),
+            );
+        }
         Ok(())
     }
 
@@ -303,6 +318,7 @@ impl<R: CallerResolver> SecretService<R> {
                 let body = changed(iface.name, vec![(prop, new_value)]);
                 call.signal_scope(path.clone(), interfaces::PROPERTIES.name, PROPERTIES_CHANGED, body);
                 Self::collection_signal(call, c, "ItemChanged", path);
+                self.shared_changed(call, c, i)?;
             }
             _ => return Err(Fault::read_only()),
         }
@@ -501,9 +517,23 @@ impl<R: CallerResolver> SecretService<R> {
     pub(crate) fn item_method(&self, call: &mut Call<'_>, member: &str, c: &str, i: &str) -> CallResult {
         match member {
             "Delete" => {
-                self.with_vault(&call.principal, |v| Ok(v.delete_item(c, i)?))?;
+                // The grantees must be looked up before the item is gone.
+                let grantees = self.with_vault(&call.principal, |v| {
+                    let grantees = v.grantees_of(c, i);
+                    v.delete_item(c, i)?;
+                    Ok(grantees)
+                })?;
                 Self::collection_signal(call, c, "ItemDeleted", paths::item(c, i));
                 self.items_changed(call, c)?;
+                for (grantee, grant) in grantees {
+                    call.signal_for(
+                        &grantee,
+                        paths::collection(SHARED_COLLECTION),
+                        interfaces::COLLECTION.name,
+                        "ItemDeleted",
+                        SignalBody::Path(paths::item(SHARED_COLLECTION, &grant)),
+                    );
+                }
                 call.reply(&(paths::none(),))
             }
             "GetSecret" => {
@@ -516,8 +546,38 @@ impl<R: CallerResolver> SecretService<R> {
             "SetSecret" => {
                 let (wire,): (WireSecret,) = args(call)?;
                 let secret = self.receive_secret(call, wire)?;
-                self.with_vault(&call.principal, |v| Ok(v.set_secret(c, i, &secret)?))?;
-                Self::collection_signal(call, c, "ItemChanged", paths::item(c, i));
+                if c == SHARED_COLLECTION {
+                    // A grantee wrote a shared item: the owner hears about it
+                    // with the owner's path, the co-grantees with theirs.
+                    let (origin, peers) = self.with_vault(&call.principal, |v| {
+                        v.set_secret(c, i, &secret)?;
+                        let origin = v.shared_origin(i).ok_or_else(Fault::unknown_object)?;
+                        let peers = v.shared_peers(i);
+                        Ok((origin, peers))
+                    })?;
+                    Self::collection_signal(call, c, "ItemChanged", paths::item(c, i));
+                    let (owner, collection, item) = origin;
+                    call.signal_for(
+                        &owner,
+                        paths::collection(&collection),
+                        interfaces::COLLECTION.name,
+                        "ItemChanged",
+                        SignalBody::Path(paths::item(&collection, &item)),
+                    );
+                    for (grantee, grant) in peers {
+                        call.signal_for(
+                            &grantee,
+                            paths::collection(SHARED_COLLECTION),
+                            interfaces::COLLECTION.name,
+                            "ItemChanged",
+                            SignalBody::Path(paths::item(SHARED_COLLECTION, &grant)),
+                        );
+                    }
+                } else {
+                    self.with_vault(&call.principal, |v| Ok(v.set_secret(c, i, &secret)?))?;
+                    Self::collection_signal(call, c, "ItemChanged", paths::item(c, i));
+                    self.shared_changed(call, c, i)?;
+                }
                 call.reply(&())
             }
             other => Err(Fault::unknown_method(other)),

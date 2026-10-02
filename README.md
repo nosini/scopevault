@@ -36,6 +36,7 @@ descriptors, which dbus-broker does.
   gnome-keyring.
 - It can serve the Secret portal too, so Flatpak apps' portal keys live in
   the vault.
+- Single items can be shared with another app, read-only or read-write.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains

@@ -27,7 +27,8 @@ use super::peer::peer_credentials;
 use super::protocol::{MAX_LINE, Reply, Request, Status, VaultState, read_line, write_json};
 use crate::identity::{BusCredentials, IdentityError, Principal, Scope};
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
-use crate::store::{StoreError, is_valid_portal_app_id};
+use crate::service_api::dispatch::GrantChange;
+use crate::store::{SHARED_COLLECTION, StoreError, is_valid_portal_app_id};
 
 /// Administrative connections served at once; more are closed at once.
 const MAX_CLIENTS: usize = 4;
@@ -40,6 +41,9 @@ pub trait ServiceControl: Send + Sync + 'static {
     fn global_lock(self: Arc<Self>) -> bool;
     /// Connections, transfer sessions and pending prompts.
     fn counters(&self) -> (usize, usize, usize);
+    /// See `SecretService::grant_changed`: signals a grant change to the
+    /// grantee's scope.
+    fn grant_changed(self: Arc<Self>, change: GrantChange);
 }
 
 impl<R: crate::identity::CallerResolver> ServiceControl for crate::service_api::SecretService<R> {
@@ -48,6 +52,9 @@ impl<R: crate::identity::CallerResolver> ServiceControl for crate::service_api::
     }
     fn counters(&self) -> (usize, usize, usize) {
         (self.active_connections(), self.open_sessions(), self.pending_prompts())
+    }
+    fn grant_changed(self: Arc<Self>, change: GrantChange) {
+        crate::service_api::SecretService::grant_changed(&self, change);
     }
 }
 
@@ -348,6 +355,92 @@ impl AdminServer {
                 let (collections, items) = v.reset_scope(authority, &scope).map_err(store_error)?;
                 tracing::info!(%scope, collections, items, "admin: scope reset");
                 Ok(Reply::Reset { collections, items })
+            }
+            Request::Share { from, item, to, write } => {
+                let (from, to) = (parse_scope(&from)?, parse_scope(&to)?);
+                if from == Scope::Portal || to == Scope::Portal {
+                    return Err(Reply::error("the portal scope never shares"));
+                }
+                if from == to {
+                    return Err(Reply::error("a scope cannot share with itself"));
+                }
+                // Check first, so the dialog is not shown for a request that
+                // would fail anyway.
+                self.unlocked().await?;
+                let label = {
+                    let mut slot = vault.lock().unwrap();
+                    let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
+                    let Some((col, it)) = item.split_once('/') else {
+                        return Err(Reply::error("the item must be COLLECTION/ITEM (as `list` shows it)"));
+                    };
+                    let s = v.scoped_admin(authority, from.clone()).map_err(store_error)?;
+                    let info = s.item(col, it).ok_or_else(|| Reply::error(format!("{from} has no item {item}")))?;
+                    info.label
+                };
+                let access = if write { "read and write" } else { "read" };
+                let action = format!("give {to} {access} access to \"{label}\" from {from}");
+                if let Some(r) = refused(self.unlocker.confirm_admin(&action).await) {
+                    return Err(r);
+                }
+                let (grant, had_shared) = {
+                    let mut slot = vault.lock().unwrap();
+                    let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
+                    let had_shared = v
+                        .scoped_admin(authority, to.clone())
+                        .map_err(store_error)?
+                        .collection_names()
+                        .iter()
+                        .any(|c| c == SHARED_COLLECTION);
+                    let grant = v.share(authority, &from, &item, &to, write).map_err(store_error)?;
+                    (grant, had_shared)
+                };
+                self.control.clone().grant_changed(GrantChange {
+                    grantee: to.clone(),
+                    grant: grant.clone(),
+                    created: true,
+                    shared_appeared: !had_shared,
+                    shared_disappeared: false,
+                });
+                tracing::info!(%from, %to, item = %item, write, "admin: item shared");
+                Ok(Reply::Shared { grant })
+            }
+            Request::Unshare { grant } => {
+                self.unlocked().await?;
+                let (listing, grantee, disappeared) = {
+                    let mut slot = vault.lock().unwrap();
+                    let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
+                    let listing = v.unshare(authority, &grant).map_err(store_error)?;
+                    let grantee: Scope =
+                        listing.grantee.parse().map_err(|e| Reply::error(format!("not a scope: {e}")))?;
+                    let still = v
+                        .scoped_admin(authority, grantee.clone())
+                        .map_err(store_error)?
+                        .collection_names()
+                        .iter()
+                        .any(|c| c == SHARED_COLLECTION);
+                    (listing, grantee, !still)
+                };
+                self.control.clone().grant_changed(GrantChange {
+                    grantee: grantee.clone(),
+                    grant: grant.clone(),
+                    created: false,
+                    shared_appeared: false,
+                    shared_disappeared: disappeared,
+                });
+                tracing::info!(grant = %grant, owner = %listing.owner, grantee = %grantee, "admin: grant removed");
+                Ok(Reply::Done {
+                    message: format!("removed the grant on \"{}\" from {}", listing.label, listing.grantee),
+                })
+            }
+            Request::Grants { scope } => {
+                let scope = match scope {
+                    Some(s) => Some(parse_scope(&s)?),
+                    None => None,
+                };
+                self.unlocked().await?;
+                let mut slot = vault.lock().unwrap();
+                let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
+                Ok(Reply::Grants { grants: v.grants(authority, scope.as_ref()).map_err(store_error)? })
             }
             Request::Backup => unreachable!("handled before"),
             Request::PortalInit => {

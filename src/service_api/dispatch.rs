@@ -54,7 +54,7 @@ use zbus::{Connection, MessageStream};
 
 use crate::identity::{CallerResolver, Principal, Scope};
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
-use crate::store::{ScopedVault, StoreError};
+use crate::store::{SHARED_COLLECTION, ScopedVault, StoreError};
 
 use super::interfaces::{self, Interface};
 use super::paths::{self, Parsed};
@@ -94,8 +94,8 @@ impl Fault {
     pub fn unknown_object() -> Self {
         Fault::new("org.freedesktop.DBus.Error.UnknownObject", "No such object")
     }
-    pub fn access_denied() -> Self {
-        Fault::new("org.freedesktop.DBus.Error.AccessDenied", "Caller could not be identified")
+    pub fn access_denied(why: impl Into<String>) -> Self {
+        Fault::new("org.freedesktop.DBus.Error.AccessDenied", why)
     }
     pub(crate) fn unknown_method(member: &str) -> Self {
         Fault::new("org.freedesktop.DBus.Error.UnknownMethod", format!("Unknown method {member}"))
@@ -137,6 +137,7 @@ impl From<StoreError> for Fault {
             StoreError::NoSuchObject => Fault::no_such_object(),
             StoreError::Limit(why) => Fault::limits(why),
             StoreError::Invalid(why) => Fault::invalid_args(why),
+            StoreError::NotPermitted(why) => Fault::access_denied(why),
             other => internal(other),
         }
     }
@@ -268,6 +269,19 @@ impl Call<'_> {
         body: SignalBody,
     ) {
         self.events.push(Event { target: Target::Scope(self.scope()), path, interface, member, body });
+    }
+
+    /// Queues a signal for another scope's connections — a shared item's
+    /// grantees, or the owner of an item a grantee changed.
+    pub fn signal_for(
+        &mut self,
+        scope: &Scope,
+        path: OwnedObjectPath,
+        interface: &'static str,
+        member: &'static str,
+        body: SignalBody,
+    ) {
+        self.events.push(Event { target: Target::Scope(scope.clone()), path, interface, member, body });
     }
 }
 
@@ -512,7 +526,7 @@ impl<R: CallerResolver> SecretService<R> {
         let principal = match &*self.resolver.resolve(&sender).await {
             Ok(p) => p.clone(),
             Err(_) => {
-                self.send_reply(msg, Err(Fault::access_denied())).await;
+                self.send_reply(msg, Err(Fault::access_denied("Caller could not be identified"))).await;
                 return false;
             }
         };
@@ -856,6 +870,60 @@ impl<R: CallerResolver> SecretService<R> {
     pub fn pending_prompts(&self) -> usize {
         self.prompts.lock().unwrap().len()
     }
+
+    /// After a `share` or `unshare` through the administrative interface:
+    /// tells every identified connection of the grantee scope that an item
+    /// appeared in or disappeared from its `Shared` collection, and that the
+    /// service's `Collections` changed when `Shared` itself appeared or
+    /// disappeared. No other scope is told.
+    pub fn grant_changed(self: &Arc<Self>, change: GrantChange) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let member = if change.created { "ItemCreated" } else { "ItemDeleted" };
+            this.emit(Event {
+                target: Target::Scope(change.grantee.clone()),
+                path: paths::collection(SHARED_COLLECTION),
+                interface: interfaces::COLLECTION.name,
+                member,
+                body: SignalBody::Path(paths::item(SHARED_COLLECTION, &change.grant)),
+            })
+            .await;
+            if !change.shared_appeared && !change.shared_disappeared {
+                return;
+            }
+            // The property value is the grantee's own view, so only a
+            // connected principal of that scope can compute it; without one,
+            // nobody receives anything anyway.
+            let Some(principal) = this.active_principals().into_iter().find(|p| p.scope() == change.grantee) else {
+                return;
+            };
+            let Ok(cols) = this.with_vault(&principal, |v| Ok(v.collection_names())) else { return };
+            let Ok(v) = value(cols.iter().map(|c| paths::collection(c)).collect::<Vec<_>>()) else { return };
+            this.emit(Event {
+                target: Target::Scope(change.grantee.clone()),
+                path: service_path(),
+                interface: interfaces::PROPERTIES.name,
+                member: "PropertiesChanged",
+                body: SignalBody::PropertiesChanged(interfaces::SERVICE.name, BTreeMap::from([("Collections", v)])),
+            })
+            .await;
+        });
+    }
+}
+
+/// What the administrative interface reports after share/unshare, for the
+/// signals to the grantee scope.
+#[derive(Debug, Clone)]
+pub struct GrantChange {
+    pub grantee: Scope,
+    /// The grant's ID (the item's path name in the grantee's view).
+    pub grant: String,
+    /// True for share (the item appears), false for unshare (it disappears).
+    pub created: bool,
+    /// Whether `Shared` appeared for the grantee with this grant.
+    pub shared_appeared: bool,
+    /// Whether `Shared` disappeared for the grantee with this unshare.
+    pub shared_disappeared: bool,
 }
 
 /// Whether a request needs the vault's (encrypted) contents.

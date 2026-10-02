@@ -37,6 +37,14 @@ Commands (the daemon must be running):
   portal new-key APP-ID       create a portal key for APP-ID (refuses if it
                               has one); a keyring file the app already has
                               cannot be decrypted with the new key
+  share FROM ITEM TO [--write]
+                              give TO read (or, with --write, read and write)
+                              access to an item (COLLECTION/ITEM, as shown by
+                              list) of scope FROM; TO sees the item in its
+                              `Shared` collection. Asks for the master password
+  unshare GRANT               revoke a grant (its ID as shown by grants)
+  grants [SCOPE] [--json]     list grants, or those where SCOPE is the owner
+                              or the grantee
   backup FILE                 write an encrypted copy of the vault to FILE;
                               it opens with the current master password
 
@@ -160,6 +168,16 @@ fn print_reply(reply: &Reply, json: bool) -> ExitCode {
             }
         }
         Reply::Reset { collections, items } => println!("deleted {items} items in {collections} collections"),
+        Reply::Grants { grants } => {
+            if grants.is_empty() {
+                println!("no grants");
+            }
+            for g in grants {
+                let access = if g.write { "write" } else { "read" };
+                println!("{}  {} {}/{}  {:?}  {} {}", g.id, g.owner, g.collection, g.item, g.label, g.grantee, access);
+            }
+        }
+        Reply::Shared { grant } => println!("grant {grant}"),
         Reply::Backup { .. } => {}
     }
     ExitCode::SUCCESS
@@ -210,6 +228,17 @@ async fn run() -> ExitCode {
         ("reset-scope", [scope]) => (Request::ResetScope { scope: scope.to_string() }, false),
         ("portal", ["init"]) => (Request::PortalInit, false),
         ("portal", ["new-key", app_id]) => (Request::PortalNewKey { app_id: app_id.to_string() }, false),
+        ("share", [from, item, to]) => {
+            (Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: false }, false)
+        }
+        ("share", [from, item, to, "--write"]) => {
+            (Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: true }, false)
+        }
+        ("unshare", [grant]) => (Request::Unshare { grant: grant.to_string() }, false),
+        ("grants", []) => (Request::Grants { scope: None }, false),
+        ("grants", ["--json"]) => (Request::Grants { scope: None }, true),
+        ("grants", [scope]) => (Request::Grants { scope: Some(scope.to_string()) }, false),
+        ("grants", [scope, "--json"]) => (Request::Grants { scope: Some(scope.to_string()) }, true),
         ("backup", [file]) => {
             // Create the file first: nothing is asked of the daemon if it
             // cannot be written, and an existing file is never replaced.

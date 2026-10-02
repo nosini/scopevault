@@ -15,6 +15,7 @@ pub const KIND_NAMESPACE: u8 = 1;
 pub const KIND_COLLECTION: u8 = 2;
 pub const KIND_ITEM: u8 = 3;
 pub const KIND_SECRET: u8 = 4;
+pub const KIND_GRANT: u8 = 5;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +45,20 @@ pub struct ItemPayload {
     pub attributes: BTreeMap<String, String>,
     pub created: u64,
     pub modified: u64,
+}
+
+/// An explicit sharing grant, stored in the *owner's* namespace so backups
+/// carry it (see `crate::store::sharing`).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GrantPayload {
+    /// The owner's item record ID (hex).
+    pub item: String,
+    /// The grantee scope, in `Display` form (`host` or `flatpak/<app-id>`).
+    pub grantee: String,
+    /// Write grants may also change the item's secret.
+    pub write: bool,
+    pub created: u64,
 }
 
 pub fn encode<T: Serialize>(value: &T) -> Zeroizing<Vec<u8>> {

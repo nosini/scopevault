@@ -23,6 +23,7 @@ mod admin;
 pub mod db;
 pub mod payload;
 mod portal;
+mod sharing;
 
 pub use admin::{
     CollectionListing, ImportReport, ItemListing, PortableCollection, PortableItem, ScopeSummary, same_attributes,
@@ -30,6 +31,7 @@ pub use admin::{
 pub use portal::{
     PORTAL_KEY_BYTES, PORTAL_SCHEMA, PortalImportReport, PortalSplit, is_valid_portal_app_id, split_portal_keys,
 };
+pub use sharing::{GrantListing, MAX_GRANTS_PER_SCOPE};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -43,8 +45,8 @@ use crate::identity::{Principal, Scope};
 use crate::service_api::paths;
 use db::{Db, RawRecord, RecordId};
 use payload::{
-    CollectionPayload, ItemPayload, KIND_COLLECTION, KIND_ITEM, KIND_NAMESPACE, KIND_SECRET, NamespacePayload, hex,
-    unhex,
+    CollectionPayload, GrantPayload, ItemPayload, KIND_COLLECTION, KIND_GRANT, KIND_ITEM, KIND_NAMESPACE, KIND_SECRET,
+    NamespacePayload, hex, unhex,
 };
 
 pub use payload::Secret;
@@ -64,6 +66,10 @@ pub const SESSION_ALIAS: &str = "session";
 /// to, as gnome-keyring's login keyring. Some clients assume it exists.
 pub const LOGIN_COLLECTION: &str = "login";
 pub const DEFAULT_ALIAS: &str = "default";
+/// The virtual collection holding the items shared with a scope (see
+/// `sharing`). The store never generates this name (`collection_name_for`
+/// lowercases), so it cannot collide with a real collection.
+pub const SHARED_COLLECTION: &str = "Shared";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -93,6 +99,10 @@ pub enum StoreError {
     Limit(&'static str),
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
+    /// An operation the caller is not permitted, although the object exists
+    /// (a write to a read-only shared item, a change to `Shared` itself).
+    #[error("not permitted: {0}")]
+    NotPermitted(&'static str),
     /// An imported portal key differs from the one already stored (see
     /// `crate::store::portal`). Carries the app ID.
     #[error("a different portal key exists for {0}")]
@@ -167,6 +177,17 @@ struct NamespaceEntry {
     aliases: BTreeMap<String, RecordId>,
     /// Keyed by path name.
     collections: BTreeMap<String, CollectionEntry>,
+    /// The explicit sharing grants this namespace's items are given away
+    /// with, keyed by grant record ID (see `sharing`).
+    grants: BTreeMap<RecordId, GrantEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct GrantEntry {
+    item: RecordId,
+    grantee: Scope,
+    write: bool,
+    created: u64,
 }
 
 impl NamespaceEntry {
@@ -180,13 +201,16 @@ struct Unlocked {
     namespaces: HashMap<Scope, NamespaceEntry>,
     /// Logically locked collections (by record ID).
     locked: HashSet<RecordId>,
+    /// Scopes that locked their `Shared` collection (a per-scope, in-memory
+    /// flag: the collection is virtual, so it cannot share the real locks).
+    shared_locked: HashSet<Scope>,
     /// Changes made inside [`Vault::transaction`], not yet applied.
     staged: Option<Staged>,
 }
 
 impl Unlocked {
     fn new(cipher: RecordCipher, namespaces: HashMap<Scope, NamespaceEntry>) -> Self {
-        Unlocked { cipher, namespaces, locked: HashSet::new(), staged: None }
+        Unlocked { cipher, namespaces, locked: HashSet::new(), shared_locked: HashSet::new(), staged: None }
     }
 }
 
@@ -251,7 +275,12 @@ fn build_index(cipher: &RecordCipher, records: &[RawRecord]) -> Result<HashMap<S
         if !seen_scopes.insert(scope.clone()) {
             return Err(corrupt("two namespace records for one scope".into()));
         }
-        let entry = NamespaceEntry { id: r.id, aliases: BTreeMap::new(), collections: BTreeMap::new() };
+        let entry = NamespaceEntry {
+            id: r.id,
+            aliases: BTreeMap::new(),
+            collections: BTreeMap::new(),
+            grants: BTreeMap::new(),
+        };
         by_ns_id.insert(r.id, (scope, entry, p.aliases));
     }
 
@@ -310,7 +339,31 @@ fn build_index(cipher: &RecordCipher, records: &[RawRecord]) -> Result<HashMap<S
     if !secrets.is_empty() {
         return Err(corrupt("secret record without an item".into()));
     }
-    if let Some(r) = records.iter().find(|r| !(KIND_NAMESPACE..=KIND_SECRET).contains(&r.kind)) {
+    for r in records.iter().filter(|r| r.kind == KIND_GRANT) {
+        let bad = |what: String| corrupt(format!("grant {} refers to {}", hex(&r.id), what));
+        let (owner, ns, _) =
+            by_ns_id.get_mut(&r.namespace).ok_or_else(|| corrupt(format!("grant {} has no namespace", hex(&r.id))))?;
+        let p: GrantPayload = payload::decode(&open_record(cipher, r)?, "grant")?;
+        let grantee: Scope = p.grantee.parse().map_err(|_| bad("an invalid grantee".into()))?;
+        if grantee == Scope::Portal {
+            return Err(bad("the portal scope".into()));
+        }
+        if *owner == grantee {
+            return Err(bad("its own scope".into()));
+        }
+        if *owner == Scope::Portal {
+            return Err(bad("an item of the portal scope".into()));
+        }
+        let item = unhex(&p.item).ok_or_else(|| bad("a malformed item".into()))?;
+        if !ns.collections.values().any(|c| c.items.contains_key(&item)) {
+            return Err(bad("an item this namespace does not hold".into()));
+        }
+        if ns.grants.values().any(|g| g.item == item && g.grantee == grantee) {
+            return Err(bad("an item and grantee granted twice".into()));
+        }
+        ns.grants.insert(r.id, GrantEntry { item, grantee, write: p.write, created: p.created });
+    }
+    if let Some(r) = records.iter().find(|r| !(KIND_NAMESPACE..=KIND_GRANT).contains(&r.kind)) {
         return Err(corrupt(format!("record {} has unknown kind {}", hex(&r.id), r.kind)));
     }
 
@@ -528,6 +581,25 @@ fn item_name(id: &RecordId) -> String {
     hex(id)
 }
 
+/// One shared item as the grantee's view sees it: the grant, and where the
+/// item really lives.
+#[derive(Debug, Clone)]
+struct SharedItem {
+    grant: RecordId,
+    write: bool,
+    grant_created: u64,
+    owner_scope: Scope,
+    /// The owner's collection, by path name and record ID.
+    owner_collection: String,
+    owner_collection_id: RecordId,
+    owner_ns: RecordId,
+    owner_item: RecordId,
+    label: String,
+    attributes: BTreeMap<String, String>,
+    created: u64,
+    modified: u64,
+}
+
 impl ScopedVault<'_> {
     pub fn scope(&self) -> &Scope {
         &self.scope
@@ -598,6 +670,10 @@ impl ScopedVault<'_> {
         seal(&self.state().cipher, KIND_SECRET, ns_id, id, &payload::encode_secret(s))
     }
 
+    fn grant_record(&self, ns_id: RecordId, id: RecordId, p: &GrantPayload) -> Result<RawRecord, StoreError> {
+        seal(&self.state().cipher, KIND_GRANT, ns_id, id, &payload::encode(p))
+    }
+
     /// Writes to the database, then installs `ns` as the scope's index entry.
     /// Inside [`Vault::transaction`] both are staged instead.
     fn commit(
@@ -632,22 +708,215 @@ impl ScopedVault<'_> {
         Ok(())
     }
 
+    /// Like [`ScopedVault::commit`], but for a namespace other than the
+    /// view's: a grantee's write changes the owner's namespace.
+    fn commit_other(
+        &mut self,
+        scope: Scope,
+        ns: NamespaceEntry,
+        writes: &[RawRecord],
+        deletes: &[(RecordId, u8)],
+    ) -> Result<(), StoreError> {
+        if let Some(st) = self.vault.unlocked.as_mut().expect("unlocked").staged.as_mut() {
+            st.changes.extend(writes.iter().cloned().map(Change::Put));
+            st.changes.extend(deletes.iter().map(|(id, kind)| Change::Delete(*id, *kind)));
+            st.namespaces.insert(scope, Some(ns));
+            return Ok(());
+        }
+        self.vault.db.apply(writes, deletes)?;
+        self.vault.unlocked.as_mut().expect("unlocked").namespaces.insert(scope, ns);
+        Ok(())
+    }
+
+    /// Another scope's namespace, considering staged changes (as [`Self::ns`]
+    /// does for this scope's).
+    fn namespace_of(&self, scope: &Scope) -> Option<NamespaceEntry> {
+        let st = self.state();
+        match st.staged.as_ref().and_then(|s| s.namespaces.get(scope)) {
+            Some(staged) => staged.clone(),
+            None => st.namespaces.get(scope).cloned(),
+        }
+    }
+
     fn ns_or_new(&self) -> Result<(NamespaceEntry, bool), StoreError> {
         match self.ns() {
             Some(ns) => Ok((ns.clone(), false)),
-            None => {
-                Ok((NamespaceEntry { id: new_id()?, aliases: BTreeMap::new(), collections: BTreeMap::new() }, true))
+            None => Ok((
+                NamespaceEntry {
+                    id: new_id()?,
+                    aliases: BTreeMap::new(),
+                    collections: BTreeMap::new(),
+                    grants: BTreeMap::new(),
+                },
+                true,
+            )),
+        }
+    }
+
+    // ---- shared items (see `sharing`) ----
+
+    /// Collects `owner`'s grants to `scope` whose item is currently visible:
+    /// the item still exists and its collection is not logically locked.
+    fn collect_shared(st: &Unlocked, scope: &Scope, owner: &Scope, ns: &NamespaceEntry, out: &mut Vec<SharedItem>) {
+        // Portal keys are never shared (`share` refuses, unlocking rejects
+        // such a grant); this view does not rely on either.
+        if owner == scope || *owner == Scope::Portal {
+            return;
+        }
+        for (gid, g) in &ns.grants {
+            if &g.grantee != scope {
+                continue;
+            }
+            let Some((cname, col, item)) =
+                ns.collections.iter().find_map(|(name, c)| c.items.get(&g.item).map(|i| (name, c, i)))
+            else {
+                continue;
+            };
+            if st.locked.contains(&col.id) {
+                continue;
+            }
+            out.push(SharedItem {
+                grant: *gid,
+                write: g.write,
+                grant_created: g.created,
+                owner_scope: owner.clone(),
+                owner_collection: cname.clone(),
+                owner_collection_id: col.id,
+                owner_ns: ns.id,
+                owner_item: g.item,
+                label: item.label.clone(),
+                attributes: item.attributes.clone(),
+                created: item.created,
+                modified: item.modified,
+            });
+        }
+    }
+
+    /// This scope's visible shared items, sorted by grant ID. Grants are few
+    /// (at most [`MAX_GRANTS_PER_SCOPE`] per owner), so they are scanned.
+    fn shared_items(&self) -> Vec<SharedItem> {
+        let st = self.state();
+        // Staged changes replace whole namespaces (see `ns`); inside a
+        // transaction the walk follows them.
+        let staged = st.staged.as_ref().map(|s| &s.namespaces);
+        let mut out = Vec::new();
+        for (owner, ns) in &st.namespaces {
+            match staged.and_then(|s| s.get(owner)) {
+                Some(Some(replacement)) => Self::collect_shared(st, &self.scope, owner, replacement, &mut out),
+                Some(None) => {}
+                None => Self::collect_shared(st, &self.scope, owner, ns, &mut out),
             }
         }
+        if let Some(s) = staged {
+            for (owner, ns) in s.iter().filter(|(o, _)| !st.namespaces.contains_key(*o)) {
+                if let Some(ns) = ns {
+                    Self::collect_shared(st, &self.scope, owner, ns, &mut out);
+                }
+            }
+        }
+        out.sort_by_key(|s| s.grant);
+        out
+    }
+
+    fn shared_by_grant(&self, item: &str) -> Option<SharedItem> {
+        let id = unhex(item)?;
+        self.shared_items().into_iter().find(|s| s.grant == id)
+    }
+
+    /// The `Shared` collection exists in the view only while at least one
+    /// grant is visible to this scope.
+    fn shared_collection(&self) -> Option<CollectionInfo> {
+        let items = self.shared_items();
+        if items.is_empty() {
+            return None;
+        }
+        let created = items.iter().map(|s| s.grant_created).min().unwrap_or(0);
+        let modified = items.iter().map(|s| s.modified).max().unwrap_or(0);
+        Some(CollectionInfo {
+            name: SHARED_COLLECTION.to_owned(),
+            label: "Shared with this application".to_owned(),
+            created,
+            modified,
+            locked: self.state().shared_locked.contains(&self.scope),
+            items: items.iter().map(|s| hex(&s.grant)).collect(),
+        })
+    }
+
+    /// Decrypts an item's secret out of `ns_id`'s namespace — the view's own,
+    /// or the owner's through a grant.
+    fn read_secret_in(&self, ns_id: RecordId, id: RecordId) -> Result<Secret, StoreError> {
+        // Inside a transaction the record may have been written just now.
+        let staged = self.state().staged.as_ref().and_then(|st| {
+            st.changes.iter().rev().find_map(|c| match c {
+                Change::Put(r) if r.id == id && r.kind == KIND_SECRET => Some(r.clone()),
+                _ => None,
+            })
+        });
+        let raw = match staged {
+            Some(r) => r,
+            None => self
+                .vault
+                .db
+                .load_one(&id, KIND_SECRET)?
+                .ok_or_else(|| StoreError::Corrupt("missing secret record".into()))?,
+        };
+        if raw.namespace != ns_id {
+            return Err(StoreError::Corrupt("secret record is misfiled".into()));
+        }
+        payload::decode_secret(&open_record(&self.state().cipher, &raw)?)
+    }
+
+    /// The grants of one of this (owner's) view's items, as (grantee, grant
+    /// ID hex). For telling grantees about changes to their shared items.
+    pub fn grantees_of(&self, collection: &str, item: &str) -> Vec<(Scope, String)> {
+        let Ok(id) = self.item_id(collection, item) else { return Vec::new() };
+        let Some(ns) = self.ns() else { return Vec::new() };
+        ns.grants.iter().filter(|(_, g)| g.item == id).map(|(gid, g)| (g.grantee.clone(), hex(gid))).collect()
+    }
+
+    /// Where one of this view's grants points: the owner's scope, collection
+    /// and item (hex). For telling the owner about a grantee's write.
+    pub fn shared_origin(&self, grant: &str) -> Option<(Scope, String, String)> {
+        let s = self.shared_by_grant(grant)?;
+        Some((s.owner_scope, s.owner_collection, hex(&s.owner_item)))
+    }
+
+    /// The other grants of the item one of this view's grants points at, as
+    /// (grantee, grant ID hex). For telling co-grantees about a write.
+    pub fn shared_peers(&self, grant: &str) -> Vec<(Scope, String)> {
+        let Some(id) = unhex(grant) else { return Vec::new() };
+        let st = self.state();
+        // The grant's owner namespace and item, through this scope's grants.
+        let mut item = None;
+        for ns in st.namespaces.values() {
+            if let Some(g) = ns.grants.get(&id).filter(|g| g.grantee == self.scope) {
+                item = Some((ns.id, g.item));
+            }
+        }
+        let Some((ns_id, item)) = item else { return Vec::new() };
+        let Some(ns) = st.namespaces.values().find(|ns| ns.id == ns_id) else { return Vec::new() };
+        ns.grants
+            .iter()
+            .filter(|(gid, g)| **gid != id && g.item == item)
+            .map(|(gid, g)| (g.grantee.clone(), hex(gid)))
+            .collect()
     }
 
     // ---- reading ----
 
     pub fn collection_names(&self) -> Vec<String> {
-        self.ns().map(|n| n.collections.keys().cloned().collect()).unwrap_or_default()
+        let mut names: Vec<String> = self.ns().map(|n| n.collections.keys().cloned().collect()).unwrap_or_default();
+        if !self.shared_items().is_empty() {
+            names.push(SHARED_COLLECTION.to_owned());
+            names.sort();
+        }
+        names
     }
 
     pub fn collection(&self, name: &str) -> Option<CollectionInfo> {
+        if name == SHARED_COLLECTION {
+            return self.shared_collection();
+        }
         let c = self.ns()?.collections.get(name)?;
         Some(CollectionInfo {
             name: name.to_owned(),
@@ -670,6 +939,17 @@ impl ScopedVault<'_> {
     }
 
     pub fn item(&self, collection: &str, item: &str) -> Option<ItemInfo> {
+        if collection == SHARED_COLLECTION {
+            let s = self.shared_by_grant(item)?;
+            return Some(ItemInfo {
+                name: item.to_owned(),
+                label: s.label,
+                attributes: s.attributes,
+                created: s.created,
+                modified: s.modified,
+                locked: self.state().shared_locked.contains(&self.scope),
+            });
+        }
         let c = self.ns()?.collections.get(collection)?;
         let id = unhex(item)?;
         let i = c.items.get(&id)?;
@@ -685,14 +965,21 @@ impl ScopedVault<'_> {
 
     /// Items whose attributes include all of `attrs`, as (collection, item, locked).
     pub fn search(&self, attrs: &BTreeMap<String, String>) -> Vec<(String, String, bool)> {
-        let Some(ns) = self.ns() else { return Vec::new() };
         let mut out = Vec::new();
-        for (cname, c) in &ns.collections {
-            let locked = self.state().locked.contains(&c.id);
-            for (id, i) in &c.items {
-                if attrs.iter().all(|(k, v)| i.attributes.get(k) == Some(v)) {
-                    out.push((cname.clone(), item_name(id), locked));
+        if let Some(ns) = self.ns() {
+            for (cname, c) in &ns.collections {
+                let locked = self.state().locked.contains(&c.id);
+                for (id, i) in &c.items {
+                    if attrs.iter().all(|(k, v)| i.attributes.get(k) == Some(v)) {
+                        out.push((cname.clone(), item_name(id), locked));
+                    }
                 }
+            }
+        }
+        let locked = self.state().shared_locked.contains(&self.scope);
+        for s in self.shared_items() {
+            if attrs.iter().all(|(k, v)| s.attributes.get(k) == Some(v)) {
+                out.push((SHARED_COLLECTION.to_owned(), hex(&s.grant), locked));
             }
         }
         out
@@ -700,6 +987,15 @@ impl ScopedVault<'_> {
 
     /// Decrypts an item's secret. Fails on a logically locked collection.
     pub fn read_secret(&self, collection: &str, item: &str) -> Result<Secret, StoreError> {
+        if collection == SHARED_COLLECTION {
+            // The grantee's own lock of `Shared`; the owner's collection lock
+            // makes the item invisible instead (see `shared_items`).
+            if !self.admin && self.state().shared_locked.contains(&self.scope) {
+                return Err(StoreError::Locked);
+            }
+            let s = self.shared_by_grant(item).ok_or(StoreError::NoSuchObject)?;
+            return self.read_secret_in(s.owner_ns, s.owner_item);
+        }
         let id = self.item_id(collection, item)?;
         let c = self.collection_entry(collection)?;
         if !self.admin && self.state().locked.contains(&c.id) {
@@ -709,30 +1005,22 @@ impl ScopedVault<'_> {
             return c.secrets.get(&id).cloned().ok_or(StoreError::NoSuchObject);
         }
         let ns_id = self.ns().expect("collection exists").id;
-        // Inside a transaction the record may have been written just now.
-        let staged = self.state().staged.as_ref().and_then(|st| {
-            st.changes.iter().rev().find_map(|c| match c {
-                Change::Put(r) if r.id == id && r.kind == KIND_SECRET => Some(r.clone()),
-                _ => None,
-            })
-        });
-        let raw = match staged {
-            Some(r) => r,
-            None => self
-                .vault
-                .db
-                .load_one(&id, KIND_SECRET)?
-                .ok_or_else(|| StoreError::Corrupt("missing secret record".into()))?,
-        };
-        if raw.namespace != ns_id {
-            return Err(StoreError::Corrupt("secret record is misfiled".into()));
-        }
-        payload::decode_secret(&open_record(&self.state().cipher, &raw)?)
+        self.read_secret_in(ns_id, id)
     }
 
     // ---- logical lock state ----
 
     pub fn set_collection_locked(&mut self, collection: &str, locked: bool) -> Result<(), StoreError> {
+        if collection == SHARED_COLLECTION {
+            // Only this scope's view is affected.
+            let set = &mut self.vault.unlocked.as_mut().expect("unlocked").shared_locked;
+            if locked {
+                set.insert(self.scope.clone());
+            } else {
+                set.remove(&self.scope);
+            }
+            return Ok(());
+        }
         let id = self.collection_entry(collection)?.id;
         let set = &mut self.vault.unlocked.as_mut().expect("unlocked").locked;
         if locked {
@@ -810,6 +1098,9 @@ impl ScopedVault<'_> {
     }
 
     pub fn delete_collection(&mut self, name: &str) -> Result<(), StoreError> {
+        if name == SHARED_COLLECTION {
+            return Err(StoreError::NotPermitted("the Shared collection cannot be deleted"));
+        }
         let mut ns = self.ns().cloned().ok_or(StoreError::NoSuchObject)?;
         let c = ns.collections.remove(name).ok_or(StoreError::NoSuchObject)?;
         let mut deletes = Vec::new();
@@ -820,6 +1111,13 @@ impl ScopedVault<'_> {
                 deletes.push((*id, KIND_SECRET));
             }
         }
+        // Grants for the collection's items go with them.
+        let grants: Vec<RecordId> =
+            ns.grants.iter().filter(|(_, g)| c.items.contains_key(&g.item)).map(|(gid, _)| *gid).collect();
+        for gid in &grants {
+            ns.grants.remove(gid);
+        }
+        deletes.extend(grants.iter().map(|gid| (*gid, KIND_GRANT)));
         ns.aliases.retain(|_, target| *target != c.id);
         let writes = if c.ephemeral { Vec::new() } else { vec![self.namespace_record(&ns)?] };
         self.commit(ns, &writes, &deletes)?;
@@ -835,6 +1133,10 @@ impl ScopedVault<'_> {
     pub fn set_alias(&mut self, alias: &str, target: Option<&str>) -> Result<(), StoreError> {
         if !paths::is_valid_element(alias) {
             return Err(StoreError::Invalid("alias"));
+        }
+        if target == Some(SHARED_COLLECTION) {
+            // `Shared` is a view, not an object an alias could point at.
+            return Err(StoreError::NotPermitted("an alias cannot point at Shared"));
         }
         let (mut ns, new) = self.ns_or_new()?;
         match target {
@@ -856,6 +1158,9 @@ impl ScopedVault<'_> {
     }
 
     pub fn set_collection_label(&mut self, name: &str, label: &str) -> Result<(), StoreError> {
+        if name == SHARED_COLLECTION {
+            return Err(StoreError::NotPermitted("the Shared collection cannot be relabelled"));
+        }
         validate_label(label)?;
         let mut ns = self.ns().cloned().ok_or(StoreError::NoSuchObject)?;
         let c = ns.collections.get_mut(name).ok_or(StoreError::NoSuchObject)?;
@@ -877,6 +1182,9 @@ impl ScopedVault<'_> {
         secret: &Secret,
         replace: bool,
     ) -> Result<(String, bool), StoreError> {
+        if collection == SHARED_COLLECTION {
+            return Err(StoreError::NotPermitted("items cannot be created in Shared"));
+        }
         validate_label(label)?;
         validate_attributes(&attributes)?;
         validate_secret(secret)?;
@@ -936,6 +1244,9 @@ impl ScopedVault<'_> {
     }
 
     pub fn set_item_label(&mut self, collection: &str, item: &str, label: &str) -> Result<(), StoreError> {
+        if collection == SHARED_COLLECTION {
+            return Err(StoreError::NotPermitted("shared items cannot be relabelled"));
+        }
         validate_label(label)?;
         self.update_item(collection, item, |i| i.label = label.to_owned())
     }
@@ -946,12 +1257,41 @@ impl ScopedVault<'_> {
         item: &str,
         attrs: BTreeMap<String, String>,
     ) -> Result<(), StoreError> {
+        if collection == SHARED_COLLECTION {
+            return Err(StoreError::NotPermitted("shared items' attributes cannot be changed"));
+        }
         validate_attributes(&attrs)?;
         self.update_item(collection, item, |i| i.attributes = attrs)
     }
 
     pub fn set_secret(&mut self, collection: &str, item: &str, secret: &Secret) -> Result<(), StoreError> {
         validate_secret(secret)?;
+        if collection == SHARED_COLLECTION {
+            if !self.admin && self.state().shared_locked.contains(&self.scope) {
+                return Err(StoreError::Locked);
+            }
+            let s = self.shared_by_grant(item).ok_or(StoreError::NoSuchObject)?;
+            if !s.write {
+                return Err(StoreError::NotPermitted("the item is shared read-only"));
+            }
+            // The owner's item keeps its own records; only its `modified`
+            // time changes with the secret.
+            let mut ns = self.namespace_of(&s.owner_scope).ok_or(StoreError::NoSuchObject)?;
+            let cid = s.owner_collection_id;
+            let entry = ns
+                .collections
+                .values_mut()
+                .find(|c| c.id == cid)
+                .and_then(|c| c.items.get_mut(&s.owner_item))
+                .ok_or(StoreError::NoSuchObject)?;
+            entry.modified = now();
+            let entry = entry.clone();
+            let writes = vec![
+                self.item_record(s.owner_ns, &cid, s.owner_item, &entry)?,
+                self.secret_record(s.owner_ns, s.owner_item, secret)?,
+            ];
+            return self.commit_other(s.owner_scope.clone(), ns, &writes, &[]);
+        }
         let id = self.item_id(collection, item)?;
         self.ensure_writable(collection)?;
         let mut ns = self.ns().cloned().expect("item exists");
@@ -971,17 +1311,27 @@ impl ScopedVault<'_> {
     }
 
     pub fn delete_item(&mut self, collection: &str, item: &str) -> Result<(), StoreError> {
+        if collection == SHARED_COLLECTION {
+            return Err(StoreError::NotPermitted("shared items cannot be deleted"));
+        }
         let id = self.item_id(collection, item)?;
         self.ensure_writable(collection)?;
         let mut ns = self.ns().cloned().expect("item exists");
         let c = ns.collections.get_mut(collection).expect("item exists");
         c.items.remove(&id);
         c.modified = now();
+        // Grants travel with the item they point at.
+        let grants: Vec<RecordId> = ns.grants.iter().filter(|(_, g)| g.item == id).map(|(gid, _)| *gid).collect();
+        for gid in &grants {
+            ns.grants.remove(gid);
+        }
+        let mut deletes = vec![(id, KIND_ITEM), (id, KIND_SECRET)];
+        deletes.extend(grants.iter().map(|gid| (*gid, KIND_GRANT)));
         if c.ephemeral {
             c.secrets.remove(&id);
             return self.commit(ns, &[], &[]);
         }
         let writes = vec![self.collection_record(ns.id, collection, &ns.collections[collection])?];
-        self.commit(ns, &writes, &[(id, KIND_ITEM), (id, KIND_SECRET)])
+        self.commit(ns, &writes, &deletes)
     }
 }

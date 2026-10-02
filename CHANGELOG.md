@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+
+- Single items can be shared with another scope, read-only or
+  read-write: `scopevault-admin share`, `unshare` and `grants`. Shared
+  items appear in a `Shared` collection.
+
 ## 0.6.0
 
 - scopevault can be the Secret portal backend. Per-app portal keys live in

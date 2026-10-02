@@ -48,6 +48,12 @@ another ID, kind or namespace, or swapping two of them, fails.
 | 2, collection | Name, label, creation and modification time |
 | 3, item | Its collection, label, attributes, creation and modification time |
 | 4, secret | Content type and value, under the same ID as its item |
+| 5, grant | The shared item, the scope it is shared with, write access, creation time |
+
+Grants were added without changing the format version. An older build
+refuses a vault that holds one ("unknown kind"), which is the safe way
+round. When unlocking, every grant is checked: its item must exist in the
+same namespace, and it must name a valid scope other than the owner's.
 
 Metadata is stored as JSON that rejects unknown fields; secrets use a
 small binary format. Unlocking decrypts and cross-checks all metadata.

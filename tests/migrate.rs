@@ -142,8 +142,22 @@ async fn admin(args: &[&str], data_dir: &Path, pins: &Pins, bus: Option<&str>) -
     }
 }
 
+/// Opens a vault this test closed a moment ago. A child that another test
+/// forks meanwhile holds a copy of the vault's `flock` until it calls exec,
+/// so the open can briefly fail with `InUse`.
+fn open_vault(dir: &Path) -> Vault {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match Vault::open(dir) {
+            Err(scopevault::store::StoreError::InUse) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            r => return r.unwrap(),
+        }
+    }
+}
 fn host_items(dir: &Path, password: &str) -> Vec<(String, String, Vec<u8>)> {
-    let mut v = Vault::open(dir).unwrap();
+    let mut v = open_vault(dir);
     v.unlock(password.as_bytes()).unwrap();
     let cols = v.export(&AdminAuthority::offline(), &Scope::Host).unwrap();
     let mut out: Vec<_> = cols
@@ -158,7 +172,7 @@ fn host_items(dir: &Path, password: &str) -> Vec<(String, String, Vec<u8>)> {
 }
 
 fn portal_items(dir: &Path, password: &str) -> Vec<(String, String, Vec<u8>)> {
-    let mut v = Vault::open(dir).unwrap();
+    let mut v = open_vault(dir);
     v.unlock(password.as_bytes()).unwrap();
     let mut out = Vec::new();
     for c in v.export(&AdminAuthority::offline(), &Scope::Portal).unwrap() {
@@ -217,7 +231,7 @@ async fn migration_then_rollback() {
         ]
     );
     // The provider's default alias came along; the provider is unchanged.
-    let mut v = Vault::open(&dir).unwrap();
+    let mut v = open_vault(&dir);
     v.unlock(TARGET_PW.as_bytes()).unwrap();
     assert_eq!(v.scoped(&scopevault::identity::Principal::Host).unwrap().alias("default").as_deref(), Some("login"));
     drop(v);
@@ -231,7 +245,7 @@ async fn migration_then_rollback() {
 
     // Rollback: an item created after the switch goes back to the provider.
     {
-        let mut v = Vault::open(&dir).unwrap();
+        let mut v = open_vault(&dir);
         v.unlock(TARGET_PW.as_bytes()).unwrap();
         let mut s = v.scoped(&scopevault::identity::Principal::Host).unwrap();
         s.create_item(

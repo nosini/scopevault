@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::db::RecordId;
 use super::{
-    AdminAuthority, DEFAULT_ALIAS, ItemEntry, KIND_COLLECTION, KIND_ITEM, KIND_NAMESPACE, KIND_SECRET, SESSION_ALIAS,
-    ScopedVault, Secret, StoreError, Vault, item_name,
+    AdminAuthority, DEFAULT_ALIAS, ItemEntry, KIND_COLLECTION, KIND_GRANT, KIND_ITEM, KIND_NAMESPACE, KIND_SECRET,
+    SESSION_ALIAS, ScopedVault, Secret, StoreError, Vault, item_name,
 };
 use crate::identity::Scope;
 
@@ -156,8 +157,36 @@ impl Vault {
     }
 
     /// Deletes everything a scope holds. Returns (collections, items).
+    /// Grants the scope gave away go with their items; grants other scopes
+    /// gave to it go too, in the same transaction.
     pub fn reset_scope(&mut self, authority: &AdminAuthority, scope: &Scope) -> Result<(usize, usize), StoreError> {
-        self.scoped_admin(authority, scope.clone())?.delete_everything()
+        self.transaction(|v| {
+            let result = v.scoped_admin(authority, scope.clone())?.delete_everything()?;
+            let mut affected: Vec<(Scope, Vec<RecordId>)> = Vec::new();
+            {
+                let u = v.unlocked.as_ref().ok_or(StoreError::Locked)?;
+                for (owner, ns) in &u.namespaces {
+                    if owner == scope {
+                        continue;
+                    }
+                    let gids: Vec<RecordId> =
+                        ns.grants.iter().filter(|(_, g)| &g.grantee == scope).map(|(gid, _)| *gid).collect();
+                    if !gids.is_empty() {
+                        affected.push((owner.clone(), gids));
+                    }
+                }
+            }
+            for (owner, gids) in affected {
+                let mut s = v.scoped_admin(authority, owner.clone())?;
+                let mut ns = s.ns().cloned().ok_or(StoreError::NoSuchObject)?;
+                for gid in &gids {
+                    ns.grants.remove(gid);
+                }
+                let deletes: Vec<(RecordId, u8)> = gids.iter().map(|gid| (*gid, KIND_GRANT)).collect();
+                s.commit(ns, &[], &deletes)?;
+            }
+            Ok(result)
+        })
     }
 
     /// Copies collections into a scope. A collection is merged into the
@@ -318,8 +347,8 @@ impl ScopedVault<'_> {
         Ok(false)
     }
 
-    /// Deletes the scope's namespace with all its collections, items and
-    /// secrets. Returns (collections, items).
+    /// Deletes the scope's namespace with all its collections, items,
+    /// secrets and grants. Returns (collections, items).
     fn delete_everything(&mut self) -> Result<(usize, usize), StoreError> {
         let Some(ns) = self.ns().cloned() else { return Ok((0, 0)) };
         let mut deletes = vec![(ns.id, KIND_NAMESPACE)];
@@ -334,6 +363,9 @@ impl ScopedVault<'_> {
                 deletes.push((*id, KIND_ITEM));
                 deletes.push((*id, KIND_SECRET));
             }
+        }
+        for gid in ns.grants.keys() {
+            deletes.push((*gid, KIND_GRANT));
         }
         let collections = ns.collections.len();
         self.commit_ns(None, &[], &deletes)?;

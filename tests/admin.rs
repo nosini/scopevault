@@ -285,3 +285,47 @@ async fn a_second_daemon_cannot_take_the_socket() {
     // Still served.
     assert!(e.admin(&Who::Host, &["status"]).await.ok);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sharing_needs_the_password_and_grants_list_it() {
+    let e = env(VaultState::Unlocked).await;
+    let r = e.client(&Who::Host, &["store", "default", "h", "host-secret", "k=v"]).await;
+    assert_eq!(field(&r[0], 1), "ok", "{r:?}");
+    let item = field(&r[0], 2).rsplit('/').next().unwrap().to_owned();
+    let spec = format!("login/{item}");
+    let grantee = "flatpak/org.example.Alpha";
+
+    // Cancelled dialog: nothing is shared.
+    e.vault.set_pins(&["CANCEL"]);
+    let out = e.admin(&Who::Host, &["share", "host", &spec, grantee]).await;
+    assert!(!out.ok && out.stderr.contains("cancelled"), "{}", out.stderr);
+    assert!(e.vault.log().contains("give flatpak/org.example.Alpha read access to"), "{}", e.vault.log());
+    let out = e.admin(&Who::Host, &["grants"]).await;
+    assert!(out.stdout.contains("no grants"), "{}", out.stdout);
+
+    // The right password shares; --write is visible in the listing.
+    e.vault.set_pins(&[PASSWORD]);
+    let out = e.admin(&Who::Host, &["share", "host", &spec, grantee, "--write"]).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    let grant = out.stdout.trim().strip_prefix("grant ").unwrap().to_owned();
+    let out = e.admin(&Who::Host, &["grants"]).await;
+    assert!(
+        out.stdout.contains(&grant) && out.stdout.contains(grantee) && out.stdout.contains("write"),
+        "{}",
+        out.stdout
+    );
+    let out = e.admin(&Who::Host, &["grants", "host"]).await;
+    assert!(out.stdout.contains(&grant), "{}", out.stdout);
+    let out = e.admin(&Who::Host, &["grants", grantee]).await;
+    assert!(out.stdout.contains(&grant), "{}", out.stdout);
+    let out = e.admin(&Who::Host, &["grants", "host", "--json"]).await;
+    assert!(out.stdout.contains("\"grants\""), "{}", out.stdout);
+
+    // Unshare needs no dialog and removes the grant.
+    let dialogs = e.vault.dialogs();
+    let out = e.admin(&Who::Host, &["unshare", &grant]).await;
+    assert!(out.ok, "{}", out.stderr);
+    assert_eq!(e.vault.dialogs(), dialogs, "unshare shows no dialog");
+    let out = e.admin(&Who::Host, &["grants"]).await;
+    assert!(out.stdout.contains("no grants"), "{}", out.stdout);
+}

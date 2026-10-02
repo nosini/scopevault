@@ -286,6 +286,24 @@ cleanly; logging out and back in first avoids it.
 The app's encrypted files stay in its own directory. They need to be
 backed up together with the vault.
 
+## Sharing
+
+Nothing is shared by default. The administrator can give one scope read,
+or read and write, access to a single item of another scope:
+`scopevault-admin share`, and `unshare` to take it back. Apps can never
+create grants, there are no wildcards, and `portal` is never involved.
+
+The other app sees shared items in a collection called `Shared`. The
+capital S keeps it apart from real collections, whose names are always
+lower case. Shared items also show up in searches, because libsecret finds
+secrets by searching every collection. Write access covers the secret
+value only; the label, attributes and deleting the item stay with the
+owner.
+
+Deleting or moving the item, or resetting either scope, removes the grant.
+If the owner locks the collection, the item disappears from the other
+scope too. Grants are part of backups but not of export and import.
+
 ## What scopevault does not protect against
 
 - Host code running as your user, or root. It can read the daemon's

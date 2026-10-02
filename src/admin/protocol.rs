@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::store::{CollectionListing, ScopeSummary};
+use crate::store::{CollectionListing, GrantListing, ScopeSummary};
 
 /// Requests are small; this bounds what the daemon reads from a client.
 pub const MAX_LINE: usize = 64 * 1024;
@@ -43,6 +43,23 @@ pub enum Request {
     /// after its keyring file appeared without an import.
     PortalNewKey {
         app_id: String,
+    },
+    /// Gives one scope access to one item of another scope. Needs the
+    /// master password.
+    Share {
+        from: String,
+        /// The item, as `COLLECTION/ITEM` in the owner's scope.
+        item: String,
+        to: String,
+        write: bool,
+    },
+    /// Revokes one grant, by its ID as shown by `grants`.
+    Unshare {
+        grant: String,
+    },
+    /// All grants, or those where the scope is the owner or the grantee.
+    Grants {
+        scope: Option<String>,
     },
     /// A copy of the encrypted database, which opens with the password
     /// current when it was made.
@@ -86,6 +103,13 @@ pub enum Reply {
     Reset {
         collections: usize,
         items: usize,
+    },
+    Grants {
+        grants: Vec<GrantListing>,
+    },
+    /// A grant was created or changed; carries its ID.
+    Shared {
+        grant: String,
     },
     /// Followed by `bytes` raw bytes.
     Backup {

@@ -413,3 +413,113 @@ fn portal_keys_are_created_only_once_per_app() {
     assert_eq!(item.attributes.get("xdg:schema").map(String::as_str), Some("org.freedesktop.portal.Secret"));
     assert_eq!(item.secret, key, "the stored key is the returned one");
 }
+
+// ---- explicit sharing ----
+
+fn b_scope() -> Scope {
+    app("org.example.B").scope()
+}
+
+#[test]
+fn sharing_validates_its_arguments() {
+    let tmp = TempDir::new("admin");
+    let dir = tmp.path().join("vault");
+    let mut v = Vault::create(&dir, PW, KDF).unwrap();
+    let auth = AdminAuthority::offline();
+    let mut s = v.scoped(&Principal::Host).unwrap();
+    s.ensure_namespace().unwrap();
+    let item = s.create_item("login", "Mail", attrs(&[("k", "v")]), &text("secret"), false).unwrap().0;
+    drop(s);
+    let spec = format!("login/{item}");
+
+    // The portal scope shares nothing, and is nobody's grantee.
+    assert!(matches!(v.share(&auth, &Scope::Portal, &spec, &b_scope(), false), Err(StoreError::Invalid(_))));
+    assert!(matches!(v.share(&auth, &Scope::Host, &spec, &Scope::Portal, false), Err(StoreError::Invalid(_))));
+    // Not to itself.
+    assert!(matches!(v.share(&auth, &Scope::Host, &spec, &Scope::Host, false), Err(StoreError::Invalid(_))));
+    // Not the session collection, not a foreign item, not a malformed spec.
+    assert!(matches!(v.share(&auth, &Scope::Host, "session/x", &b_scope(), false), Err(StoreError::Invalid(_))));
+    let unknown = "f".repeat(32);
+    assert!(
+        matches!(
+            v.share(&auth, &Scope::Host, &format!("login/{unknown}"), &b_scope(), false),
+            Err(StoreError::NoSuchObject)
+        ),
+        "no such item"
+    );
+    assert!(matches!(
+        v.share(&auth, &Scope::Host, &format!("nowhere/{item}"), &b_scope(), false),
+        Err(StoreError::NoSuchObject)
+    ));
+    assert!(matches!(v.share(&auth, &Scope::Host, "login", &b_scope(), false), Err(StoreError::Invalid(_))));
+
+    // Sharing again changes the access instead of adding a grant.
+    let first = v.share(&auth, &Scope::Host, &spec, &b_scope(), false).unwrap();
+    assert_eq!(v.grants(&auth, None).unwrap().len(), 1);
+    let again = v.share(&auth, &Scope::Host, &spec, &b_scope(), true).unwrap();
+    assert_eq!(first, again, "the same grant");
+    let all = v.grants(&auth, None).unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].write);
+    assert_eq!(
+        (all[0].owner.as_str(), all[0].collection.as_str(), all[0].item.as_str()),
+        ("host", "login", item.as_str())
+    );
+    assert_eq!(all[0].label, "Mail");
+    assert_eq!(all[0].grantee, "flatpak/org.example.B");
+
+    // The listing can be filtered by either side.
+    assert_eq!(v.grants(&auth, Some(&Scope::Host)).unwrap().len(), 1);
+    assert_eq!(v.grants(&auth, Some(&b_scope())).unwrap().len(), 1);
+    assert!(v.grants(&auth, Some(&app("org.example.C").scope())).unwrap().is_empty());
+}
+
+#[test]
+fn grants_are_limited_per_owner() {
+    let tmp = TempDir::new("admin");
+    let dir = tmp.path().join("vault");
+    let mut v = Vault::create(&dir, PW, KDF).unwrap();
+    let auth = AdminAuthority::offline();
+    let mut s = v.scoped(&Principal::Host).unwrap();
+    s.ensure_namespace().unwrap();
+    let item = s.create_item("login", "Mail", attrs(&[("k", "v")]), &text("secret"), false).unwrap().0;
+    drop(s);
+    let spec = format!("login/{item}");
+
+    for i in 0..scopevault::store::MAX_GRANTS_PER_SCOPE {
+        let grantee = app(&format!("org.example.G{i}")).scope();
+        v.share(&auth, &Scope::Host, &spec, &grantee, false).unwrap();
+    }
+    assert!(matches!(
+        v.share(&auth, &Scope::Host, &spec, &app("org.example.Overflow").scope(), false),
+        Err(StoreError::Limit(_))
+    ));
+    // At the limit, an existing grant can still change its access.
+    v.share(&auth, &Scope::Host, &spec, &app("org.example.G0").scope(), true).unwrap();
+}
+
+#[test]
+fn a_grant_to_a_missing_item_is_corruption() {
+    let tmp = TempDir::new("admin");
+    let dir = tmp.path().join("vault");
+    let mut v = Vault::create(&dir, PW, KDF).unwrap();
+    let auth = AdminAuthority::offline();
+    let mut s = v.scoped(&Principal::Host).unwrap();
+    s.ensure_namespace().unwrap();
+    let item = s.create_item("login", "Mail", attrs(&[("k", "v")]), &text("secret"), false).unwrap().0;
+    drop(s);
+    v.share(&auth, &Scope::Host, &format!("login/{item}"), &b_scope(), false).unwrap();
+    drop(v);
+
+    // The item's records go away behind the vault's back; the grant then
+    // points at an item its namespace does not hold.
+    let raw = rusqlite::Connection::open(dir.join("vault.db")).unwrap();
+    let id = scopevault::store::payload::unhex(&item).unwrap();
+    for kind in [3, 4] {
+        raw.execute("DELETE FROM records WHERE id = ?1 AND kind = ?2", rusqlite::params![&id[..], kind]).unwrap();
+    }
+    drop(raw);
+
+    let mut v = Vault::open(&dir).unwrap();
+    assert!(matches!(v.unlock(PW), Err(StoreError::Corrupt(_))), "{v:?}");
+}
