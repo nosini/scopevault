@@ -87,16 +87,22 @@ fn main() -> ExitCode {
     let _ = rustix::process::setsid();
     detach_stdio();
     match deliver(mode, &request) {
-        Ok(reply) => log(libc::LOG_INFO, &format!("{}: {reply}", what(mode))),
-        Err(e) => log(libc::LOG_NOTICE, &format!("{}: {e}", what(mode))),
+        Ok(reply) => log(libc::LOG_INFO, &format!("{} delivered: {reply}", what(mode))),
+        // At login PAM runs `auth` before the daemon starts, so the
+        // `--if-running` helper finds none every time; the `--wait` one
+        // delivers later. Nothing to report.
+        Err(Failure::NotRunning(_)) if mode == Mode::IfRunning => {}
+        Err(Failure::NotRunning(e) | Failure::Other(e)) => {
+            log(libc::LOG_NOTICE, &format!("{} not delivered: {e}", what(mode)))
+        }
     }
     ExitCode::SUCCESS
 }
 
 fn what(mode: Mode) -> &'static str {
     match mode {
-        Mode::IfRunning | Mode::Wait => "login password delivered",
-        Mode::Change => "password change delivered",
+        Mode::IfRunning | Mode::Wait => "login password",
+        Mode::Change => "password change",
     }
 }
 
@@ -145,7 +151,13 @@ fn socket_path() -> PathBuf {
     dir.join("scopevault").join("login")
 }
 
-fn connect(mode: Mode) -> Result<UnixStream, String> {
+enum Failure {
+    /// No daemon answered on the socket.
+    NotRunning(String),
+    Other(String),
+}
+
+fn connect(mode: Mode) -> Result<UnixStream, Failure> {
     let path = socket_path();
     let deadline = Instant::now() + if mode == Mode::Wait { WAIT } else { Duration::ZERO };
     loop {
@@ -157,13 +169,17 @@ fn connect(mode: Mode) -> Result<UnixStream, String> {
             {
                 std::thread::sleep(RETRY);
             }
-            Err(e) => return Err(format!("the daemon is not running ({}: {e})", path.display())),
+            Err(e) => return Err(Failure::NotRunning(format!("the daemon is not running ({}: {e})", path.display()))),
         }
     }
 }
 
-fn deliver(mode: Mode, request: &Request) -> Result<String, String> {
+fn deliver(mode: Mode, request: &Request) -> Result<String, Failure> {
     let mut stream = connect(mode)?;
+    send(&mut stream, request).map_err(Failure::Other)
+}
+
+fn send(stream: &mut UnixStream, request: &Request) -> Result<String, String> {
     let peer = rustix::net::sockopt::socket_peercred(stream.as_fd()).map_err(|e| format!("peer credentials: {e}"))?;
     if peer.uid != rustix::process::getuid() {
         return Err(format!("the socket belongs to UID {}; not sending the password", peer.uid.as_raw()));

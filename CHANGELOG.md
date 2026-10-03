@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.1
+
+- The PAM helper no longer logs a failed delivery at every login when the
+  daemon simply isn't running yet.
+
 ## 0.10.0
 
 - Logging in, or unlocking the screen, can open the vault with your login
