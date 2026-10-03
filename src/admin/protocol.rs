@@ -21,6 +21,9 @@ pub enum Request {
     Status,
     /// Global lock: drops the vault key and all decrypted data.
     Lock,
+    /// Opens the unlock dialog if the vault is locked (for example right
+    /// after login, before applications ask for their secrets).
+    Unlock,
     /// The daemon asks for the old and the new password.
     ChangePassword,
     Scopes,

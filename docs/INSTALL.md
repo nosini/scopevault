@@ -20,6 +20,7 @@ lines where it belongs:
 
 ```sh
 install -D -m 644 packaging/scopevault.service ~/.config/systemd/user/scopevault.service
+install -D -m 644 packaging/scopevault-unlock.service ~/.config/systemd/user/scopevault-unlock.service
 install -D -m 644 packaging/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
 install -D -m 644 packaging/page.codeberg.nosini.ScopeVault.Portal.service ~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service
 install -D -m 644 packaging/gnome-keyring-secrets.desktop ~/.config/autostart/gnome-keyring-secrets.desktop
@@ -47,6 +48,11 @@ What they do:
   everything else still comes from the system's configuration. The
   backend has its own bus name, `page.codeberg.nosini.ScopeVault.Portal`, and
   its activation file starts the same unit.
+- `scopevault-unlock.service` opens the unlock dialog as soon as you are
+  logged in, so the vault is usually open before apps ask for it. Apps
+  that ask while the dialog is up wait for it, but apps that talk to the
+  Secret Service directly give up after about 25 seconds, so don't leave
+  it waiting long.
 
 gnome-keyring's own systemd user units get masked as well. They are
 disabled by default, but a single `systemctl --user restart
@@ -94,13 +100,38 @@ name, and it exits after two minutes.
 
    ```sh
    systemctl --user daemon-reload
-   systemctl --user enable scopevault.service
+   systemctl --user enable scopevault.service scopevault-unlock.service
    systemctl --user mask gnome-keyring-daemon.socket gnome-keyring-daemon.service
    ```
 
 5. Log out and back in. gnome-keyring keeps the name until the end of the
    current session; at the next login scopevault takes it, and
    xdg-desktop-portal reads its new configuration.
+
+6. Give Flatpak apps that use the Secret Service directly their items
+   back. The import put everything into `host`, but a Flatpak app only
+   sees its own scope, so such an app now finds nothing. Apps that use the
+   Secret portal are fine, their keys are already in place. scopevault
+   never guesses which item belongs to which app, so this is up to you:
+   `flatpak list --app` shows the app IDs, and `scopevault-admin list
+   host` shows the items with their labels and attributes, never the
+   secrets. Then move them:
+
+   ```sh
+   scopevault-admin move host flatpak/APP-ID COLLECTION/ITEM...
+   ```
+
+   `move` asks for the master password and needs the daemon running,
+   which is why it comes after the switch. Cryptomator's items, for
+   example, are labelled "Cryptomator" and have a `Vault` attribute:
+
+   ```sh
+   scopevault-admin move host flatpak/org.cryptomator.Cryptomator login/ITEM...
+   ```
+
+   Do this before starting such an app. If it already ran and saved new
+   items, for example because you entered a password again,
+   `scopevault-admin reset-scope flatpak/APP-ID` clears its scope first.
 
 ## Checking it
 
@@ -149,7 +180,7 @@ creating new keys that would clash with the ones you export.
    along with systemd:
 
    ```sh
-   systemctl --user disable scopevault.service
+   systemctl --user disable scopevault.service scopevault-unlock.service
    systemctl --user unmask gnome-keyring-daemon.socket gnome-keyring-daemon.service
    systemctl --user daemon-reload
    gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.ReloadConfig

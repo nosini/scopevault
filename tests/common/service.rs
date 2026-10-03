@@ -54,10 +54,14 @@ pub struct Fixture {
 }
 
 pub async fn fixture(state: VaultState) -> Fixture {
+    fixture_with(VaultFixture::new(state)).await
+}
+
+/// [`fixture`] on a vault fixture built by the test (other unlock timings).
+pub async fn fixture_with(vault: VaultFixture) -> Fixture {
     let bus = Arc::new(TestBus::start());
     let conn = bus.connect().await;
     let resolver = Arc::new(FixedResolver::default());
-    let vault = VaultFixture::new(state);
     let service = SecretService::new(conn.clone(), resolver.clone(), vault.unlocker.clone());
     let serving = service.clone().start().await.unwrap();
     tokio::spawn(serving);

@@ -18,7 +18,7 @@ use common::tempdir::TempDir;
 use common::{PASSWORD, VaultFixture, VaultState};
 use scopevault::identity::{Principal, Scope};
 use scopevault::portal_backend::{BACKEND_NAME, BACKEND_PATH, FRONTEND_NAME, PortalBackend};
-use scopevault::prompts::unlock::VaultSlot;
+use scopevault::prompts::unlock::{UnlockOutcome, VaultSlot};
 use scopevault::store::{AdminAuthority, PortableItem, Secret};
 use zbus::Connection;
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue};
@@ -296,12 +296,30 @@ async fn the_locked_vault_is_unlocked_through_the_dialog() {
     assert_eq!(r.unwrap(), 0);
     assert_eq!(bytes.len(), 64);
 
-    // A cancelled dialog is response 1.
+    // A cancelled dialog is response 1, after the portal request waited out
+    // the fixture's 1 s implicit deadline instead of failing at once.
     fx.fx.vault.lock_vault();
     fx.fx.vault.set_pins(&["CANCEL"]);
+    let started = std::time::Instant::now();
     let (r, bytes) = retrieve(&fe, APP).await;
     assert_eq!(r.unwrap(), 1);
     assert!(bytes.is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(800), "{:?}", started.elapsed());
+
+    // A request made during the cooldown waits without a dialog and is
+    // served once the vault is unlocked through the fixture's unlocker.
+    fx.fx.vault.lock_vault();
+    let waiter = {
+        let fe = fe.clone();
+        tokio::spawn(async move { retrieve(&fe, APP).await })
+    };
+    fx.fx.vault.set_pins(&[PASSWORD]);
+    let u = fx.fx.vault.unlocker.clone();
+    assert_eq!(u.ensure_unlocked(&Scope::Host).await, UnlockOutcome::Unlocked);
+    let (r, bytes) = tokio::time::timeout(Duration::from_secs(10), waiter).await.unwrap().unwrap();
+    assert_eq!(r.unwrap(), 0);
+    assert_eq!(bytes.len(), 64, "the key created earlier is served");
+    assert_eq!(fx.fx.vault.dialogs(), 3, "no dialog for the waiting request itself");
 }
 
 #[tokio::test(flavor = "multi_thread")]

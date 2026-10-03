@@ -1,0 +1,19 @@
+# systemd user unit that opens scopevault's unlock dialog once the session
+# is up, so the vault is usually unlocked before applications ask for it.
+# Install as ~/.config/systemd/user/scopevault-unlock.service (see
+# docs/INSTALL.md).
+#
+# Type=exec, not oneshot: the dialog can stay open longer than a start
+# timeout. No Restart=: a dialog the user cancelled must not reopen.
+
+[Unit]
+Description=Unlock scopevault after login
+After=scopevault.service graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/scopevault-admin unlock --wait 60
+
+[Install]
+WantedBy=graphical-session.target

@@ -288,6 +288,11 @@ impl AdminServer {
                 }
                 Ok(Reply::Done { message: "password changed".into() })
             }
+            Request::Unlock => {
+                let was = vault.lock().unwrap().is_unlocked();
+                self.unlocked().await?;
+                Ok(Reply::Done { message: if was { "was already unlocked" } else { "unlocked" }.into() })
+            }
             Request::Scopes => {
                 self.unlocked().await?;
                 let mut slot = vault.lock().unwrap();

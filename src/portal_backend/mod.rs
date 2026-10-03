@@ -47,6 +47,8 @@ pub const REQUEST_PREFIX: &str = "/org/freedesktop/portal/desktop/request/";
 /// app, so it may be a pipe nobody ever reads: the daemon must not block on
 /// it indefinitely.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the diagnostics lookup behind a refusal may take.
+const CALLER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// RetrieveSecret's response codes: success, cancelled by the user, refused
 /// for any other reason.
@@ -155,6 +157,38 @@ impl PortalBackend {
         }
     }
 
+    /// Names the caller behind the frontend for a refused request:
+    /// xdg-desktop-portal encodes the calling application's bus name into
+    /// the handle, so the process that asked for another app's key can be
+    /// named in the log. Diagnostics only: best-effort, bounded, and it
+    /// never changes the response.
+    async fn log_refused_caller(&self, handle: &str) {
+        let lookup = async {
+            let caller = caller_from_handle(handle)?;
+            let dbus = zbus::fdo::DBusProxy::new(&self.conn).await.ok()?;
+            let name = zbus::names::BusName::try_from(caller.as_str()).ok()?;
+            let creds = dbus.get_connection_credentials(name).await.ok()?;
+            let pid = creds.process_id()?;
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned());
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map(|c| {
+                let spaces: Vec<u8> = c.into_iter().map(|b| if b == 0 { b' ' } else { b }).collect();
+                String::from_utf8_lossy(&spaces).chars().take(300).collect::<String>()
+            });
+            Some((pid, exe, cmdline))
+        };
+        let (pid, exe, cmdline) = match tokio::time::timeout(CALLER_LOOKUP_TIMEOUT, lookup).await {
+            Ok(Some((pid, exe, cmdline))) => (Some(pid), exe, cmdline),
+            _ => (None, None, None),
+        };
+        tracing::warn!(
+            handle = %handle,
+            pid = pid.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            exe = exe.unwrap_or_else(|| "unknown".into()),
+            cmdline = cmdline.unwrap_or_else(|| "unknown".into()),
+            "portal: the caller behind the refused request"
+        );
+    }
+
     /// The work of one call, after the caller was authenticated: unlock,
     /// find or create the key, write it to the fd. Each step can take a
     /// while (a dialog, key derivation), so it runs raced against the
@@ -240,6 +274,19 @@ impl PortalBackend {
             }
         }
     }
+}
+
+/// The caller of a portal request, as xdg-desktop-portal encodes it into
+/// the request handle: the calling application's unique bus name with the
+/// leading `:` removed and every `.` replaced by `_`. Empty handles, empty
+/// components and anything with other characters give `None`.
+fn caller_from_handle(handle: &str) -> Option<String> {
+    let rest = handle.strip_prefix(REQUEST_PREFIX)?;
+    let first = rest.split('/').next()?;
+    if first.is_empty() || !first.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    Some(format!(":{first}").replace('_', "."))
 }
 
 /// Writes all of `data` to `fd`, waiting for the pipe to drain, but never
@@ -348,6 +395,7 @@ impl PortalBackend {
         }
         if !is_valid_portal_app_id(app_id) {
             tracing::warn!(sender = %sender, app_id = %app_id, "portal: refused an invalid app ID");
+            self.log_refused_caller(handle.as_str()).await;
             return Ok((RESPONSE_OTHER, empty_results()));
         }
 
@@ -396,5 +444,19 @@ mod tests {
     #[test]
     fn the_backend_name_is_the_prefix_plus_portal() {
         assert_eq!(BACKEND_NAME, format!("{DBUS_PREFIX}.Portal"));
+    }
+
+    #[test]
+    fn caller_from_handle_decodes_the_encoded_unique_name() {
+        assert_eq!(caller_from_handle(&format!("{REQUEST_PREFIX}1_234/token")), Some(":1.234".to_owned()));
+        assert_eq!(
+            caller_from_handle(&format!("{REQUEST_PREFIX}1_234/token/extra")),
+            Some(":1.234".to_owned()),
+            "a third path component is ignored"
+        );
+        assert_eq!(caller_from_handle(&format!("wrong{REQUEST_PREFIX}1_234/token")), None);
+        assert_eq!(caller_from_handle(REQUEST_PREFIX), None, "empty component");
+        assert_eq!(caller_from_handle(&format!("{REQUEST_PREFIX}/token")), None);
+        assert_eq!(caller_from_handle(&format!("{REQUEST_PREFIX}1-234/token")), None, "other characters");
     }
 }

@@ -134,8 +134,9 @@ App-supplied labels are never shown.
 
 - Only one dialog at a time; concurrent requests wait for it.
 - After a cancelled or failed dialog, requests that did not explicitly ask
-  for one fail at once for 30 seconds, so an app retrying in a loop cannot
-  bring the dialog back. Explicit unlock prompts still show it.
+  for one open no new dialog for 30 seconds. They wait, up to five minutes
+  from their arrival, for something else to unlock the vault. Explicit
+  unlock prompts still show the dialog.
 - When every waiting request has gone away, pinentry is killed.
 - Three wrong passwords count as a cancel.
 - Without a vault, the dialog asks for a new password twice and creates

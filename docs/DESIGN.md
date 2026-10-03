@@ -188,8 +188,14 @@ the unlock dialog. Concurrent requests share one dialog. `CreateItem` is
 the exception: it answers `IsLocked`, because libsecret then unlocks and
 retries by itself.
 After a dialog was cancelled or failed, requests that would open another
-one fail at once for 30 seconds, so an app retrying in a loop cannot keep
-the dialog coming back. An explicit unlock prompt still shows it.
+one don't, for 30 seconds, so an app retrying in a loop cannot keep the
+dialog coming back. They wait instead, up to five minutes from when they
+arrived, until something else unlocks the vault: another request's
+dialog, an explicit unlock prompt, or `scopevault-admin unlock`. At login
+that matters, because applications start while the first dialog is still
+open. A direct Secret Service client gives up after its own D-Bus timeout,
+usually 25 seconds, whatever the daemon does. The portal waits without a
+timeout.
 
 An app can also ask for a dialog explicitly. If it gets three of those
 cancelled within two minutes, its further prompts are dismissed without a
@@ -333,6 +339,8 @@ scope too. Grants are part of backups but not of export and import.
   client). Bitwarden could not be put through the private-bus test
   harness: it crashed there at startup, before talking to the daemon, so
   that test says nothing about it.
+  Bitwarden uses the Secret portal and works with scopevault as the portal
+  backend.
 - gnome-keyring reports the generic schema for schema-less items only
   after reloading them from disk, so scopevault treats a missing schema
   and the generic one as the same when comparing items.

@@ -195,6 +195,27 @@ async fn global_lock_needs_a_new_unlock_and_tells_clients() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unlock_opens_the_dialog_only_while_locked() {
+    let e = env(VaultState::Locked).await;
+    e.vault.set_pins(&["CANCEL"]);
+    let out = e.admin(&Who::Host, &["unlock"]).await;
+    assert!(!out.ok && out.stderr.contains("cancelled"), "{}", out.stderr);
+    assert!(!e.vault.unlocked());
+
+    e.vault.set_pins(&["wrong", PASSWORD]);
+    let out = e.admin(&Who::Host, &["unlock"]).await;
+    assert_eq!(out.stdout.trim(), "unlocked", "{}", out.stderr);
+    assert!(e.vault.unlocked());
+    let dialogs = e.vault.dialogs();
+    let out = e.admin(&Who::Host, &["unlock"]).await;
+    assert_eq!(out.stdout.trim(), "was already unlocked", "{}", out.stderr);
+    assert_eq!(e.vault.dialogs(), dialogs, "no dialog while unlocked");
+
+    let out = e.admin(&Who::Sandbox("ok", A), &["unlock"]).await;
+    assert!(!out.ok && out.stderr.contains(DENIED), "{}", out.stderr);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn moving_items_needs_the_password() {
     let e = env(VaultState::Unlocked).await;
     let a = Who::Sandbox("ok", A);
@@ -328,4 +349,36 @@ async fn sharing_needs_the_password_and_grants_list_it() {
     assert_eq!(e.vault.dialogs(), dialogs, "unshare shows no dialog");
     let out = e.admin(&Who::Host, &["grants"]).await;
     assert!(out.stdout.contains("no grants"), "{}", out.stdout);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_wait_retries_the_connection_only() {
+    let e = env(VaultState::Unlocked).await;
+    // A socket path where nothing listens: `--wait 1` fails after about a
+    // second, not at once and not after minutes.
+    let missing = e.tmp.path().join("run").join("absent");
+    let mut cmd = Command::new(ADMIN);
+    cmd.args(["--socket", missing.to_str().unwrap(), "unlock", "--wait", "1"]).stdin(Stdio::null());
+    let started = std::time::Instant::now();
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("cannot connect"), "{}", stderr);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(900), "{:?}", started.elapsed());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+
+    // The bounds of --wait are usage errors.
+    for args in [vec!["unlock", "--wait", "0"], vec!["unlock", "--wait", "601"], vec!["unlock", "--wait", "x"]] {
+        let out = e.admin(&Who::Host, &args).await;
+        assert!(!out.ok, "{args:?}");
+        assert!(out.stderr.contains("usage: scopevault-admin"), "{args:?}: {}", out.stderr);
+    }
+
+    // Without --wait, a missing socket fails at once.
+    let mut cmd = Command::new(ADMIN);
+    cmd.args(["--socket", missing.to_str().unwrap(), "unlock"]).stdin(Stdio::null());
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("cannot connect"), "{}", stderr);
 }

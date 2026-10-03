@@ -7,6 +7,12 @@
 //! clients disconnected and their requests were dropped), the task is
 //! aborted, which kills pinentry.
 //!
+//! Requests that did not ask for a prompt (and the Secret portal's) do not
+//! fail while a dialog was cancelled or failed: they wait for an unlock by
+//! anything else — another dialog, an explicit prompt, `scopevault-admin
+//! unlock` — up to their deadline ([`UnlockTimings::implicit_wait`]), so an
+//! unlock at login serves the applications that started with it.
+//!
 //! If no vault exists yet, the same flow asks for a new password (entered
 //! twice) and creates one.
 //!
@@ -22,16 +28,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
-use super::pinentry::{self, PinOutcome, PinRequest, PinentryConfig};
+use super::pinentry::{self, PinOutcome, PinRequest, PinentryConfig, PinentryError};
 use crate::crypto::{KdfParams, VaultKey};
 use crate::identity::Scope;
 use crate::store::{StoreError, Vault};
 
 pub const MAX_ATTEMPTS: usize = 3;
-/// After a cancelled or failed dialog, automatic unlock attempts (requests
-/// that need the vault but did not ask for a prompt) fail at once for this
-/// long, so an app retrying in a loop cannot reopen the dialog over and over.
+/// After a cancelled or failed dialog, implicit and portal requests wait
+/// without opening another dialog for this long (an app retrying in a loop
+/// must not reopen the dialog over and over). Requests that ask for a
+/// prompt explicitly are not subject to it.
 pub const IMPLICIT_COOLDOWN: Duration = Duration::from_secs(30);
+/// How long an implicit or portal request waits for an unlock — its own or
+/// another request's dialog — before it gives up.
+pub const IMPLICIT_WAIT: Duration = Duration::from_secs(300);
+/// A pinentry that cannot show its window yet (the session prompter is not
+/// up, so it falls back to curses and fails without a terminal) is retried
+/// after this long.
+pub const NOT_READY_DELAY: Duration = Duration::from_secs(2);
+/// Retries for a prompter that is not ready stop once this long has passed
+/// since the dialog's first attempt.
+pub const NOT_READY_WINDOW: Duration = Duration::from_secs(30);
 /// Explicit prompts (an app's `Unlock` or `CreateCollection`) always show a
 /// dialog, but once a scope's dialogs were cancelled or failed this many
 /// times within [`EXPLICIT_REFUSAL_WINDOW`], its further prompts are
@@ -40,6 +57,25 @@ pub const IMPLICIT_COOLDOWN: Duration = Duration::from_secs(30);
 /// affected.
 pub const EXPLICIT_REFUSAL_LIMIT: usize = 3;
 pub const EXPLICIT_REFUSAL_WINDOW: Duration = Duration::from_secs(120);
+
+/// The waits around unlocking, configurable so tests do not need the
+/// defaults' patience.
+#[derive(Debug, Clone, Copy)]
+pub struct UnlockTimings {
+    pub implicit_wait: Duration,
+    pub not_ready_delay: Duration,
+    pub not_ready_window: Duration,
+}
+
+impl Default for UnlockTimings {
+    fn default() -> Self {
+        UnlockTimings {
+            implicit_wait: IMPLICIT_WAIT,
+            not_ready_delay: NOT_READY_DELAY,
+            not_ready_window: NOT_READY_WINDOW,
+        }
+    }
+}
 
 /// The vault, or the place where it will be created.
 pub struct VaultSlot {
@@ -82,6 +118,7 @@ pub struct Unlocker {
     vault: SharedVault,
     pinentry: PinentryConfig,
     new_vault_kdf: KdfParams,
+    timings: UnlockTimings,
     flight: Mutex<Option<Flight>>,
     next_id: AtomicU64,
     /// Held while any dialog is shown, so dialogs never overlap.
@@ -124,10 +161,21 @@ fn display(scope: &Scope) -> String {
 
 impl Unlocker {
     pub fn new(vault: SharedVault, pinentry: PinentryConfig, new_vault_kdf: KdfParams) -> Arc<Self> {
+        Self::with_timings(vault, pinentry, new_vault_kdf, UnlockTimings::default())
+    }
+
+    /// [`Unlocker::new`] with other waits (tests use short ones).
+    pub fn with_timings(
+        vault: SharedVault,
+        pinentry: PinentryConfig,
+        new_vault_kdf: KdfParams,
+        timings: UnlockTimings,
+    ) -> Arc<Self> {
         Arc::new(Unlocker {
             vault,
             pinentry,
             new_vault_kdf,
+            timings,
             flight: Mutex::new(None),
             next_id: AtomicU64::new(1),
             dialog_gate: tokio::sync::Mutex::new(()),
@@ -203,16 +251,13 @@ impl Unlocker {
     }
 
     /// Like [`Unlocker::ensure_unlocked`], for requests that need the vault
-    /// without having asked for a prompt. Shortly after a cancelled or failed
-    /// dialog it returns `Cancelled` without showing another one.
-    pub async fn ensure_unlocked_implicit(self: &Arc<Self>, requester: &Scope) -> UnlockOutcome {
-        if self.vault.lock().unwrap().is_unlocked() {
-            return UnlockOutcome::Unlocked;
-        }
-        if self.cooldown_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
-            return UnlockOutcome::Cancelled;
-        }
-        self.ensure_unlocked(requester).await
+    /// without having asked for a prompt: instead of failing while the
+    /// cooldown is active they wait for an unlock by anything else, up to
+    /// [`UnlockTimings::implicit_wait`] after `since` (when the request
+    /// arrived), so a request made while the user is still answering one
+    /// dialog is served by it.
+    pub async fn ensure_unlocked_implicit(self: &Arc<Self>, requester: &Scope, since: Instant) -> UnlockOutcome {
+        self.wait_for_unlock(display(requester), since).await
     }
 
     /// [`Unlocker::ensure_unlocked_implicit`] for the Secret portal backend:
@@ -220,19 +265,51 @@ impl Unlocker {
     /// validated before this is called. Without a vault it fails without a
     /// dialog: the portal never creates one.
     pub async fn ensure_unlocked_portal(self: &Arc<Self>, app_id: &str) -> UnlockOutcome {
-        {
-            let slot = self.vault.lock().unwrap();
-            if slot.vault.is_none() {
-                return UnlockOutcome::Failed("no vault".into());
-            }
-            if slot.is_unlocked() {
+        if self.vault.lock().unwrap().vault.is_none() {
+            return UnlockOutcome::Failed("no vault".into());
+        }
+        self.wait_for_unlock(format!("The application {app_id}"), Instant::now()).await
+    }
+
+    /// The waiting loop behind [`Unlocker::ensure_unlocked_implicit`] and
+    /// [`Unlocker::ensure_unlocked_portal`]: until the deadline, join or
+    /// start the shared dialog while no cooldown is active, and wait without
+    /// opening another one while it is. A waiting request never opens a
+    /// second dialog, so it does not wake up when the cooldown expires; a
+    /// new request arriving after the cooldown has expired does, as usual.
+    async fn wait_for_unlock(self: &Arc<Self>, who: String, started: Instant) -> UnlockOutcome {
+        // Subscribed before the first check, so an unlock in between is not
+        // missed.
+        let mut unlocked = self.unlocked_tx.subscribe();
+        let deadline = tokio::time::Instant::from_std(started + self.timings.implicit_wait);
+        'wait: loop {
+            if self.vault.lock().unwrap().is_unlocked() {
                 return UnlockOutcome::Unlocked;
             }
+            // A request that waited in its connection's queue until after
+            // its deadline opens no dialog (`timeout_at` would start one).
+            if tokio::time::Instant::now() >= deadline {
+                break 'wait;
+            }
+            let cooling_down = self.cooldown_until.lock().unwrap().is_some_and(|t| Instant::now() < t);
+            if cooling_down {
+                match tokio::time::timeout_at(deadline, unlocked_by(&mut unlocked)).await {
+                    Err(_) => break 'wait,
+                    Ok(true) => continue,
+                    // The unlocker itself is gone; nothing will unlock.
+                    Ok(false) => return UnlockOutcome::Cancelled,
+                }
+            }
+            match tokio::time::timeout_at(deadline, self.ensure_unlocked_as(who.clone())).await {
+                Ok(UnlockOutcome::Unlocked) => return UnlockOutcome::Unlocked,
+                // The dialog ended cancelled or failed, which started the
+                // cooldown; keep waiting instead of failing the request.
+                Ok(_) => continue,
+                Err(_) => break 'wait,
+            }
         }
-        if self.cooldown_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
-            return UnlockOutcome::Cancelled;
-        }
-        self.ensure_unlocked_as(format!("The application {app_id}")).await
+        tracing::info!(who = %who, waited = started.elapsed().as_secs(), "request gave up waiting for the unlock");
+        UnlockOutcome::Cancelled
     }
 
     /// Whether an explicit prompt of `scope` may show a dialog now (see
@@ -384,14 +461,53 @@ impl Unlocker {
             return UnlockOutcome::Unlocked;
         }
         let exists = self.vault.lock().unwrap().vault.is_some();
+        let started = Instant::now();
         let outcome = if exists { self.unlock_dialog(who).await } else { self.create_dialog(who).await };
+        let elapsed = started.elapsed().as_millis() as u64;
+        match &outcome {
+            UnlockOutcome::Unlocked if exists => tracing::info!(who, elapsed_ms = elapsed, "unlock dialog: unlocked"),
+            UnlockOutcome::Unlocked => tracing::info!(who, elapsed_ms = elapsed, "unlock dialog: vault created"),
+            UnlockOutcome::Cancelled => tracing::info!(who, elapsed_ms = elapsed, "unlock dialog: cancelled"),
+            UnlockOutcome::Failed(reason) => {
+                tracing::warn!(who, elapsed_ms = elapsed, reason = %reason, "unlock dialog failed")
+            }
+        }
         if outcome == UnlockOutcome::Unlocked {
             let _ = self.unlocked_tx.send(());
         }
         outcome
     }
 
+    /// Runs one `pinentry::ask`, retrying while the prompter may not be up
+    /// yet: a pinentry that cannot show its window fails with an I/O or
+    /// protocol error and is tried again after `not_ready_delay`, as long as
+    /// less than `not_ready_window` has passed since `started`. A retry is
+    /// the same request (same text, same `error` line) and does not use up a
+    /// password attempt. `Spawn` and `Timeout` are never retried, and a
+    /// cancel ends at once.
+    async fn ask_retry(&self, req: &PinRequest, started: Instant) -> Result<PinOutcome, PinentryError> {
+        loop {
+            match pinentry::ask(&self.pinentry, req).await {
+                Ok(outcome) => return Ok(outcome),
+                // A pinentry that cannot show its window fails with an I/O
+                // or protocol error; everything else ends the dialog.
+                Err(e) if matches!(e, PinentryError::Io(_) | PinentryError::Protocol(_)) => {
+                    if started.elapsed() >= self.timings.not_ready_window {
+                        return Err(e);
+                    }
+                    tracing::info!(
+                        "pinentry failed: {e}; retrying in {} s, the prompter may not be ready yet",
+                        self.timings.not_ready_delay.as_secs()
+                    );
+                    tokio::time::sleep(self.timings.not_ready_delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     async fn unlock_dialog(&self, who: &str) -> UnlockOutcome {
+        let started = Instant::now();
         let mut error = None;
         for _ in 0..MAX_ATTEMPTS {
             let req = PinRequest {
@@ -403,7 +519,7 @@ impl Unlocker {
                 error: error.take(),
                 repeat: None,
             };
-            let password = match pinentry::ask(&self.pinentry, &req).await {
+            let password = match self.ask_retry(&req, started).await {
                 Ok(PinOutcome::Entered(p)) => p,
                 Ok(PinOutcome::Cancelled) => return UnlockOutcome::Cancelled,
                 Err(e) => return UnlockOutcome::Failed(e.to_string()),
@@ -439,10 +555,12 @@ impl Unlocker {
                 Err(e) => return UnlockOutcome::Failed(e.to_string()),
             }
         }
+        tracing::info!(who, "unlock dialog ended after too many wrong passwords");
         UnlockOutcome::Cancelled
     }
 
     async fn create_dialog(&self, who: &str) -> UnlockOutcome {
+        let started = Instant::now();
         let req = PinRequest {
             title: "Create keyring password".into(),
             description: format!(
@@ -453,7 +571,7 @@ impl Unlocker {
             error: None,
             repeat: Some("Repeat:".into()),
         };
-        let password = match pinentry::ask(&self.pinentry, &req).await {
+        let password = match self.ask_retry(&req, started).await {
             Ok(PinOutcome::Entered(p)) if p.is_empty() => return UnlockOutcome::Cancelled,
             Ok(PinOutcome::Entered(p)) => p,
             Ok(PinOutcome::Cancelled) => return UnlockOutcome::Cancelled,
@@ -477,4 +595,12 @@ impl Unlocker {
             Err(e) => UnlockOutcome::Failed(e.to_string()),
         }
     }
+}
+
+/// Resolves once the vault was unlocked by anything — a dialog, an explicit
+/// prompt, `scopevault-admin unlock`. `false`: the unlocker itself is gone.
+async fn unlocked_by(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
+    // Missed notifications (the channel moved on) were unlocks too: the
+    // caller looks at the vault again.
+    !matches!(rx.recv().await, Err(tokio::sync::broadcast::error::RecvError::Closed))
 }

@@ -291,6 +291,9 @@ pub type CallResult = Result<Message, Fault>;
 /// the shared queue budget until it is dropped.
 struct Queued {
     msg: Message,
+    /// When the request arrived: a wait for the vault counts from here, so
+    /// requests queued behind a waiting one do not each wait in full.
+    received: std::time::Instant,
     _charge: Charge,
 }
 
@@ -419,7 +422,7 @@ impl<R: CallerResolver> SecretService<R> {
                         }
                     }
                     let tx = workers.entry(sender.clone()).or_insert_with(|| self.spawn_worker(&sender));
-                    match tx.try_send(Queued { msg, _charge: charge }) {
+                    match tx.try_send(Queued { msg, received: std::time::Instant::now(), _charge: charge }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(q)) => {
                             self.spawn_fault(&q.msg, Fault::limits("Too many requests"))
@@ -470,7 +473,7 @@ impl<R: CallerResolver> SecretService<R> {
         let sender = sender.clone();
         tokio::spawn(async move {
             while let Some(q) = rx.recv().await {
-                let identified = this.handle(&q.msg, &peer).await;
+                let identified = this.handle(&q.msg, q.received, &peer).await;
                 drop(q);
                 // An unidentified caller keeps no worker or connection slot
                 // while idle; its next request starts a new worker. Closing
@@ -479,7 +482,7 @@ impl<R: CallerResolver> SecretService<R> {
                 if !identified && rx.is_empty() {
                     rx.close();
                     while let Some(q) = rx.recv().await {
-                        this.handle(&q.msg, &peer).await;
+                        this.handle(&q.msg, q.received, &peer).await;
                     }
                     let mut peers = this.peers.lock().unwrap();
                     if peers.get(&sender).is_some_and(|p| Arc::ptr_eq(p, &peer)) {
@@ -516,7 +519,7 @@ impl<R: CallerResolver> SecretService<R> {
     }
 
     /// Handles one request. Returns whether the caller was identified.
-    async fn handle(self: &Arc<Self>, msg: &Message, peer: &Peer) -> bool {
+    async fn handle(self: &Arc<Self>, msg: &Message, received: std::time::Instant, peer: &Peer) -> bool {
         let hdr = msg.header();
         let Some(sender) = hdr.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else { return false };
         // Queued before the connection closed: nobody is left to answer.
@@ -535,7 +538,7 @@ impl<R: CallerResolver> SecretService<R> {
             return true;
         }
         let mut call = Call { hdr, msg, sender, principal, events: Vec::new() };
-        let result = self.dispatch(&mut call, peer).await;
+        let result = self.dispatch(&mut call, received, peer).await;
         // The connection may have closed while this request ran, after its
         // state was dropped; drop whatever the request added since.
         if peer.is_gone() {
@@ -594,7 +597,7 @@ impl<R: CallerResolver> SecretService<R> {
         f(&mut scoped)
     }
 
-    async fn dispatch(self: &Arc<Self>, call: &mut Call<'_>, peer: &Peer) -> CallResult {
+    async fn dispatch(self: &Arc<Self>, call: &mut Call<'_>, received: std::time::Instant, peer: &Peer) -> CallResult {
         let path = call.hdr.path().ok_or_else(Fault::unknown_object)?.to_owned();
         let member = call.hdr.member().ok_or_else(|| Fault::unknown_method(""))?.to_string();
         let interface = call.hdr.interface().map(|i| i.to_string());
@@ -620,7 +623,7 @@ impl<R: CallerResolver> SecretService<R> {
             // unless someone else waits for it too.
             let scope = call.scope();
             let outcome = tokio::select! {
-                o = self.unlocker.ensure_unlocked_implicit(&scope) => o,
+                o = self.unlocker.ensure_unlocked_implicit(&scope, received) => o,
                 () = peer.wait_gone() => return Err(Fault::is_locked()),
             };
             match outcome {

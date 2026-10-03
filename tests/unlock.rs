@@ -5,13 +5,13 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::tempdir::TempDir;
 use scopevault::crypto::KdfParams;
 use scopevault::identity::{AppId, Scope};
 use scopevault::prompts::pinentry::PinentryConfig;
-use scopevault::prompts::unlock::{UnlockOutcome, Unlocker, VaultSlot};
+use scopevault::prompts::unlock::{MAX_ATTEMPTS, UnlockOutcome, UnlockTimings, Unlocker, VaultSlot};
 use scopevault::store::Vault;
 
 struct Fixture {
@@ -21,6 +21,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(pins: &[&str], existing_password: Option<&[u8]>) -> Self {
+        Self::with_timings(pins, existing_password, timings(Duration::from_secs(1)))
+    }
+
+    fn with_timings(pins: &[&str], existing_password: Option<&[u8]>, t: UnlockTimings) -> Self {
         let tmp = TempDir::new("unlock");
         let fake = tmp.path().join("pinentry");
         std::fs::create_dir(&fake).unwrap();
@@ -36,7 +40,7 @@ impl Fixture {
         let slot = Arc::new(Mutex::new(VaultSlot::open(dir).unwrap()));
         let config =
             PinentryConfig { program: common::support_script("fake-pinentry.sh"), timeout: Duration::from_secs(20) };
-        Fixture { unlocker: Unlocker::new(slot, config, KdfParams::MINIMUM), tmp }
+        Fixture { unlocker: Unlocker::with_timings(slot, config, KdfParams::MINIMUM, t), tmp }
     }
 
     fn fake(&self) -> PathBuf {
@@ -62,6 +66,17 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn app() -> Scope {
     Scope::Flatpak(AppId::parse("org.example.App").unwrap())
+}
+
+/// The fixture's short waits, with the implicit wait chosen per test. The
+/// not-ready retry is fast (100 ms delay, 1 s window), so tests with a
+/// `FAIL`ing pinentry finish quickly.
+fn timings(implicit_wait: Duration) -> UnlockTimings {
+    UnlockTimings {
+        implicit_wait,
+        not_ready_delay: Duration::from_millis(100),
+        not_ready_window: Duration::from_secs(1),
+    }
 }
 
 fn reopen(dir: &Path, pw: &[u8]) -> bool {
@@ -167,14 +182,154 @@ async fn abandoned_dialog_is_killed() {
     assert_eq!(fx.dialogs(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_dialog_makes_implicit_requests_wait() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::with_timings(&["CANCEL"], Some(b"pw"), timings(Duration::from_secs(3)));
+    let started = Instant::now();
+    assert_eq!(fx.unlocker.ensure_unlocked_implicit(&app(), Instant::now()).await, UnlockOutcome::Cancelled);
+    // It waited about implicit_wait instead of returning at once, and no
+    // second dialog was opened meanwhile.
+    assert!(started.elapsed() >= Duration::from_millis(2500), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(fx.dialogs(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_wait_counts_from_when_the_request_arrived() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::with_timings(&["pw"], Some(b"pw"), timings(Duration::from_secs(1)));
+    // Queued for longer than the implicit wait: it gives up at once and
+    // opens no dialog.
+    let arrived = Instant::now() - Duration::from_secs(2);
+    let started = Instant::now();
+    assert_eq!(fx.unlocker.ensure_unlocked_implicit(&app(), arrived).await, UnlockOutcome::Cancelled);
+    assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    assert_eq!(fx.dialogs(), 0);
+    assert!(!fx.unlocked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn during_the_cooldown_an_implicit_request_waits_for_an_explicit_unlock() {
+    let _s = SERIAL.lock().await;
+    // implicit_wait 10 s: an Unlocked result cannot be the deadline.
+    let fx = Fixture::with_timings(&["CANCEL", "pw"], Some(b"pw"), timings(Duration::from_secs(10)));
+    let waiter = {
+        let u = fx.unlocker.clone();
+        tokio::spawn(async move { u.ensure_unlocked_implicit(&app(), Instant::now()).await })
+    };
+    for _ in 0..100 {
+        if fx.dialogs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The dialog answers CANCEL at once; the request keeps waiting without
+    // opening another dialog.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!fx.unlocked(), "the cancel left the vault locked");
+
+    // An explicit prompt is not subject to the cooldown; it unlocks the
+    // vault, and the waiting implicit request finishes with it.
+    let explicit = {
+        let u = fx.unlocker.clone();
+        tokio::spawn(async move { u.ensure_unlocked(&app()).await })
+    };
+    assert_eq!(explicit.await.unwrap(), UnlockOutcome::Unlocked);
+    assert_eq!(waiter.await.unwrap(), UnlockOutcome::Unlocked);
+    assert_eq!(fx.dialogs(), 2, "the cancelled dialog and the explicit one");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn during_the_cooldown_a_portal_request_waits_for_an_explicit_unlock() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::with_timings(&["CANCEL", "pw"], Some(b"pw"), timings(Duration::from_secs(10)));
+    let waiter = {
+        let u = fx.unlocker.clone();
+        tokio::spawn(async move { u.ensure_unlocked_portal("org.example.App").await })
+    };
+    for _ in 0..100 {
+        if fx.dialogs() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!fx.unlocked());
+
+    let explicit = {
+        let u = fx.unlocker.clone();
+        tokio::spawn(async move { u.ensure_unlocked(&app()).await })
+    };
+    assert_eq!(explicit.await.unwrap(), UnlockOutcome::Unlocked);
+    assert_eq!(waiter.await.unwrap(), UnlockOutcome::Unlocked);
+    assert_eq!(fx.dialogs(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompter_that_is_not_ready_is_retried() {
+    let _s = SERIAL.lock().await;
+    // FAIL answers with a device error, as a pinentry without a window does.
+    let fx = Fixture::with_timings(&["FAIL", "pw"], Some(b"pw"), timings(Duration::from_secs(1)));
+    let started = Instant::now();
+    assert_eq!(fx.unlocker.ensure_unlocked(&app()).await, UnlockOutcome::Unlocked);
+    assert_eq!(fx.dialogs(), 2, "the failed attempt and the retry");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+    // EXIT makes pinentry quit without replying; the same retry applies.
+    let fx = Fixture::with_timings(&["EXIT", "pw"], Some(b"pw"), timings(Duration::from_secs(1)));
+    assert_eq!(fx.unlocker.ensure_unlocked(&app()).await, UnlockOutcome::Unlocked);
+    assert_eq!(fx.dialogs(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompter_that_never_gets_ready_fails_after_the_window() {
+    let _s = SERIAL.lock().await;
+    let pins: Vec<&str> = vec!["FAIL"; 40];
+    let fx = Fixture::with_timings(&pins, Some(b"pw"), timings(Duration::from_secs(1)));
+    let started = Instant::now();
+    assert!(matches!(fx.unlocker.ensure_unlocked(&app()).await, UnlockOutcome::Failed(_)));
+    // The not_ready_window passed before the failure, with a retry every
+    // not_ready_delay: a few pinentry runs, more than the MAX_ATTEMPTS
+    // password attempts but bounded by the window.
+    assert!(started.elapsed() >= Duration::from_millis(800), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let runs = fx.dialogs();
+    assert!(runs > MAX_ATTEMPTS && runs <= 40, "{runs} pinentry runs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn missing_pinentry_fails_cleanly() {
     let _s = SERIAL.lock().await;
     let tmp = TempDir::new("unlock");
     let slot = Arc::new(Mutex::new(VaultSlot::open(tmp.path().join("vault")).unwrap()));
     let config = PinentryConfig { program: "/nonexistent/pinentry".into(), timeout: Duration::from_secs(5) };
-    let u = Unlocker::new(slot, config, KdfParams::MINIMUM);
+    // A long not-ready window, so a retried Spawn error would show.
+    let t = UnlockTimings { not_ready_window: Duration::from_secs(10), ..timings(Duration::from_secs(2)) };
+    let u = Unlocker::with_timings(slot, config, KdfParams::MINIMUM, t);
+    let started = Instant::now();
     assert!(matches!(u.ensure_unlocked(&app()).await, UnlockOutcome::Failed(_)));
-    // Automatic unlocks then pause instead of retrying a broken dialog.
-    assert_eq!(u.ensure_unlocked_implicit(&app()).await, UnlockOutcome::Cancelled);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "Spawn is not retried, well under not_ready_window: {:?}",
+        started.elapsed()
+    );
+    // The failure starts the cooldown; an implicit request then waits
+    // without a dialog and gives up only at its own deadline.
+    let started = Instant::now();
+    assert_eq!(u.ensure_unlocked_implicit(&app(), Instant::now()).await, UnlockOutcome::Cancelled);
+    assert!(started.elapsed() >= Duration::from_millis(1500), "{:?}", started.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_shows_the_error_line_again() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::with_timings(&["wrong", "FAIL", "right"], Some(b"right"), timings(Duration::from_secs(1)));
+    assert_eq!(fx.unlocker.ensure_unlocked(&app()).await, UnlockOutcome::Unlocked);
+    let log = fx.log();
+    assert!(
+        log.matches("SETERROR Wrong password").count() >= 2,
+        "the retried dialog shows the error line again: {log}"
+    );
+    assert_eq!(fx.dialogs(), 3, "wrong password, the FAIL retry, the right one");
 }

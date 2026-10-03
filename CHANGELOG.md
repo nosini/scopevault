@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0
+
+- Requests made while the vault is locked wait for an unlock, for up to
+  five minutes, instead of failing after a cancelled dialog. Apps starting
+  at login no longer lose their secrets because the first dialog went
+  wrong.
+- A pinentry that fails because GNOME's prompt isn't ready yet is retried.
+- `scopevault-admin unlock` and `scopevault-unlock.service`, which opens
+  the dialog right after login.
+
 ## 0.7.0
 
 - Single items can be shared with another scope, read-only or

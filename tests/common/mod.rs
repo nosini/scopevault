@@ -117,6 +117,20 @@ pub struct VaultFixture {
 
 impl VaultFixture {
     pub fn new(state: VaultState) -> Self {
+        use scopevault::prompts::unlock::UnlockTimings;
+        Self::with_timings(
+            state,
+            UnlockTimings {
+                implicit_wait: Duration::from_secs(1),
+                not_ready_delay: Duration::from_millis(100),
+                not_ready_window: Duration::from_secs(1),
+            },
+        )
+    }
+
+    /// [`VaultFixture::new`] with other waits, for tests that need a longer
+    /// implicit wait than the fixture's 1 s.
+    pub fn with_timings(state: VaultState, timings: scopevault::prompts::unlock::UnlockTimings) -> Self {
         use scopevault::crypto::KdfParams;
         use scopevault::prompts::unlock::{Unlocker, VaultSlot};
         use scopevault::store::Vault;
@@ -154,7 +168,8 @@ impl VaultFixture {
         };
         let config =
             scopevault::prompts::pinentry::PinentryConfig { program: wrapper, timeout: Duration::from_secs(20) };
-        let unlocker = Unlocker::new(std::sync::Arc::new(std::sync::Mutex::new(slot)), config, KdfParams::MINIMUM);
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(slot));
+        let unlocker = Unlocker::with_timings(slot, config, KdfParams::MINIMUM, timings);
         VaultFixture { tmp, unlocker }
     }
 

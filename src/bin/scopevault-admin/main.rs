@@ -12,6 +12,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use scopevault::admin::protocol::{MAX_REPLY_LINE, Reply, Request, VaultState, read_line, write_json};
 use scopevault::admin::server::default_socket_path;
@@ -24,6 +25,10 @@ usage: scopevault-admin [--socket PATH] COMMAND [ARGS]
 Commands (the daemon must be running):
   status                      vault state and connection counts
   lock                        lock the vault for everyone (global lock)
+  unlock [--wait SECONDS]     unlock the vault (password dialog) if it is
+                              locked; with --wait, wait up to SECONDS (1 to
+                              600) for the daemon's socket to appear, for a
+                              start-up order that does not guarantee it
   change-password             change the master password (asked in a dialog)
   scopes                      scopes that have data, with their sizes
   list SCOPE [--json]         collections and items of SCOPE (no secrets)
@@ -84,11 +89,26 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Sends one request; returns the reply and, for a backup, its bytes.
-async fn request(socket: &PathBuf, req: &Request) -> Result<(Reply, Vec<u8>), String> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| format!("cannot connect to {}: {e} (is scopevault-daemon running?)", socket.display()))?;
+/// Sends one request; returns the reply and, for a backup, its bytes. With
+/// `wait`, a connection that fails because the socket does not exist yet or
+/// refuses is retried every 500 ms until the wait has passed: only the
+/// connection is retried, never the request.
+async fn request(socket: &PathBuf, req: &Request, wait: Option<Duration>) -> Result<(Reply, Vec<u8>), String> {
+    let cannot_connect =
+        |e: std::io::Error| format!("cannot connect to {}: {e} (is scopevault-daemon running?)", socket.display());
+    let deadline = wait.map(|w| Instant::now() + w);
+    let stream = loop {
+        match UnixStream::connect(socket).await {
+            Ok(s) => break s,
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
+                    && deadline.is_some_and(|d| Instant::now() < d) =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(cannot_connect(e)),
+        }
+    };
     let (rd, mut wr) = stream.into_split();
     write_json(&mut wr, req).await.map_err(|e| format!("cannot send the request: {e}"))?;
     let mut rd = BufReader::new(rd);
@@ -213,6 +233,22 @@ async fn run() -> ExitCode {
     let Some(socket) = socket.or_else(default_socket_path) else {
         return fail("XDG_RUNTIME_DIR is not set; use --socket");
     };
+    // `unlock --wait` exists for the login unit: the daemon's socket may not
+    // be there yet.
+    if cmd.as_str() == "unlock" {
+        let wait = match rest.as_slice() {
+            [] => None,
+            ["--wait", secs] => match secs.parse::<u64>() {
+                Ok(s) if (1..=600).contains(&s) => Some(Duration::from_secs(s)),
+                _ => return usage(),
+            },
+            _ => return usage(),
+        };
+        return match request(&socket, &Request::Unlock, wait).await {
+            Ok((reply, _)) => print_reply(&reply, false),
+            Err(e) => fail(e),
+        };
+    }
     let (req, json) = match (cmd.as_str(), rest.as_slice()) {
         ("status", []) => (Request::Status, false),
         ("lock", []) => (Request::Lock, false),
@@ -247,7 +283,7 @@ async fn run() -> ExitCode {
                 Ok(f) => f,
                 Err(e) => return fail(format!("cannot create {}: {e}", path.display())),
             };
-            let (reply, data) = match request(&socket, &Request::Backup).await {
+            let (reply, data) = match request(&socket, &Request::Backup, None).await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = std::fs::remove_file(&path);
@@ -271,7 +307,7 @@ async fn run() -> ExitCode {
         }
         _ => return usage(),
     };
-    match request(&socket, &req).await {
+    match request(&socket, &req, None).await {
         Ok((reply, _)) => print_reply(&reply, json),
         Err(e) => fail(e),
     }

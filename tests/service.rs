@@ -13,6 +13,7 @@ use std::time::Duration;
 use common::service::*;
 use common::{PASSWORD, VaultFixture, VaultState};
 use scopevault::identity::Principal;
+use scopevault::prompts::unlock::UnlockTimings;
 use scopevault::service_api::dispatch::{MAX_PROMPTS_PER_CONNECTION, MAX_SESSIONS_PER_CONNECTION};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -307,23 +308,31 @@ async fn a_missing_vault_is_created_on_first_use() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelled_unlock_gives_is_locked_and_a_cooldown() {
+async fn a_cancelled_unlock_makes_requests_wait_without_new_dialogs() {
     let fx = fixture(VaultState::Locked).await;
     let a = fx.client(Some(app_a())).await;
     fx.vault.set_pins(&["CANCEL"]);
+    // The request waits out the fixture's 1 s implicit deadline instead of
+    // failing at once, and exactly one dialog was shown.
+    let started = std::time::Instant::now();
     assert_eq!(search(&a, &[]).await.unwrap_err().0, IS_LOCKED);
+    assert!(started.elapsed() >= Duration::from_millis(800), "{:?}", started.elapsed());
     assert_eq!(fx.vault.dialogs(), 1);
-    // Retries during the cooldown fail at once, without another dialog.
-    for _ in 0..3 {
+    // Requests made during the cooldown wait, without another dialog.
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
         assert_eq!(get(&a, SERVICE, SVC_IFACE, "Collections").await.unwrap_err().0, IS_LOCKED);
-        let m = call(&a, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await;
-        assert_eq!(m.unwrap_err().0, IS_LOCKED);
+        assert!(started.elapsed() >= Duration::from_millis(800), "{:?}", started.elapsed());
+        assert_eq!(call(&a, SERVICE, SVC_IFACE, "ReadAlias", &("default",)).await.unwrap_err().0, IS_LOCKED);
     }
-    // CreateItem and Lock never open a dialog.
+    assert_eq!(fx.vault.dialogs(), 1);
+    // CreateItem and Lock still answer at once without a dialog.
     let s = ClientSession::plain(&a).await;
     let e = create_item(&a, "/org/freedesktop/secrets/aliases/default", &s, "x", &[], b"x", true).await.unwrap_err();
     assert_eq!(e.0, IS_LOCKED);
+    let started = std::time::Instant::now();
     assert_eq!(xlock(&a, "Lock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap(), (vec![], "/".into()));
+    assert!(started.elapsed() < Duration::from_millis(800), "{:?}", started.elapsed());
     assert_eq!(fx.vault.dialogs(), 1);
     assert!(!fx.vault.unlocked());
 
@@ -335,6 +344,33 @@ async fn cancelled_unlock_gives_is_locked_and_a_cooldown() {
     assert!(!dismissed);
     assert_eq!(paths_of(result), ["/org/freedesktop/secrets/collection/login"], "the scope's own login collection");
     assert!(fx.vault.unlocked());
+    assert_eq!(fx.vault.dialogs(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_waiting_during_the_cooldown_is_served_by_a_later_unlock() {
+    let timings = UnlockTimings { implicit_wait: Duration::from_secs(10), ..UnlockTimings::default() };
+    let fx = fixture_with(VaultFixture::with_timings(VaultState::Locked, timings)).await;
+    let a = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    // B's request joins the dialog, which is cancelled, and keeps waiting.
+    fx.vault.set_pins(&["CANCEL", PASSWORD]);
+    let started = std::time::Instant::now();
+    let waiting = tokio::spawn(async move { search(&b, &[]).await });
+    while fx.vault.dialogs() == 0 || !fx.vault.log().contains("GETPIN") {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "B's request must outlast the cancelled dialog");
+
+    // A's explicit Unlock (a connection of its own: calls of one connection
+    // are handled in order) unlocks the vault, which serves B too.
+    let (_, prompt) = xlock(&a, "Unlock", &["/org/freedesktop/secrets/aliases/default"]).await.unwrap();
+    let (dismissed, _) = run_prompt(&a, &fx.service_name().await, &prompt).await;
+    assert!(!dismissed);
+    let found = tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap();
+    assert!(found.is_ok(), "{found:?}");
+    assert!(started.elapsed() < Duration::from_secs(9), "served by the unlock, not the deadline");
     assert_eq!(fx.vault.dialogs(), 2);
 }
 
