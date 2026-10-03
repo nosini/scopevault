@@ -132,6 +132,8 @@ Some Flatpak permissions make the sandbox meaningless:
 `--filesystem=home` or `host`, and `--allow=devel`. Such apps still get
 their own scope, but they can run code on the host and so reach `host` and
 everything else. The identity probe points them out.
+A narrower permission can have a similar effect for secrets; see "Host
+services acting for Flatpak apps" below.
 
 ## The Secret Service, per caller
 
@@ -335,6 +337,31 @@ asks for the status first.
 - Flatpak apps with permissions that escape the sandbox (see above).
 - Rolling the vault file back to an older copy, and secrets surviving in
   old backups or snapshots. See [STORE.md](STORE.md).
+
+### Host services acting for Flatpak apps
+
+scopevault identifies the process that calls it. A host service that
+stores or reads secrets because a Flatpak app asked it to is a host caller,
+so whatever it stores goes into `host`, and scopevault cannot tell on whose
+behalf it acted. Only the Secret portal passes the app's identity along.
+
+This works in both directions:
+
+- A Flatpak app can cause secrets to be stored in `host`. Evolution from
+  Flathub is an example. With the Secret portal its own secrets stay in its
+  sandbox, but adding a collection account there apparently goes through
+  GNOME Online Accounts on the host, and the host's evolution-data-server
+  then asked for the account's password in a host dialog and stored it in
+  `host`. The app can't read it, but the password now lives outside its
+  scope.
+- A host service can hand secrets to any Flatpak app allowed to talk to
+  it. GNOME Online Accounts gives its clients account passwords and access
+  tokens, and every Flatpak app with
+  `--talk-name=org.gnome.OnlineAccounts` is such a client.
+
+`flatpak info --show-permissions APP` shows what an app may talk to.
+`flatpak override --user --no-talk-name=NAME APP` takes a name away, at
+the cost of whatever the app used it for.
 
 ## Compatibility notes
 
