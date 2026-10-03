@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 
 use super::AdminAuthority;
 use super::peer::peer_credentials;
-use super::protocol::{MAX_LINE, Reply, Request, Status, VaultState, read_line, write_json};
+use super::protocol::{CANCELLED, MAX_LINE, Reply, Request, Status, VaultState, read_line, write_json};
 use crate::identity::{BusCredentials, IdentityError, Principal, Scope};
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
 use crate::service_api::dispatch::GrantChange;
@@ -130,7 +130,7 @@ pub fn bind(path: &Path) -> std::io::Result<BoundSocket> {
 fn refused(outcome: UnlockOutcome) -> Option<Reply> {
     match outcome {
         UnlockOutcome::Unlocked => None,
-        UnlockOutcome::Cancelled => Some(Reply::error("cancelled in the password dialog")),
+        UnlockOutcome::Cancelled => Some(Reply::error(CANCELLED)),
         UnlockOutcome::Failed(e) => Some(Reply::error(format!("the password dialog failed: {e}"))),
     }
 }

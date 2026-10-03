@@ -77,7 +77,7 @@ fn open(dir: &Path) -> Result<Vault, String> {
 async fn ask(cfg: &PinentryConfig, req: &PinRequest) -> Result<Zeroizing<String>, String> {
     match pinentry::ask(cfg, req).await {
         Ok(PinOutcome::Entered(p)) => Ok(p),
-        Ok(PinOutcome::Cancelled) => Err("cancelled in the password dialog".into()),
+        Ok(PinOutcome::Cancelled) => Err(scopevault::admin::protocol::CANCELLED.into()),
         Err(e) => Err(format!("the password dialog failed: {e}")),
     }
 }

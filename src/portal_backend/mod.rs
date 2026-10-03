@@ -425,7 +425,12 @@ impl PortalBackend {
         if let Err(e) = self.conn.object_server().remove::<Request, _>(handle.as_str()).await {
             tracing::warn!(path = %handle, error = %e, "portal: cannot remove the request object");
         }
-        tracing::info!(app_id = %app_id, response = response.0, "portal: RetrieveSecret finished");
+        // Some apps ask every second (Bitwarden), so successes are debug.
+        if response.0 == RESPONSE_SUCCESS {
+            tracing::debug!(app_id = %app_id, "portal: RetrieveSecret finished");
+        } else {
+            tracing::info!(app_id = %app_id, response = response.0, "portal: RetrieveSecret finished");
+        }
         Ok(response)
     }
 

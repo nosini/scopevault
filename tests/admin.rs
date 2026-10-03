@@ -382,3 +382,24 @@ async fn unlock_wait_retries_the_connection_only() {
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(stderr.contains("cannot connect"), "{}", stderr);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_wait_reopens_a_dialog_dismissed_at_once() {
+    // At login gnome-shell cancels prompts it cannot show yet, within a
+    // second or two; with --wait such a cancel is retried.
+    let e = env(VaultState::Locked).await;
+    e.vault.set_pins(&["CANCEL", PASSWORD]);
+    let out = e.admin(&Who::Host, &["unlock", "--wait", "30"]).await;
+    assert_eq!(out.stdout.trim(), "unlocked", "{}", out.stderr);
+    assert!(out.stderr.contains("trying again"), "{}", out.stderr);
+    assert_eq!(e.vault.dialogs(), 2);
+
+    // A cancel that took as long as a person's is final, even with --wait.
+    e.vault.lock_vault();
+    e.vault.set_pins(&["SLOWCANCEL", PASSWORD]);
+    let dialogs = e.vault.dialogs();
+    let out = e.admin(&Who::Host, &["unlock", "--wait", "30"]).await;
+    assert!(!out.ok && out.stderr.contains("cancelled"), "{}", out.stderr);
+    assert_eq!(e.vault.dialogs(), dialogs + 1);
+    assert!(!e.vault.unlocked());
+}

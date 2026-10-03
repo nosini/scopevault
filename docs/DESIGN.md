@@ -344,3 +344,10 @@ scope too. Grants are part of backups but not of export and import.
 - gnome-keyring reports the generic schema for schema-less items only
   after reloading them from disk, so scopevault treats a missing schema
   and the generic one as the same when comparing items.
+- Shortly after login, gnome-shell cannot show its password prompt yet and
+  dismisses it, which pinentry reports as an ordinary cancel. The login
+  unit (`scopevault-admin unlock --wait`) therefore reopens a dialog that
+  was cancelled within five seconds.
+- Some apps ask the portal for their key very often, Bitwarden about
+  once a second, so successful portal requests are only logged at debug
+  level to keep the journal readable.

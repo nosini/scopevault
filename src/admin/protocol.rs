@@ -14,6 +14,8 @@ use crate::store::{CollectionListing, GrantListing, ScopeSummary};
 pub const MAX_LINE: usize = 64 * 1024;
 /// Largest reply line the client accepts (listings can be long).
 pub const MAX_REPLY_LINE: usize = 64 * 1024 * 1024;
+/// The error message of a request whose password dialog was cancelled.
+pub const CANCELLED: &str = "cancelled in the password dialog";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+- At login, gnome-shell can dismiss the unlock dialog before showing it.
+  `scopevault-admin unlock --wait` now opens it again.
+- Successful portal requests are logged at debug level, since some apps
+  ask every second.
+
 ## 0.8.0
 
 - Requests made while the vault is locked wait for an unlock, for up to

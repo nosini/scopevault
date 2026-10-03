@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use scopevault::admin::protocol::{MAX_REPLY_LINE, Reply, Request, VaultState, read_line, write_json};
+use scopevault::admin::protocol::{CANCELLED, MAX_REPLY_LINE, Reply, Request, VaultState, read_line, write_json};
 use scopevault::admin::server::default_socket_path;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::UnixStream;
@@ -26,9 +26,10 @@ Commands (the daemon must be running):
   status                      vault state and connection counts
   lock                        lock the vault for everyone (global lock)
   unlock [--wait SECONDS]     unlock the vault (password dialog) if it is
-                              locked; with --wait, wait up to SECONDS (1 to
-                              600) for the daemon's socket to appear, for a
-                              start-up order that does not guarantee it
+                              locked; with --wait (for login), for up to
+                              SECONDS (1 to 600) wait for the daemon's socket
+                              and reopen a dialog the desktop dismissed
+                              before it could be answered (within 5 s)
   change-password             change the master password (asked in a dialog)
   scopes                      scopes that have data, with their sizes
   list SCOPE [--json]         collections and items of SCOPE (no secrets)
@@ -87,6 +88,39 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
 fn usage() -> ExitCode {
     eprint!("{USAGE}");
     ExitCode::from(2)
+}
+
+/// A cancel this quick did not come from the user: gnome-shell dismisses
+/// prompts it cannot show yet (shortly after login it cannot open modal
+/// dialogs), and pinentry reports that as a cancel.
+const QUICK_CANCEL: Duration = Duration::from_secs(5);
+const UNLOCK_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// `unlock`. With `wait` (the login unit), a dialog cancelled within
+/// [`QUICK_CANCEL`] is opened again until the wait has passed; without it,
+/// a cancel is final.
+async fn unlock(socket: &PathBuf, wait: Option<Duration>) -> ExitCode {
+    let deadline = wait.map(|w| Instant::now() + w);
+    loop {
+        let asked = Instant::now();
+        let remaining = deadline.map(|d| d.saturating_duration_since(asked));
+        let reply = match request(socket, &Request::Unlock, remaining).await {
+            Ok((reply, _)) => reply,
+            Err(e) => return fail(e),
+        };
+        let quick_cancel =
+            matches!(&reply, Reply::Error { message } if message == CANCELLED) && asked.elapsed() < QUICK_CANCEL;
+        if quick_cancel && deadline.is_some_and(|d| Instant::now() + UNLOCK_RETRY_DELAY < d) {
+            eprintln!(
+                "scopevault-admin: the dialog was dismissed after {} ms, before anyone could answer it; \
+                 trying again",
+                asked.elapsed().as_millis()
+            );
+            tokio::time::sleep(UNLOCK_RETRY_DELAY).await;
+            continue;
+        }
+        return print_reply(&reply, false);
+    }
 }
 
 /// Sends one request; returns the reply and, for a backup, its bytes. With
@@ -244,10 +278,7 @@ async fn run() -> ExitCode {
             },
             _ => return usage(),
         };
-        return match request(&socket, &Request::Unlock, wait).await {
-            Ok((reply, _)) => print_reply(&reply, false),
-            Err(e) => fail(e),
-        };
+        return unlock(&socket, wait).await;
     }
     let (req, json) = match (cmd.as_str(), rest.as_slice()) {
         ("status", []) => (Request::Status, false),
