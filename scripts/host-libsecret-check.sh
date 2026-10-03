@@ -18,7 +18,7 @@
 #
 # Needs: secret-tool (libsecret-tools), dbus-broker, systemd-socket-activate
 # (systemd), gdbus (glib2-tools), and a built daemon
-# (cargo build --bin scopevault-daemon). PINENTRY overrides the dialog
+# (cargo build: the daemon and scopevault-admin). PINENTRY overrides the dialog
 # program for --real (default: pinentry).
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,6 +44,9 @@ activate=$(command -v systemd-socket-activate || echo /usr/lib/systemd/systemd-s
 newest() { ls -t "$root/target/release/$1" "$root/target/debug/$1" 2>/dev/null | head -n 1; }
 daemon=$(newest scopevault-daemon)
 [ -n "$daemon" ] || { echo "build the daemon first: cargo build --bin scopevault-daemon" >&2; exit 2; }
+# From the same build as the daemon.
+admin=$(dirname "$daemon")/scopevault-admin
+[ -x "$admin" ] || { echo "build $admin first: cargo build" >&2; exit 2; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/scopevault-libsecret.XXXXXX")
 bus_pid=
@@ -201,18 +204,30 @@ pins "wrong" "$pw"
 say "enter a wrong password first, then \"$pw\""
 check "lookup after restart (wrong, then right password)" "$(lookup one)" "replaced"
 
-# 4. Cancel: no secret, a "locked" error.
+# 4. Cancel, as at login: the lookup keeps waiting instead of failing, and
+#    a later unlock (here `scopevault-admin unlock`, at login the unit that
+#    runs it) serves it. secret-tool's own D-Bus timeout is 25 s per call,
+#    so the second password must follow the Cancel within about that.
 stop
 start
-pins CANCEL
-say "press Cancel"
-if out=$(st lookup app scopevault-check kind one 2>"$work/err"); then
-    bad "cancelled unlock returned a secret: '$out'"
-elif grep -qi lock "$work/err"; then
-    ok "cancelled unlock gives an error: $(head -n1 "$work/err")"
-else
-    bad "cancelled unlock gives an unexpected error: $(head -n1 "$work/err")"
-fi
+pins CANCEL "$pw"
+say "press Cancel, then in the next dialog enter \"$pw\" (within 20 s)"
+before=$(wc -l < "$work/daemon.log")
+lookup one >"$work/waited" &
+lookup_pid=$!
+for _ in $(seq "$((limit * 10))"); do
+    tail -n "+$((before + 1))" "$work/daemon.log" | grep -q 'unlock dialog: cancelled' && break
+    sleep 0.1
+done
+sleep 1
+if kill -0 "$lookup_pid" 2>/dev/null; then ok "after Cancel the lookup still waits"
+else bad "after Cancel the lookup ended: '$(cat "$work/waited")'"; fi
+unlocked=$(timeout "$limit" "$admin" --socket "$work/admin/socket" unlock 2>&1 || true)
+check "scopevault-admin unlock" "$unlocked" "unlocked"
+wait "$lookup_pid" || true
+check "the waiting lookup is served by that unlock" "$(cat "$work/waited")" "replaced"
+dialogs=$(tail -n "+$((before + 1))" "$work/daemon.log" | grep -c 'unlock dialog: ' || true)
+check "two dialogs: the cancelled one and the admin's" "$dialogs" 2
 
 if [ "$real" = "--real" ]; then
     echo "dialogs: real pinentry (${PINENTRY:-pinentry})"
