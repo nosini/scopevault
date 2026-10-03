@@ -210,11 +210,17 @@ pub(crate) struct Event {
 struct Peer {
     principal: OnceLock<Principal>,
     gone: watch::Sender<bool>,
+    /// A request with a session this daemon never opened was logged.
+    unknown_session_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Peer {
     fn new() -> Self {
-        Peer { principal: OnceLock::new(), gone: watch::Sender::new(false) }
+        Peer {
+            principal: OnceLock::new(),
+            gone: watch::Sender::new(false),
+            unknown_session_logged: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn is_gone(&self) -> bool {
@@ -449,6 +455,45 @@ impl<R: CallerResolver> SecretService<R> {
     /// stops waiting for the vault and skips requests still queued; aborting
     /// its prompt tasks closes their dialogs unless another request waits
     /// too.
+    /// A request named a transfer session that does not exist (not one of
+    /// another connection: that is refused silently). libsecret opens one
+    /// session per process and never opens another, so a program that
+    /// started before this daemon (a restart, or a logout that stopped it)
+    /// keeps failing with `NoSession` until it is restarted. Logged once per
+    /// connection, with the program, so the journal says what to restart.
+    pub(crate) fn note_unknown_session(&self, sender: &OwnedUniqueName) {
+        let first = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(sender)
+            .is_some_and(|p| !p.unknown_session_logged.swap(true, std::sync::atomic::Ordering::Relaxed));
+        if !first {
+            return;
+        }
+        let conn = self.conn.clone();
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            let lookup = async {
+                let dbus = zbus::fdo::DBusProxy::new(&conn).await.ok()?;
+                let pid = dbus.get_connection_unix_process_id(sender.as_ref().into()).await.ok()?;
+                let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+                Some((pid, exe.map(|p| p.to_string_lossy().into_owned())))
+            };
+            let (pid, exe) = match tokio::time::timeout(std::time::Duration::from_secs(2), lookup).await {
+                Ok(Some((pid, exe))) => (pid.to_string(), exe.unwrap_or_else(|| "unknown".into())),
+                _ => ("unknown".into(), "unknown".into()),
+            };
+            tracing::info!(
+                sender = %sender,
+                pid,
+                exe,
+                "a client used a transfer session this daemon never opened, probably one from before a daemon \
+                 restart; libsecret does not open a new one, so restart that program"
+            );
+        });
+    }
+
     fn forget_connection(&self, gone: &OwnedUniqueName) {
         if let Some(peer) = self.peers.lock().unwrap().remove(gone) {
             // Before the cleanup below, so a request that creates a session

@@ -176,7 +176,14 @@ impl<R: CallerResolver> SecretService<R> {
     ) -> Result<T, Fault> {
         let Parsed::Session(id) = paths::parse(path.as_str()) else { return Err(Fault::no_session()) };
         let sessions = self.sessions.lock().unwrap();
-        let s = sessions.get(id).filter(|s| s.owner == call.sender).ok_or_else(Fault::no_session)?;
+        let Some(s) = sessions.get(id) else {
+            drop(sessions);
+            self.note_unknown_session(&call.sender);
+            return Err(Fault::no_session());
+        };
+        if s.owner != call.sender {
+            return Err(Fault::no_session());
+        }
         f(&s.algorithm)
     }
 

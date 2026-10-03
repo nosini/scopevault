@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.1
+
+- The daemon keeps running when you log out, and the vault is locked
+  instead. Programs that outlive a logout, such as GNOME Online Accounts,
+  lost their libsecret session whenever the Secret Service went away and
+  then failed every request until restarted.
+- The daemon logs which program uses a transfer session it never opened,
+  so it is clear what needs restarting after the daemon restarts.
+
 ## 0.11.0
 
 - The vault locks before the system suspends or hibernates. With login

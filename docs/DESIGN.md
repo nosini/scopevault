@@ -223,6 +223,13 @@ apps need their secrets in the background, and they would stall every time
 the screen locks. With login unlocking set up, unlocking the screen after
 resume opens the vault again.
 
+The daemon keeps running when you log out, with the vault locked. Some
+programs outlive a logout, GNOME Online Accounts' `goa-daemon` among them,
+and libsecret in them never reopens its transfer session. If the Secret
+Service went away with the session, those programs would fail every
+request until restarted. gnome-keyring has the same problem; after a
+restart of scopevault, restart them (`pkill -x goa-daemon`).
+
 ## Administration
 
 Ordinary Secret Service requests from host programs stay limited to

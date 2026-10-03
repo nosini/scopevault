@@ -4,6 +4,13 @@
 # No namespace sandboxing (ProtectSystem, ProtectHome, PrivateTmp and the
 # like): it would put the daemon in its own mount namespace, and then every
 # host caller fails the same-namespace check and is refused.
+#
+# Not PartOf=graphical-session.target: the daemon keeps running after a
+# logout (scopevault-unlock.service locks the vault then). Programs of the
+# user manager can outlive a logout (goa-daemon, evolution-data-server), and
+# libsecret opens one transfer session per process and never another: a
+# new daemon at the next login would refuse their old session, and every
+# GNOME Online Accounts account would fail to sign in.
 
 [Unit]
 Description=scopevault Secret Service
@@ -11,7 +18,6 @@ Description=scopevault Secret Service
 # gnome-keyring's secrets component starts first (the Secret portal backend
 # starts it), it owns the name and this unit fails.
 Before=graphical-session.target
-PartOf=graphical-session.target
 
 [Service]
 Type=dbus

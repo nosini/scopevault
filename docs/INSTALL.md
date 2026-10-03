@@ -153,6 +153,16 @@ name, and it exits after two minutes.
   when it starts, so the journal tells you whether the running daemon is
   the one you installed. After installing new binaries, run
   `systemctl --user restart scopevault.service`, which locks the vault.
+- After restarting the daemon, also restart programs that keep running and
+  use libsecret, above all GNOME Online Accounts: `pkill -x goa-daemon`.
+  D-Bus starts it again when it's needed. libsecret opens one encrypted
+  session per process and never another, and a restarted daemon doesn't
+  know the old one, so such a program fails every request until it
+  restarts ("sign in failed" for every account). The daemon logs it once
+  per program. gnome-keyring behaves the same way.
+- The daemon keeps running when you log out, with the vault locked, for
+  the same reason. After changing the unit files,
+  `systemctl --user daemon-reload` is enough.
 
 On a desktop that never had gnome-keyring, run `scopevault-admin portal
 init` instead of importing. From then on every app without a keyring file
@@ -278,6 +288,7 @@ try it: the module can't block a login, but a typo in a PAM file can.
    cargo build --release --manifest-path pam/Cargo.toml
    install -m 755 target/release/scopevault-daemon target/release/scopevault-admin ~/.local/bin/
    systemctl --user restart scopevault.service   # locks the vault; unlock it again
+   pkill -x goa-daemon                           # see "Checking it"
    sudo install -o root -g root -m 755 target/release/scopevault-pam-helper /usr/local/libexec/
    sudo install -o root -g root -m 755 pam/target/release/libpam_scopevault.so /usr/lib64/security/pam_scopevault.so
    sudo restorecon -v /usr/local/libexec/scopevault-pam-helper /usr/lib64/security/pam_scopevault.so

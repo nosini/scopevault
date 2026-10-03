@@ -401,8 +401,46 @@ async fn signals_reach_only_the_owning_scope_and_are_never_broadcast() {
     }
 }
 
+/// The daemon's log, for the one test here that looks at it.
+#[derive(Clone)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_log() -> Capture {
+    static LOG: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let capture = Capture(Arc::default());
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        capture
+    })
+    .clone()
+}
+
+const STALE: &str = "a client used a transfer session this daemon never opened";
+
+fn stale_lines(log: &Capture) -> Vec<String> {
+    let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+    text.lines().filter(|l| l.contains(STALE)).map(str::to_owned).collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_die_with_their_connection_and_reconnects_start_fresh() {
+    let log = captured_log();
     let e = env(VaultState::Unlocked).await;
     let a = e.run(&e.flatpak(A), &["create", "Login", "default", "store", "default", "A", "alpha-secret", ATTRS]).await;
     let item = a.ok(1).to_owned();
@@ -424,15 +462,35 @@ async fn sessions_die_with_their_connection_and_reconnects_start_fresh() {
     }
     let held = finish(holder).await;
     assert_eq!(held.ok(0), "alpha-secret", "the holder itself can use it");
+    // Another connection's session is refused without a log line: only
+    // sessions that do not exist at all point to a restart.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(stale_lines(&log), Vec::<String>::new());
 
     // After the holder left, its session is gone for everyone, and a new
     // connection of the same app is identified afresh.
     e.all_connections_gone().await;
     assert_eq!(e.service.open_sessions(), 0);
-    let out = e.run(&e.flatpak(A), &["use-session", &session, "secret", &item, "session", "secret", &item]).await;
+    let out = e
+        .run(&e.flatpak(A), &["use-session", &session, "secret", &item, "secrets", &item, "session", "secret", &item])
+        .await;
     assert_eq!(out.err(1), "org.freedesktop.Secret.Error.NoSession: No such session");
-    assert_eq!(out.ok(3), "alpha-secret");
+    assert_eq!(out.err(2), "org.freedesktop.Secret.Error.NoSession: No such session");
+    assert_eq!(out.ok(4), "alpha-secret");
     e.all_connections_gone().await;
+    // That is what a program sees after a daemon restart: logged once for
+    // the connection, naming the program to restart.
+    let mut lines = Vec::new();
+    for _ in 0..100 {
+        lines = stale_lines(&log);
+        if !lines.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(stale_lines(&log).len(), 1, "{lines:?}");
+    assert!(lines[0].contains("scopevault-client"), "{}", lines[0]);
 }
 
 /// Many short-lived connections (in this process, so classified as host):
