@@ -121,7 +121,8 @@ logical lock affects nothing else and is not saved; after a restart the
 whole vault is locked anyway.
 
 The whole vault is locked by `scopevault-admin lock`
-and when the daemon stops.
+and, automatically, before the system suspends or hibernates
+(`src/sleep.rs`). It does not lock with the screen.
 
 Unlocking never changes who may see what.
 

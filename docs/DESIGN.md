@@ -216,6 +216,13 @@ process and never opens another, so closing them would break every running
 application until it restarts. A session only protects secrets on their
 way to its own connection, so keeping it gives nothing away.
 
+The vault also locks when the system goes to sleep. The daemon holds a
+logind delay inhibitor, locks the vault when logind announces the suspend,
+and only then lets it go ahead. It does not lock with the screen: many
+apps need their secrets in the background, and they would stall every time
+the screen locks. With login unlocking set up, unlocking the screen after
+resume opens the vault again.
+
 ## Administration
 
 Ordinary Secret Service requests from host programs stay limited to

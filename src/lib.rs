@@ -13,6 +13,7 @@ pub mod login;
 pub mod portal_backend;
 pub mod prompts;
 pub mod service_api;
+pub mod sleep;
 pub mod store;
 
 /// Prefix for this project's own D-Bus names and object paths.

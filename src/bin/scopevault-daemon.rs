@@ -5,7 +5,8 @@
 //! the `org.freedesktop.impl.portal.Secret` backend for xdg-desktop-portal)
 //! from a second bus connection, and the administrative interface
 //! (scopevault-admin) and the login socket (scopevault-pam-helper) on Unix
-//! sockets. It refuses to start if another
+//! sockets. It locks the vault before the system sleeps (logind, on the
+//! system bus). It refuses to start if another
 //! process owns one of the names; it never replaces a running keyring. It
 //! exits when a bus connection closes, because identity caches are valid
 //! for one bus connection only.
@@ -291,6 +292,16 @@ async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
     };
     let checker = UnixChkpwd::new(opts.unix_chkpwd.clone())?;
     let login = LoginUnlock::new(unlocker.clone(), Arc::new(checker), LoginTimings::default());
+    match zbus::connection::Builder::system() {
+        Ok(b) => match b.build().await {
+            Ok(system) => {
+                let s = service.clone();
+                tokio::spawn(scopevault::sleep::lock_before_sleep(system, move || s.global_lock()));
+            }
+            Err(e) => tracing::warn!(error = %e, "no system bus; the vault is not locked before suspend"),
+        },
+        Err(e) => tracing::warn!(error = %e, "no system bus; the vault is not locked before suspend"),
+    }
     let admin = AdminServer::new(classify, unlocker, service, login.clone());
     tracing::info!(socket = %opts.admin_socket.display(), "administrative interface ready");
     let login_bound = scopevault::admin::server::bind(&opts.login_socket)

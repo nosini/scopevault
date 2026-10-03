@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.0
+
+- The vault locks before the system suspends or hibernates. With login
+  unlocking, unlocking the screen after resume opens it again.
+
 ## 0.10.1
 
 - The PAM helper no longer logs a failed delivery at every login when the

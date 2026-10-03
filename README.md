@@ -41,6 +41,7 @@ descriptors, which dbus-broker does.
 - A small GTK window does the same administration as the command line.
 - Optionally, the login password opens the vault at login and screen
   unlock.
+- The vault locks before the system goes to sleep.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains
