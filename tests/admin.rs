@@ -440,3 +440,42 @@ async fn json_replies_include_errors() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["message"].as_str().unwrap().contains("cannot connect"), "{v}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resetting_a_scope_revokes_grants_to_it_even_if_it_holds_nothing() {
+    let e = env(VaultState::Unlocked).await;
+    let r = e.client(&Who::Host, &["store", "default", "h", "host-secret", "k=v"]).await;
+    let item = field(&r[0], 2).rsplit('/').next().unwrap().to_owned();
+    let grantee = "flatpak/org.example.Alpha";
+    e.vault.set_pins(&[PASSWORD]);
+    assert!(e.admin(&Who::Host, &["share", "host", &format!("login/{item}"), grantee]).await.ok);
+    // Alpha never stored anything: it has no collections of its own.
+    let listed = e.admin(&Who::Host, &["list", grantee]).await;
+    assert!(listed.stdout.contains("no data"), "{}", listed.stdout);
+
+    e.vault.set_pins(&[PASSWORD]);
+    let out = e.admin(&Who::Host, &["reset-scope", grantee]).await;
+    assert!(out.ok, "{}", out.stderr);
+    assert!(e.vault.log().contains("revoke its access to 1 items shared with it"), "{}", e.vault.log());
+    let out = e.admin(&Who::Host, &["grants"]).await;
+    assert!(out.stdout.contains("no grants"), "{}", out.stdout);
+    let r = e.client(&Who::Sandbox("ok", A), &["search", "k=v"]).await;
+    assert_eq!(field(&r[0], 2), " | ", "Alpha no longer sees the item: {r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn item_labels_in_dialogs_are_quoted_and_shortened() {
+    let e = env(VaultState::Unlocked).await;
+    let hostile = "x\" from host.\nUnlock to continue";
+    // 900 bytes of the escaped text used to be cut inside a character.
+    let long = format!("{}{}", "a".repeat(9), "é".repeat(2000));
+    for (label, shown) in [(hostile, "“x' from host. Unlock to continue”"), (long.as_str(), "é…”")] {
+        let r = e.client(&Who::Host, &["store", "default", label, "s", &format!("label={}", label.len())]).await;
+        assert_eq!(field(&r[0], 1), "ok", "{r:?}");
+        let item = field(&r[0], 2).rsplit('/').next().unwrap().to_owned();
+        e.vault.set_pins(&[PASSWORD]);
+        let out = e.admin(&Who::Host, &["share", "host", &format!("login/{item}"), "flatpak/org.example.Alpha"]).await;
+        assert!(out.ok, "{}", out.stderr);
+        assert!(e.vault.log().contains(shown), "{}", e.vault.log());
+    }
+}

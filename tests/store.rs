@@ -318,6 +318,32 @@ fn second_opener_is_refused_and_create_does_not_overwrite() {
 }
 
 #[test]
+fn a_failed_create_removes_only_its_own_file() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    // Another opener holds the vault: refused, and the vault stays.
+    let held = Vault::open(&dir).unwrap();
+    std::fs::rename(dir.join("vault.db"), dir.join("moved.db")).unwrap();
+    assert!(matches!(Vault::create(&dir, PW, KDF), Err(StoreError::InUse)));
+    std::fs::rename(dir.join("moved.db"), dir.join("vault.db")).unwrap();
+    assert!(matches!(Vault::create(&dir, PW, KDF), Err(StoreError::InUse)));
+    assert!(dir.join("vault.db").exists(), "a refused create must not remove the vault");
+    drop(held);
+    let mut v = Vault::open(&dir).unwrap();
+    v.unlock(PW).unwrap();
+
+    // A failure after the file was created removes that file, so a retry
+    // can succeed.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", fresh.join("vault.db-wal")).unwrap();
+    assert!(matches!(Vault::create(&fresh, PW, KDF), Err(StoreError::InsecurePath(_))));
+    assert!(!fresh.join("vault.db").exists());
+    Vault::create(&fresh, PW, KDF).unwrap();
+}
+
+#[test]
 fn password_change_keeps_data() {
     let tmp = TempDir::new("store");
     let dir = populated(&tmp);

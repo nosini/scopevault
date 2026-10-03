@@ -75,20 +75,28 @@ pub enum PinentryError {
     Timeout,
 }
 
+/// Longest escaped argument sent; Assuan lines are at most 1000 bytes.
+const MAX_ESCAPED: usize = 900;
+
 /// Percent-encodes what Assuan requires (`%`, CR, LF) and drops other
-/// control characters.
+/// control characters. Longer text is cut at a character boundary, never
+/// inside a character or an escape.
 fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = String::with_capacity(s.len().min(MAX_ESCAPED));
+    let mut buf = [0u8; 4];
     for c in s.chars() {
-        match c {
-            '%' => out.push_str("%25"),
-            '\n' => out.push_str("%0A"),
-            '\r' => out.push_str("%0D"),
-            c if c.is_control() => {}
-            c => out.push(c),
+        let piece: &str = match c {
+            '%' => "%25",
+            '\n' => "%0A",
+            '\r' => "%0D",
+            c if c.is_control() => continue,
+            c => c.encode_utf8(&mut buf),
+        };
+        if out.len() + piece.len() > MAX_ESCAPED {
+            break;
         }
+        out.push_str(piece);
     }
-    out.truncate(900);
     out
 }
 
@@ -243,5 +251,23 @@ mod tests {
         assert_eq!(&out[..], b"a%b\nc");
         assert!(unescape_into(b"%2", &mut Zeroizing::new(Vec::new())).is_err());
         assert!(unescape_into(b"%zz", &mut Zeroizing::new(Vec::new())).is_err());
+    }
+
+    #[test]
+    fn long_text_is_cut_between_characters_and_escapes() {
+        // A two-byte character across the limit.
+        let s = format!("{}é tail", "a".repeat(MAX_ESCAPED - 1));
+        assert_eq!(escape(&s), "a".repeat(MAX_ESCAPED - 1));
+        // An escape across the limit.
+        let s = format!("{}\nmore", "a".repeat(MAX_ESCAPED - 2));
+        assert_eq!(escape(&s), "a".repeat(MAX_ESCAPED - 2));
+        for n in 0..8 {
+            let s = format!("{}{}", "x".repeat(n), "é%\n".repeat(400));
+            let e = escape(&s);
+            assert!(e.len() <= MAX_ESCAPED);
+            let mut out = Zeroizing::new(Vec::new());
+            unescape_into(e.as_bytes(), &mut out).unwrap();
+            assert!(std::str::from_utf8(&out).is_ok());
+        }
     }
 }

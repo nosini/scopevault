@@ -111,6 +111,19 @@ fn found_in(have: &[PortableCollection], wanted: &[PortableCollection]) -> (usiz
     (found, items.len())
 }
 
+/// Hardens this process before it handles the master password, the vault
+/// key or plaintext secrets: no core dumps, no ptrace by other processes,
+/// private files. Import and export call it once their provider connection
+/// is set up: a provider may identify its callers through procfs (as
+/// scopevault does, and the tests' stand-in provider is scopevault), which
+/// hardening makes unreadable; it does so on the first call and keeps the
+/// result for the connection. The online commands are not hardened: they
+/// handle no secrets, and the daemon identifies its admin client the same
+/// way.
+fn harden() -> Result<(), String> {
+    scopevault::hardening::harden_process().map_err(|e| format!("cannot harden the process: {e}"))
+}
+
 /// A summary without secrets or attribute values.
 fn summarize(cols: &[PortableCollection]) {
     for c in cols {
@@ -141,6 +154,9 @@ pub async fn import(opts: Options) -> ExitCode {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
+    if let Err(e) = harden() {
+        return fail(e);
+    }
     println!("reading from {} ...", provider.owner().await);
     let source = match provider.read_all().await {
         Ok(s) => s,
@@ -245,6 +261,14 @@ pub async fn export(opts: Options) -> ExitCode {
         Ok(v) => v,
         Err(e) => return fail(e),
     };
+    // Connected before anything secret is handled; see `harden`.
+    let provider = match Provider::connect(opts.bus.as_deref()).await {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = harden() {
+        return fail(e);
+    }
     let what = format!("scopevault-admin wants to copy passwords out of {}. Enter its password.", dir.display());
     if let Err(e) = unlock(&mut vault, &opts.pinentry, &what).await {
         return fail(e);
@@ -261,10 +285,6 @@ pub async fn export(opts: Options) -> ExitCode {
         cols.len()
     );
     summarize(&cols);
-    let provider = match Provider::connect(opts.bus.as_deref()).await {
-        Ok(p) => p,
-        Err(e) => return fail(e),
-    };
     println!("writing to {} ...", provider.owner().await);
     if opts.scope == Scope::Portal {
         // A key must never land beside a different one for the same app:
@@ -284,7 +304,10 @@ pub async fn export(opts: Options) -> ExitCode {
     }
     let report = match provider.write(&cols).await {
         Ok(r) => r,
-        Err(e) => return fail(format!("{e} (items written before this remain in the provider)")),
+        Err(e) if e.partial => {
+            return fail(format!("{} (items written before this remain in the provider)", e.message));
+        }
+        Err(e) => return fail(format!("{}. Nothing was written", e.message)),
     };
     let back = match provider.read_all().await {
         Ok(b) => b,
@@ -292,8 +315,8 @@ pub async fn export(opts: Options) -> ExitCode {
     };
     let (found, total) = found_in(&back, &cols);
     println!(
-        "wrote {} items ({} already there, {} new collections)",
-        report.items_written, report.items_skipped, report.collections_created
+        "wrote {} items, replaced {} older versions ({} already there, {} new collections)",
+        report.items_written, report.items_replaced, report.items_skipped, report.collections_created
     );
     if found != total {
         return fail(format!("verification failed: only {found} of {total} items read back identically"));
@@ -326,6 +349,9 @@ fn portal_conflicts(cols: &[PortableCollection], there: &[PortableCollection]) -
 /// Replaces the vault with a backup, after checking that the backup opens
 /// with its password and is intact. The replaced vault is kept beside it.
 pub async fn restore(file: &Path, opts: Options) -> ExitCode {
+    if let Err(e) = harden() {
+        return fail(e);
+    }
     let dir = &opts.data_dir;
     let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
         return fail("the data directory has no parent");
@@ -377,6 +403,9 @@ async fn restore_into(
         let what =
             format!("scopevault-admin wants to restore the backup {}. Enter the backup's password.", file.display());
         unlock(&mut v, cfg, &what).await?;
+        // Unlocking checks the metadata only; a damaged secret would show
+        // only when an app reads it.
+        v.verify_secrets().map_err(|e| format!("{} is not a usable backup: {e}", file.display()))?;
         let scopes = v.scope_summaries(&AdminAuthority::offline()).map_err(|e| e.to_string())?;
         format!("{} scopes, {} items", scopes.len(), scopes.iter().map(|s| s.items).sum::<usize>())
     };

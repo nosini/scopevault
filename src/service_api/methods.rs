@@ -21,8 +21,9 @@ use crate::prompts::unlock::UnlockOutcome;
 use crate::store::{SHARED_COLLECTION, ScopedVault, Secret};
 
 use super::dispatch::{
-    Call, CallResult, Event, Fault, MAX_PROMPTS_PER_CONNECTION, MAX_SESSIONS_PER_CONNECTION, Node, PromptAction,
-    PromptEntry, SecretService, SignalBody, Target, TransferSession, service_path, value,
+    Call, CallResult, Event, Fault, MAX_PROMPTS_PER_CONNECTION, MAX_SECRET_BYTES_PER_REPLY,
+    MAX_SESSIONS_PER_CONNECTION, Node, PromptAction, PromptEntry, SecretService, SignalBody, Target, TransferSession,
+    service_path, value,
 };
 use super::interfaces::{self, Interface};
 use super::paths::{self, Parsed};
@@ -418,23 +419,45 @@ impl<R: CallerResolver> SecretService<R> {
                 // Check the session first, so a foreign session fails even
                 // when no item resolves.
                 self.with_session(call, &session, |_| Ok(()))?;
-                let secrets = self.with_vault(&call.principal, |v| {
-                    let mut out = Vec::new();
+                // Each path is answered once and each item decrypted once,
+                // however often the request repeats them; the total is
+                // bounded (see MAX_SECRET_BYTES_PER_REPLY).
+                let (answers, secrets) = self.with_vault(&call.principal, |v| {
+                    let mut seen = BTreeSet::new();
+                    let mut decrypted: HashMap<(String, String), usize> = HashMap::new();
+                    let mut secrets: Vec<Secret> = Vec::new();
+                    let mut answers = Vec::new();
+                    let mut total = 0usize;
                     for p in &items {
-                        let Some(Obj::Item(c, i)) = resolve_obj(v, p.as_str()) else { continue };
-                        match v.read_secret(&c, &i) {
-                            Ok(s) => out.push((p.clone(), s)),
-                            Err(crate::store::StoreError::Locked) => {}
-                            Err(e) => return Err(e.into()),
+                        if !seen.insert(p.as_str()) {
+                            continue;
                         }
+                        let Some(Obj::Item(c, i)) = resolve_obj(v, p.as_str()) else { continue };
+                        let n = match decrypted.get(&(c.clone(), i.clone())) {
+                            Some(&n) => n,
+                            None => match v.read_secret(&c, &i) {
+                                Ok(s) => {
+                                    secrets.push(s);
+                                    decrypted.insert((c, i), secrets.len() - 1);
+                                    secrets.len() - 1
+                                }
+                                Err(crate::store::StoreError::Locked) => continue,
+                                Err(e) => return Err(e.into()),
+                            },
+                        };
+                        total += secrets[n].value.len();
+                        if total > MAX_SECRET_BYTES_PER_REPLY {
+                            return Err(Fault::limits("Too many secrets in one request; ask for fewer at a time"));
+                        }
+                        answers.push((p.clone(), n));
                     }
-                    Ok(out)
+                    Ok((answers, secrets))
                 })?;
                 // Keyed by the path the client used, which is how libsecret
                 // looks the results up.
                 let mut reply: HashMap<OwnedObjectPath, WireSecret> = HashMap::new();
-                for (p, s) in &secrets {
-                    reply.insert(p.clone(), self.send_secret(call, &session, s)?);
+                for (p, n) in answers {
+                    reply.insert(p, self.send_secret(call, &session, &secrets[n])?);
                 }
                 call.reply(&(reply,))
             }

@@ -69,7 +69,11 @@ ask for its password with pinentry):
                               org.freedesktop.portal.Secret schema) go into
                               the `portal` scope. The provider is not changed.
   export                      copy scope `host` into the provider on the bus
-                              (rollback); items it already has are skipped
+                              (rollback); items it already has are skipped,
+                              an older version (same attributes, another
+                              secret or label) is replaced, and if several
+                              items there could be that older version,
+                              nothing is written
 
 A SCOPE is `host`, `flatpak/APP-ID` or `portal`. With `export --scope
 portal`, the portal keys are written back into the provider's default

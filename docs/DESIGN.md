@@ -241,6 +241,9 @@ scope to `host` when something is missing: that would undo the isolation.
 
 `scopevault-admin export` goes the other way, for switching back. It writes
 what gnome-keyring doesn't have and skips what it has.
+An item changed in scopevault replaces its older version in gnome-keyring
+instead of being added next to it. If that older version is ambiguous,
+export writes nothing.
 
 ### gnome-keyring and the bus name
 

@@ -341,17 +341,24 @@ impl AdminServer {
             Request::ResetScope { scope } => {
                 let scope = parse_scope(&scope)?;
                 self.unlocked().await?;
-                let (collections, items) = {
+                let (collections, items, shared_with_it) = {
                     let mut slot = vault.lock().unwrap();
                     let v = slot.vault.as_mut().ok_or_else(|| Reply::error("there is no vault yet"))?;
                     let listing = v.scoped_admin(authority, scope.clone()).map_err(store_error)?.listing();
-                    (listing.len(), listing.iter().map(|c| c.items.len()).sum::<usize>())
+                    // Grants to the scope go too, even if it holds nothing
+                    // itself (for example an app that never stored anything).
+                    let incoming = v.grants(authority, Some(&scope)).map_err(store_error)?;
+                    let shared_with_it = incoming.iter().filter(|g| g.grantee == scope.to_string()).count();
+                    (listing.len(), listing.iter().map(|c| c.items.len()).sum::<usize>(), shared_with_it)
                 };
-                if collections == 0 {
+                if collections == 0 && shared_with_it == 0 {
                     return Ok(Reply::Reset { collections: 0, items: 0 });
                 }
-                let action =
+                let mut action =
                     format!("delete everything stored for {scope}: {items} items in {collections} collections");
+                if shared_with_it > 0 {
+                    action.push_str(&format!(", and revoke its access to {shared_with_it} items shared with it"));
+                }
                 if let Some(r) = refused(self.unlocker.confirm_admin(&action).await) {
                     return Err(r);
                 }
@@ -383,7 +390,10 @@ impl AdminServer {
                     info.label
                 };
                 let access = if write { "read and write" } else { "read" };
-                let action = format!("give {to} {access} access to \"{label}\" from {from}");
+                // The label is the app's choice: quoted safely (see
+                // `quote_untrusted`).
+                let label = crate::prompts::quote_untrusted(&label);
+                let action = format!("give {to} {access} access to {label} from {from}");
                 if let Some(r) = refused(self.unlocker.confirm_admin(&action).await) {
                     return Err(r);
                 }

@@ -393,15 +393,10 @@ impl Vault {
         }
         let key = VaultKey::generate()?;
         let wrap = key.wrap(password, kdf)?;
-        let db = match Db::create(dir, &wrap) {
-            Ok(db) => db,
-            Err(StoreError::Exists) => return Err(StoreError::Exists),
-            Err(e) => {
-                // Do not leave a half-initialised file that would block retries.
-                let _ = std::fs::remove_file(dir.join(db::DB_FILE));
-                return Err(e);
-            }
-        };
+        // A half-initialised file is removed by `Db::create` itself; an
+        // error here (another opener, an existing vault) leaves the files
+        // alone.
+        let db = Db::create(dir, &wrap)?;
         let cipher = key.record_cipher();
         Ok(Vault { db, unlocked: Some(Unlocked::new(cipher, HashMap::new())) })
     }
@@ -429,6 +424,19 @@ impl Vault {
     /// Finishes unlocking with an already unwrapped key: decrypts and
     /// checks every metadata record. On any inconsistency the vault stays
     /// locked.
+    /// Decrypts and decodes every secret record, which unlocking does not
+    /// do (secrets are read on demand): for checking a backup before it
+    /// replaces a vault. Returns their number.
+    pub fn verify_secrets(&self) -> Result<usize, StoreError> {
+        let u = self.unlocked.as_ref().ok_or(StoreError::Locked)?;
+        let mut n = 0;
+        for r in self.db.load_all()?.iter().filter(|r| r.kind == KIND_SECRET) {
+            payload::decode_secret(&open_record(&u.cipher, r)?)?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn unlock_with_key(&mut self, key: VaultKey) -> Result<(), StoreError> {
         if self.unlocked.is_some() {
             return Ok(());

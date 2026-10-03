@@ -199,6 +199,10 @@ creating new keys that would clash with the ones you export.
 
    It writes the items gnome-keyring doesn't have and skips the ones it
    has.
+   An item you changed in scopevault replaces gnome-keyring's older
+   version instead of ending up next to it. If gnome-keyring has several
+   items that could be that older version, the export writes nothing and
+   names them; delete the obsolete ones in Seahorse and run it again.
 
    If apps got new portal keys from scopevault, export those as well:
 

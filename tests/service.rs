@@ -725,6 +725,21 @@ async fn unidentified_connections_hold_no_slots_and_scopes_have_a_cap() {
     let extra = fx.client(Some(app_a())).await;
     let e = call(&extra, SERVICE, PROPS, "Get", &(SVC_IFACE, "Collections")).await.unwrap_err();
     assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded");
+    // Refused connections keep no slot of the global limit while idle.
+    let mut refused = Vec::new();
+    for _ in 0..20 {
+        let c = fx.client(Some(app_a())).await;
+        let e = call(&c, SERVICE, PROPS, "Get", &(SVC_IFACE, "Collections")).await.unwrap_err();
+        assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded");
+        refused.push(c);
+    }
+    for _ in 0..100 {
+        if fx.service.active_connections() == MAX_CONNECTIONS_PER_SCOPE {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fx.service.active_connections(), MAX_CONNECTIONS_PER_SCOPE, "refused connections are not tracked");
     // Other scopes are unaffected.
     let b = fx.client(Some(app_b())).await;
     collections(&b).await;
@@ -768,4 +783,40 @@ async fn repeatedly_cancelled_prompts_stop_showing_dialogs_for_that_app() {
     assert!(!dismissed);
     assert_eq!(fx.vault.dialogs(), EXPLICIT_REFUSAL_LIMIT + 1);
     assert!(fx.vault.unlocked());
+}
+
+/// Repeating paths in `GetSecrets` decrypts nothing twice, and the
+/// plaintext one call can return is bounded, also when distinct paths
+/// (aliases) name the same item.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_secrets_is_deduplicated_and_bounded() {
+    use scopevault::service_api::dispatch::MAX_SECRET_BYTES_PER_REPLY;
+    use scopevault::store::MAX_SECRET_BYTES;
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let s = ClientSession::plain(&a).await;
+    let col = create_collection(&a, "Big", "").await;
+    let item = create_item(&a, &col, &s, "big", &[("k", "v")], &vec![7u8; MAX_SECRET_BYTES], false).await.unwrap();
+    let id = item.rsplit('/').next().unwrap().to_owned();
+
+    // One path 10 000 times: one answer.
+    let repeated = vec![obj(&item); 10_000];
+    let m = call(&a, SERVICE, SVC_IFACE, "GetSecrets", &(repeated, &s.path)).await.unwrap();
+    let (map,): (HashMap<OwnedObjectPath, WireSecret>,) = m.body().deserialize().unwrap();
+    assert_eq!(map.len(), 1);
+    assert_eq!(s.decode(&map[&obj(&item)]).0.len(), MAX_SECRET_BYTES);
+
+    // Distinct paths to the same item are answered each, up to the bound.
+    let fits = MAX_SECRET_BYTES_PER_REPLY / MAX_SECRET_BYTES;
+    let mut paths = vec![obj(&item)];
+    for n in 1..=fits {
+        let alias = format!("big{n}");
+        call(&a, SERVICE, SVC_IFACE, "SetAlias", &(alias.as_str(), obj(&col))).await.unwrap();
+        paths.push(obj(&format!("/org/freedesktop/secrets/aliases/{alias}/{id}")));
+    }
+    let m = call(&a, SERVICE, SVC_IFACE, "GetSecrets", &(&paths[..fits], &s.path)).await.unwrap();
+    let (map,): (HashMap<OwnedObjectPath, WireSecret>,) = m.body().deserialize().unwrap();
+    assert_eq!(map.len(), fits);
+    let e = call(&a, SERVICE, SVC_IFACE, "GetSecrets", &(&paths[..], &s.path)).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded", "{e:?}");
 }

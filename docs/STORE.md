@@ -162,6 +162,7 @@ through `/proc`.
 | Attributes per item | 64, each name up to 256 bytes and value up to 4 KiB |
 | Secret | 512 KiB |
 | Content type | 128 bytes |
+| Plaintext in one `GetSecrets` reply | 16 MiB; repeated paths are answered once |
 
 ## What this does not protect against
 

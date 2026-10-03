@@ -118,27 +118,10 @@ impl Db {
         dir.join(DB_FILE).exists()
     }
 
-    fn open_connection(dir: &Path, create: bool) -> Result<(Connection, OwnedFd), StoreError> {
-        let dir_fd = private_dir(dir)?;
-        let lock = take_lock(&dir_fd)?;
-        if create {
-            // Create the file ourselves so its mode is 0600 from the start;
-            // SQLite gives the WAL and shm files the same mode.
-            rustix::fs::openat(
-                &dir_fd,
-                DB_FILE,
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .map_err(|e| match e {
-                rustix::io::Errno::EXIST => StoreError::Exists,
-                e => std::io::Error::from(e).into(),
-            })?;
-        } else if !Self::exists(dir) {
-            return Err(StoreError::NotFound);
-        }
+    /// Opens the database under `dir_fd`, which the caller has locked.
+    fn connect(dir_fd: &OwnedFd, dir: &Path) -> Result<Connection, StoreError> {
         for name in [DB_FILE, "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
-            check_file(&dir_fd, name)?;
+            check_file(dir_fd, name)?;
         }
         let conn = Connection::open_with_flags(
             dir.join(DB_FILE),
@@ -154,11 +137,41 @@ impl Db {
              PRAGMA trusted_schema = OFF;
              PRAGMA cell_size_check = ON;",
         )?;
-        Ok((conn, lock))
+        Ok(conn)
     }
 
+    /// Creates the database. A failure after the file was created removes
+    /// it again, while the lock is still held: only a file this call
+    /// created is ever removed, so a vault another opener holds or created
+    /// meanwhile is left alone.
     pub fn create(dir: &Path, wrap: &KeyWrap) -> Result<Db, StoreError> {
-        let (mut conn, lock) = Self::open_connection(dir, true)?;
+        let dir_fd = private_dir(dir)?;
+        let lock = take_lock(&dir_fd)?;
+        // Create the file ourselves so its mode is 0600 from the start;
+        // SQLite gives the WAL and shm files the same mode.
+        rustix::fs::openat(
+            &dir_fd,
+            DB_FILE,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|e| match e {
+            rustix::io::Errno::EXIST => StoreError::Exists,
+            e => std::io::Error::from(e).into(),
+        })?;
+        match Self::initialise(&dir_fd, dir, wrap) {
+            Ok(conn) => Ok(Db { conn, dir: dir.to_owned(), _lock: lock }),
+            Err(e) => {
+                for name in [DB_FILE, "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
+                    let _ = rustix::fs::unlinkat(&dir_fd, name, rustix::fs::AtFlags::empty());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn initialise(dir_fd: &OwnedFd, dir: &Path, wrap: &KeyWrap) -> Result<Connection, StoreError> {
+        let mut conn = Self::connect(dir_fd, dir)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
         tx.execute_batch(&format!(
             "PRAGMA application_id = {APPLICATION_ID};
@@ -177,11 +190,16 @@ impl Db {
             params![wrap.kdf.m_kib, wrap.kdf.t, wrap.kdf.p, &wrap.salt[..], &wrap.nonce[..], &wrap.wrapped],
         )?;
         tx.commit()?;
-        Ok(Db { conn, dir: dir.to_owned(), _lock: lock })
+        Ok(conn)
     }
 
     pub fn open(dir: &Path) -> Result<Db, StoreError> {
-        let (conn, lock) = Self::open_connection(dir, false)?;
+        let dir_fd = private_dir(dir)?;
+        let lock = take_lock(&dir_fd)?;
+        if !Self::exists(dir) {
+            return Err(StoreError::NotFound);
+        }
+        let conn = Self::connect(&dir_fd, dir)?;
         let app_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         if app_id != APPLICATION_ID {
             return Err(StoreError::NotAVault);

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.1
+
+- Creating a vault could delete an existing one when it raced another
+  process or failed on permissions.
+- One app could make the daemon decrypt and hold gigabytes with a single
+  `GetSecrets`. Replies are now capped at 16 MiB.
+- Resetting a scope that held nothing left grants to it in place.
+- Connections refused by the per-app limit kept their slot.
+- An item's label could rewrite the text of the daemon's share dialog,
+  and a long one could crash the request.
+- `restore` accepted backups with damaged secrets.
+- `export` added a changed item next to its old version in gnome-keyring
+  instead of replacing it.
+- Migrating from another scopevault failed for large secrets.
+- `import`, `export` and `restore` now harden the process like the daemon.
+
 ## 0.9.0
 
 - A graphical front end, `scopevault-gui`, for the administration tasks.

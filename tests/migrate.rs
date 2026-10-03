@@ -260,11 +260,185 @@ async fn migration_then_rollback() {
     pins.set(&[TARGET_PW]);
     let out = admin(&["export"], &dir, &pins, Some(&old.bus.address)).await;
     assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
-    assert!(out.stdout.contains("wrote 1 items (4 already there, 0 new collections)"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("wrote 1 items, replaced 0 older versions (4 already there, 0 new collections)"),
+        "{}",
+        out.stdout
+    );
     assert!(out.stdout.contains("verified: all 5 items are in the provider"), "{}", out.stdout);
     let r = old.client(&["lookup", "service=new", "lookup", "service=mail"]).await;
     assert_eq!(r[0].split('\t').nth(2), Some("new-pw"));
     assert_eq!(r[1].split('\t').nth(2), Some("mail-pw"), "the old store remains usable");
+}
+
+/// A password changed in scopevault replaces the provider's old version on
+/// export instead of landing beside it; when it is unclear which old item
+/// to replace, nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_replaces_changed_items_and_stops_on_ambiguity() {
+    let old = old_provider(VaultState::Unlocked).await;
+    old.fill().await;
+    let tmp = TempDir::new("migrate");
+    let dir = tmp.path().join("vault");
+    drop(Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap());
+    let pins = Pins::new();
+    pins.set(&[TARGET_PW]);
+    assert!(admin(&["import"], &dir, &pins, Some(&old.bus.address)).await.ok);
+
+    let set_secret = |label: &str, value: &[u8]| {
+        let mut v = open_vault(&dir);
+        v.unlock(TARGET_PW.as_bytes()).unwrap();
+        let mut s = v.scoped(&scopevault::identity::Principal::Host).unwrap();
+        let (c, i, _) = s.search(&[("service".to_owned(), label.to_owned())].into()).remove(0);
+        s.set_secret(&c, &i, &Secret::new(value.to_vec(), "text/plain")).unwrap();
+    };
+    set_secret("mail", b"mail-pw-2");
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("wrote 0 items, replaced 1 older versions (3 already there"), "{}", out.stdout);
+    let r = old.client(&["search", "service=mail", "lookup", "service=mail"]).await;
+    assert_eq!(r[0].split('\t').nth(2).unwrap().split(" | ").next().unwrap().split(',').count(), 1, "{r:?}");
+    assert_eq!(r[1].split('\t').nth(2), Some("mail-pw-2"));
+
+    // The provider gets a second item with the web password's attributes.
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let mut s = slot.vault.as_mut().unwrap().scoped(&scopevault::identity::Principal::Host).unwrap();
+        s.create_item(
+            "login",
+            "Web copy",
+            [("service".to_owned(), "web".to_owned())].into(),
+            &Secret::new(*b"other", "text/plain"),
+            false,
+        )
+        .unwrap();
+    }
+    set_secret("web", b"web-pw-2");
+    set_secret("vpn", b"vpn-pw-2");
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(!out.ok, "{}", out.stdout);
+    assert!(out.stderr.contains("several items with the same attributes as \"Ünïcödé ✓\""), "{}", out.stderr);
+    assert!(out.stderr.contains("Nothing was written"), "{}", out.stderr);
+    let r = old.client(&["lookup", "service=vpn"]).await;
+    assert_eq!(r[0].split('\t').nth(2), Some("vpn-pw"), "not even the unambiguous item was written");
+}
+
+/// The offline commands hold the master password and plaintext secrets:
+/// the executable itself must be hardened before it asks for the password.
+/// Checked from its pinentry child while it waits for the password.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_commands_harden_the_process() {
+    let old = old_provider(VaultState::Unlocked).await;
+    let tmp = TempDir::new("harden");
+    let dir = tmp.path().join("vault");
+    drop(Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap());
+    let backup = tmp.path().join("backup.db");
+    std::fs::copy(dir.join("vault.db"), &backup).unwrap();
+    let pins = Pins::new();
+    let probe = pins.dir.path().join("probe");
+    let program = pins.dir.path().join("probing-pinentry.sh");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n{{ stat -c %u /proc/$PPID/environ; grep 'Max core file size' /proc/$PPID/limits; }} > '{}'\n\
+             exec '{}' \"$@\"\n",
+            probe.display(),
+            pins.program().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bus = old.bus.address.as_str();
+    for args in [vec!["import", "--bus", bus], vec!["export", "--bus", bus], vec!["restore", backup.to_str().unwrap()]]
+    {
+        let cmd = args[0];
+        let _ = std::fs::remove_file(&probe);
+        pins.set(&["CANCEL"]);
+        let mut c = Command::new(ADMIN);
+        c.args(&args).arg("--data-dir").arg(&dir).arg("--pinentry").arg(&program);
+        let out = tokio::task::spawn_blocking(move || c.stdin(Stdio::null()).output().unwrap()).await.unwrap();
+        assert!(!out.status.success());
+        let seen = std::fs::read_to_string(&probe)
+            .unwrap_or_else(|_| panic!("{cmd}: no dialog: {}", String::from_utf8_lossy(&out.stderr)));
+        let mut lines = seen.lines();
+        let owner: u32 = lines.next().unwrap().trim().parse().unwrap();
+        assert_ne!(owner, rustix::process::getuid().as_raw(), "{cmd}: procfs entries still ours, so dumpable");
+        let core: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(&core[4..6], ["0", "0"], "{cmd}: {seen}");
+    }
+}
+
+/// Two source collections that go into the same target are planned
+/// together: one old item is never replaced twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_plans_collections_with_the_same_target_together() {
+    let old = old_provider(VaultState::Unlocked).await;
+    old.fill().await;
+    let tmp = TempDir::new("migrate");
+    let dir = tmp.path().join("vault");
+    drop(Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap());
+    let pins = Pins::new();
+    pins.set(&[TARGET_PW]);
+    assert!(admin(&["import"], &dir, &pins, Some(&old.bus.address)).await.ok);
+    {
+        let mut v = open_vault(&dir);
+        v.unlock(TARGET_PW.as_bytes()).unwrap();
+        let mut s = v.scoped(&scopevault::identity::Principal::Host).unwrap();
+        let mail: std::collections::BTreeMap<String, String> =
+            [("service".to_owned(), "mail".to_owned()), ("user".to_owned(), "alice".to_owned())].into();
+        let (c, i, _) = s.search(&mail).remove(0);
+        s.set_secret(&c, &i, &Secret::new(*b"mail-pw-2", "text/plain")).unwrap();
+        // A second collection with the default collection's label.
+        let (second, _) = s.create_collection("Login", "").unwrap();
+        s.create_item(&second, "Mail", mail, &Secret::new(*b"mail-pw-3", "text/plain"), false).unwrap();
+    }
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("wrote 1 items, replaced 1 older versions"), "{}", out.stdout);
+    let r = old.client(&["search", "service=mail"]).await;
+    assert_eq!(r[0].split('\t').nth(2).unwrap().split(" | ").next().unwrap().split(',').count(), 2, "{r:?}");
+}
+
+/// Reading a provider asks for secrets in batches small enough for
+/// scopevault's bound on one reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_secrets_are_read_in_batches_the_provider_accepts() {
+    use scopevault::service_api::dispatch::MAX_SECRET_BYTES_PER_REPLY;
+    use scopevault::store::MAX_SECRET_BYTES;
+    let old = old_provider(VaultState::Unlocked).await;
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let mut s = slot.vault.as_mut().unwrap().scoped(&scopevault::identity::Principal::Host).unwrap();
+        s.ensure_namespace().unwrap();
+        let big = Secret::new(vec![7u8; MAX_SECRET_BYTES], "application/octet-stream");
+        for n in 0..=MAX_SECRET_BYTES_PER_REPLY / MAX_SECRET_BYTES {
+            s.create_item("login", "big", [("n".to_owned(), n.to_string())].into(), &big, false).unwrap();
+        }
+    }
+    let tmp = TempDir::new("migrate");
+    let dir = tmp.path().join("vault");
+    {
+        // Export reads the provider's default collection to plan this item.
+        let mut v = Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap();
+        let mut s = v.scoped(&scopevault::identity::Principal::Host).unwrap();
+        s.ensure_namespace().unwrap();
+        s.create_item(
+            "login",
+            "small",
+            [("k".to_owned(), "v".to_owned())].into(),
+            &Secret::new(*b"s", "text/plain"),
+            false,
+        )
+        .unwrap();
+    }
+    let pins = Pins::new();
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("wrote 1 items"), "{}", out.stdout);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -331,6 +505,20 @@ async fn restore_checks_the_backup_and_keeps_the_old_vault() {
         item(&mut v, "after");
     }
     let pins = Pins::new();
+
+    // A damaged secret record: refused, nothing changes.
+    let damaged = tmp.path().join("damaged.db");
+    std::fs::copy(&backup, &damaged).unwrap();
+    let n = rusqlite::Connection::open(&damaged)
+        .unwrap()
+        .execute("UPDATE records SET ciphertext = zeroblob(length(ciphertext)) WHERE kind = 4", [])
+        .unwrap();
+    assert_eq!(n, 1);
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["restore", damaged.to_str().unwrap()], &dir, &pins, None).await;
+    assert!(!out.ok && out.stderr.contains("not a usable backup"), "{}", out.stderr);
+    assert!(out.stderr.contains("failed authentication"), "{}", out.stderr);
+    assert_eq!(host_items(&dir, TARGET_PW).len(), 2);
 
     // Not a vault, and a wrong password: nothing changes.
     let junk = tmp.path().join("junk.db");

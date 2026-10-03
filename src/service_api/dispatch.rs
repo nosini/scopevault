@@ -67,6 +67,10 @@ pub const MAX_QUEUED_PER_CONNECTION: usize = 32;
 pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 /// Bytes of requests queued, all connections together.
 pub const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+/// Plaintext one `GetSecrets` call may return: 32 secrets of the largest
+/// size. Paths are deduplicated first, so this bounds what one request can
+/// make the daemon decrypt and hold.
+pub const MAX_SECRET_BYTES_PER_REPLY: usize = 16 * 1024 * 1024;
 /// Simultaneously served client connections. Connections whose caller could
 /// not be identified hold a slot only while they have requests queued.
 pub const MAX_CONNECTIONS: usize = 1024;
@@ -475,8 +479,8 @@ impl<R: CallerResolver> SecretService<R> {
             while let Some(q) = rx.recv().await {
                 let identified = this.handle(&q.msg, q.received, &peer).await;
                 drop(q);
-                // An unidentified caller keeps no worker or connection slot
-                // while idle; its next request starts a new worker. Closing
+                // An unidentified or unadmitted caller keeps no worker or
+                // connection slot while idle; its next request starts a new worker. Closing
                 // first means nothing sent meanwhile is lost: it is either
                 // drained here or refused to the sender, which respawns.
                 if !identified && rx.is_empty() {
@@ -518,7 +522,10 @@ impl<R: CallerResolver> SecretService<R> {
         }
     }
 
-    /// Handles one request. Returns whether the caller was identified.
+    /// Handles one request. Returns whether the connection holds a slot:
+    /// false for a caller that could not be identified or was not admitted
+    /// (its scope is at [`MAX_CONNECTIONS_PER_SCOPE`]), whose worker then
+    /// stops once idle, so it keeps no slot of [`MAX_CONNECTIONS`] either.
     async fn handle(self: &Arc<Self>, msg: &Message, received: std::time::Instant, peer: &Peer) -> bool {
         let hdr = msg.header();
         let Some(sender) = hdr.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else { return false };
@@ -535,7 +542,7 @@ impl<R: CallerResolver> SecretService<R> {
         };
         if peer.principal.get().is_none() && !self.admit(peer, &principal) {
             self.send_reply(msg, Err(Fault::limits("Too many connections for this application"))).await;
-            return true;
+            return false;
         }
         let mut call = Call { hdr, msg, sender, principal, events: Vec::new() };
         let result = self.dispatch(&mut call, received, peer).await;
