@@ -147,6 +147,11 @@ name, and it exits after two minutes.
   `scopevault-admin list portal` shows which apps have keys, without the
   keys.
 - The daemon logs to the journal: `journalctl --user -u scopevault`.
+- `scopevault-daemon --version` and `scopevault-admin --version` show the
+  version and the commit they were built from. The daemon logs the same
+  when it starts, so the journal tells you whether the running daemon is
+  the one you installed. After installing new binaries, run
+  `systemctl --user restart scopevault.service`, which locks the vault.
 
 On a desktop that never had gnome-keyring, run `scopevault-admin portal
 init` instead of importing. From then on every app without a keyring file

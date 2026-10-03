@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.2
+
+- `--version` for the daemon and the CLI, with the commit they were built
+  from. The daemon logs it at startup.
+
 ## 0.9.1
 
 - Creating a vault could delete an existing one when it raced another

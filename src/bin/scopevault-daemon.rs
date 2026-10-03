@@ -32,6 +32,7 @@ const QUEUE_CHECK: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "\
 usage: scopevault-daemon [--data-dir DIR] [--pinentry PROGRAM] [--admin-socket PATH]
+       scopevault-daemon --version
 
 Serves org.freedesktop.secrets on the session bus, the Secret portal
 backend (page.codeberg.nosini.ScopeVault.Portal), and the administrative
@@ -85,6 +86,10 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--version") {
+        println!("scopevault-daemon {}", scopevault::VERSION);
+        return ExitCode::SUCCESS;
+    }
     // Colours only on a terminal, not in files or the journal.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -181,6 +186,7 @@ fn name_taken() -> String {
 }
 
 async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
+    tracing::info!(version = scopevault::VERSION, "starting");
     let conn = zbus::connection::Builder::session()
         .map_err(|e| format!("cannot find the session bus: {e}"))?
         .build()

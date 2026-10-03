@@ -86,6 +86,8 @@ collection.
   --bus ADDRESS     bus of the other provider (default: the session bus)
   --scope SCOPE     scope to import into or export from (default: host)
   --pinentry PROG   pinentry program (default: pinentry)
+
+  --version         the version and the git commit it was built from
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
@@ -264,6 +266,10 @@ async fn run() -> ExitCode {
         args.remove(0);
     }
     let Some((cmd, rest)) = args.split_first() else { return usage() };
+    if cmd == "--version" && rest.is_empty() {
+        println!("scopevault-admin {}", scopevault::VERSION);
+        return ExitCode::SUCCESS;
+    }
     let mut rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     if matches!(cmd.as_str(), "restore" | "import" | "export") {
         let (opts, positional) = match offline::parse(&rest) {

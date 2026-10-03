@@ -479,3 +479,15 @@ async fn item_labels_in_dialogs_are_quoted_and_shortened() {
         assert!(e.vault.log().contains(shown), "{}", e.vault.log());
     }
 }
+
+#[test]
+fn version_names_the_build() {
+    let daemon = env!("CARGO_BIN_EXE_scopevault-daemon");
+    for (program, name) in [(ADMIN, "scopevault-admin"), (daemon, "scopevault-daemon")] {
+        let out = Command::new(program).arg("--version").output().unwrap();
+        assert!(out.status.success());
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert_eq!(line, format!("{name} {}", scopevault::VERSION));
+        assert!(line.starts_with(&format!("{name} {} (", env!("CARGO_PKG_VERSION"))) && line.ends_with(')'), "{line}");
+    }
+}
