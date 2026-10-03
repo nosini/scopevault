@@ -18,6 +18,10 @@
 //!
 //! The slow key derivation runs on a blocking thread and does not hold the
 //! vault lock, so other requests are not stalled by it.
+//!
+//! The vault can also be unlocked without a dialog, through a key slot
+//! ([`Unlocker::unlock_with_slot`], the login password). That serves every
+//! waiting request and closes an unlock dialog that is open.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -29,7 +33,9 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use super::pinentry::{self, PinOutcome, PinRequest, PinentryConfig, PinentryError};
-use crate::crypto::{KdfParams, VaultKey};
+use zeroize::Zeroizing;
+
+use crate::crypto::{KdfParams, Slot, VaultKey};
 use crate::identity::Scope;
 use crate::store::{StoreError, Vault};
 
@@ -109,6 +115,9 @@ pub enum UnlockOutcome {
 
 struct Flight {
     id: u64,
+    /// Shared with the dialog task; an unlock through a key slot settles the
+    /// flight from outside.
+    settle: Arc<watch::Sender<Option<UnlockOutcome>>>,
     result: watch::Receiver<Option<UnlockOutcome>>,
     waiters: Arc<AtomicUsize>,
     abort: AbortHandle,
@@ -218,13 +227,16 @@ impl Unlocker {
                 None => {
                     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                     let (tx, rx) = watch::channel(None);
+                    let settle = Arc::new(tx);
+                    let tx = settle.clone();
                     let this = self.clone();
                     let task = tokio::spawn(async move {
                         let outcome = this.dialog(&who).await;
-                        let _ = tx.send(Some(outcome));
+                        settle_once(&tx, outcome);
                     });
                     *slot = Some(Flight {
                         id,
+                        settle,
                         result: rx,
                         waiters: Arc::new(AtomicUsize::new(0)),
                         abort: task.abort_handle(),
@@ -595,6 +607,85 @@ impl Unlocker {
             Err(e) => UnlockOutcome::Failed(e.to_string()),
         }
     }
+}
+
+/// The outcome of [`Unlocker::unlock_with_slot`]. Messages contain no
+/// secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotUnlock {
+    Unlocked,
+    /// It was unlocked already; the password was not tried.
+    AlreadyUnlocked,
+    /// The password does not open the slot.
+    WrongPassword,
+    /// There is no vault, or it has no such slot.
+    NoSlot,
+    Failed(String),
+}
+
+impl Unlocker {
+    /// Unlocks the vault with `password` through `slot` (the login
+    /// password's), without a dialog. On success, waiting requests are
+    /// served and an open unlock dialog is closed. The key derivation runs
+    /// without holding the vault.
+    pub async fn unlock_with_slot(self: &Arc<Self>, slot: Slot, password: Zeroizing<Vec<u8>>) -> SlotUnlock {
+        let wrap = {
+            let s = self.vault.lock().unwrap();
+            if s.is_unlocked() {
+                return SlotUnlock::AlreadyUnlocked;
+            }
+            match s.vault.as_ref().map(|v| v.key_slot(slot)) {
+                None | Some(Ok(None)) => return SlotUnlock::NoSlot,
+                Some(Ok(Some(w))) => w,
+                Some(Err(e)) => return SlotUnlock::Failed(e.to_string()),
+            }
+        };
+        let key = match tokio::task::spawn_blocking(move || VaultKey::unwrap_for(slot, &wrap, &password)).await {
+            Ok(Ok(key)) => key,
+            Ok(Err(crate::crypto::CryptoError::Unwrap)) => return SlotUnlock::WrongPassword,
+            Ok(Err(e)) => return SlotUnlock::Failed(e.to_string()),
+            Err(e) => return SlotUnlock::Failed(e.to_string()),
+        };
+        let vault = self.vault.clone();
+        let r = tokio::task::spawn_blocking(move || match vault.lock().unwrap().vault.as_mut() {
+            Some(v) => v.unlock_with_key(key),
+            None => Err(StoreError::NotFound),
+        })
+        .await;
+        match r {
+            Ok(Ok(())) => {
+                self.unlocked_elsewhere();
+                SlotUnlock::Unlocked
+            }
+            Ok(Err(e)) => SlotUnlock::Failed(e.to_string()),
+            Err(e) => SlotUnlock::Failed(e.to_string()),
+        }
+    }
+
+    /// The vault was unlocked without the shared dialog: wakes requests
+    /// waiting for an unlock, and settles a dialog that is still open as
+    /// unlocked and closes it (aborting its task kills pinentry).
+    fn unlocked_elsewhere(&self) {
+        if let Some(f) = self.flight.lock().unwrap().as_ref()
+            && settle_once(&f.settle, UnlockOutcome::Unlocked)
+        {
+            f.abort.abort();
+            tracing::info!("unlock dialog closed: the vault was unlocked without it");
+        }
+        let _ = self.unlocked_tx.send(());
+    }
+}
+
+/// Sets a flight's outcome unless it has one already. Returns whether it
+/// did.
+fn settle_once(tx: &watch::Sender<Option<UnlockOutcome>>, outcome: UnlockOutcome) -> bool {
+    tx.send_if_modified(|v| {
+        if v.is_some() {
+            return false;
+        }
+        *v = Some(outcome);
+        true
+    })
 }
 
 /// Resolves once the vault was unlocked by anything — a dialog, an explicit

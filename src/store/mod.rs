@@ -40,7 +40,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 pub use crate::admin::AdminAuthority;
-use crate::crypto::{CryptoError, KdfParams, RecordAad, RecordCipher, VaultKey, random_array};
+use crate::crypto::{CryptoError, KdfParams, KeyWrap, RecordAad, RecordCipher, Slot, VaultKey, random_array};
 use crate::identity::{Principal, Scope};
 use crate::service_api::paths;
 use db::{Db, RawRecord, RecordId};
@@ -197,6 +197,10 @@ impl NamespaceEntry {
 }
 
 struct Unlocked {
+    /// Kept to wrap the key for another slot (the login password's)
+    /// without asking for the master password again. Anyone holding
+    /// `cipher` can read everything anyway.
+    key: VaultKey,
     cipher: RecordCipher,
     namespaces: HashMap<Scope, NamespaceEntry>,
     /// Logically locked collections (by record ID).
@@ -209,8 +213,9 @@ struct Unlocked {
 }
 
 impl Unlocked {
-    fn new(cipher: RecordCipher, namespaces: HashMap<Scope, NamespaceEntry>) -> Self {
-        Unlocked { cipher, namespaces, locked: HashSet::new(), shared_locked: HashSet::new(), staged: None }
+    fn new(key: VaultKey, namespaces: HashMap<Scope, NamespaceEntry>) -> Self {
+        let cipher = key.record_cipher();
+        Unlocked { key, cipher, namespaces, locked: HashSet::new(), shared_locked: HashSet::new(), staged: None }
     }
 }
 
@@ -397,8 +402,7 @@ impl Vault {
         // error here (another opener, an existing vault) leaves the files
         // alone.
         let db = Db::create(dir, &wrap)?;
-        let cipher = key.record_cipher();
-        Ok(Vault { db, unlocked: Some(Unlocked::new(cipher, HashMap::new())) })
+        Ok(Vault { db, unlocked: Some(Unlocked::new(key, HashMap::new())) })
     }
 
     /// Opens an existing vault, locked.
@@ -441,9 +445,8 @@ impl Vault {
         if self.unlocked.is_some() {
             return Ok(());
         }
-        let cipher = key.record_cipher();
-        let namespaces = build_index(&cipher, &self.db.load_all()?)?;
-        self.unlocked = Some(Unlocked::new(cipher, namespaces));
+        let namespaces = build_index(&key.record_cipher(), &self.db.load_all()?)?;
+        self.unlocked = Some(Unlocked::new(key, namespaces));
         Ok(())
     }
 
@@ -469,6 +472,40 @@ impl Vault {
             return Err(StoreError::Invalid("the password was changed meanwhile"));
         }
         self.db.set_key_wrap(new)
+    }
+
+    /// The wrap stored for `slot`, if any. Works while locked.
+    pub fn key_slot(&self, slot: Slot) -> Result<Option<KeyWrap>, StoreError> {
+        match slot.kind() {
+            None => self.db.key_wrap().map(Some),
+            Some(kind) => self.db.key_slot(kind),
+        }
+    }
+
+    /// Replaces the wrap of a key slot other than the master one with
+    /// `new` (`None` removes it), if `current` is still what is stored: the
+    /// slow key derivation for `new` runs without holding the vault, and a
+    /// change made meanwhile must not be overwritten.
+    pub fn replace_key_slot(
+        &mut self,
+        slot: Slot,
+        current: Option<&KeyWrap>,
+        new: Option<&KeyWrap>,
+    ) -> Result<(), StoreError> {
+        let kind = slot.kind().ok_or(StoreError::Invalid("the master password has its own wrap"))?;
+        if self.db.key_slot(kind)?.as_ref() != current {
+            return Err(StoreError::Invalid("the key slot was changed meanwhile"));
+        }
+        match new {
+            Some(w) => self.db.set_key_slot(kind, w),
+            None => self.db.delete_key_slot(kind).map(drop),
+        }
+    }
+
+    /// A copy of the vault key, to wrap it for another slot without
+    /// holding the vault. Only while unlocked.
+    pub fn vault_key(&self) -> Result<VaultKey, StoreError> {
+        Ok(self.unlocked.as_ref().ok_or(StoreError::Locked)?.key.duplicate())
     }
 
     /// Rewraps the vault key under a new password. Requires the current

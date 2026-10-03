@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use common::tempdir::TempDir;
 use rusqlite::Connection;
-use scopevault::crypto::KdfParams;
+use scopevault::crypto::{KdfParams, Slot, VaultKey};
 use scopevault::identity::{AppId, Principal};
 use scopevault::store::{Secret, StoreError, Vault};
 
@@ -358,6 +358,130 @@ fn password_change_keeps_data() {
     let c = s.collection_names()[0].clone();
     let i = s.search(&attrs(&[("n", "1")]))[0].1.clone();
     assert_eq!(&s.read_secret(&c, &i).unwrap().value[..], b"s1");
+}
+
+/// Opens `v` through its login slot, as the daemon does with the password
+/// PAM delivers.
+fn unlock_login(v: &mut Vault, pw: &[u8]) -> Result<(), StoreError> {
+    let wrap = v.key_slot(Slot::Login)?.ok_or(StoreError::NotFound)?;
+    let key = VaultKey::unwrap_for(Slot::Login, &wrap, pw)?;
+    v.unlock_with_key(key)
+}
+
+fn add_login_slot(v: &mut Vault, pw: &[u8]) {
+    let wrap = v.vault_key().unwrap().wrap_for(Slot::Login, pw, KDF).unwrap();
+    let current = v.key_slot(Slot::Login).unwrap();
+    v.replace_key_slot(Slot::Login, current.as_ref(), Some(&wrap)).unwrap();
+}
+
+#[test]
+fn the_login_slot_opens_the_vault_and_the_master_password_still_does() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    let mut v = Vault::open(&dir).unwrap();
+    assert!(v.key_slot(Slot::Login).unwrap().is_none());
+    assert!(matches!(v.vault_key(), Err(StoreError::Locked)));
+    v.unlock(PW).unwrap();
+    add_login_slot(&mut v, b"login pw");
+    drop(v);
+
+    let mut v = Vault::open(&dir).unwrap();
+    assert!(matches!(unlock_login(&mut v, PW), Err(StoreError::WrongPassword)));
+    assert!(matches!(unlock_login(&mut v, b"wrong"), Err(StoreError::WrongPassword)));
+    unlock_login(&mut v, b"login pw").unwrap();
+    let s = v.scoped(&app("org.example.A")).unwrap();
+    let c = s.collection_names()[0].clone();
+    let i = s.search(&attrs(&[("n", "1")]))[0].1.clone();
+    assert_eq!(&s.read_secret(&c, &i).unwrap().value[..], b"s1");
+    drop(v);
+
+    let mut v = Vault::open(&dir).unwrap();
+    assert!(matches!(v.unlock(b"login pw"), Err(StoreError::WrongPassword)));
+    v.unlock(PW).unwrap();
+
+    // Changing the master password leaves the login slot alone.
+    v.change_password(PW, b"new master", KDF).unwrap();
+    drop(v);
+    let mut v = Vault::open(&dir).unwrap();
+    unlock_login(&mut v, b"login pw").unwrap();
+}
+
+#[test]
+fn key_slot_changes_are_checked_against_the_stored_one() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    let mut v = Vault::open(&dir).unwrap();
+    v.unlock(PW).unwrap();
+    let key = v.vault_key().unwrap();
+    let first = key.wrap_for(Slot::Login, b"one", KDF).unwrap();
+    let second = key.wrap_for(Slot::Login, b"two", KDF).unwrap();
+    // Adding needs "no slot yet"; replacing needs the slot that is there.
+    assert!(v.replace_key_slot(Slot::Login, Some(&first), Some(&second)).is_err());
+    v.replace_key_slot(Slot::Login, None, Some(&first)).unwrap();
+    assert!(v.replace_key_slot(Slot::Login, None, Some(&second)).is_err());
+    v.replace_key_slot(Slot::Login, Some(&first), Some(&second)).unwrap();
+    assert_eq!(v.key_slot(Slot::Login).unwrap(), Some(second.clone()));
+    // The master wrap is not a key slot.
+    assert!(v.replace_key_slot(Slot::Master, None, Some(&second)).is_err());
+    v.replace_key_slot(Slot::Login, Some(&second), None).unwrap();
+    assert!(v.key_slot(Slot::Login).unwrap().is_none());
+    drop(v);
+    let mut v = Vault::open(&dir).unwrap();
+    assert!(matches!(unlock_login(&mut v, b"two"), Err(StoreError::NotFound)));
+}
+
+/// The table is added to existing vaults without a format change, and
+/// nothing else about the file changes: older builds still open the vault
+/// with the master password.
+#[test]
+fn key_slots_leave_the_format_alone() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    let master_before: Vec<u8> =
+        raw(&dir).query_row("SELECT wrapped FROM vault WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let mut v = Vault::open(&dir).unwrap();
+    v.unlock(PW).unwrap();
+    add_login_slot(&mut v, b"login pw");
+    drop(v);
+    let db = raw(&dir);
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, scopevault::store::db::SCHEMA_VERSION);
+    let master_after: Vec<u8> = db.query_row("SELECT wrapped FROM vault WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(master_before, master_after);
+    let slots: i64 = db.query_row("SELECT count(*) FROM key_slots", [], |r| r.get(0)).unwrap();
+    assert_eq!(slots, 1);
+}
+
+#[test]
+fn backups_leave_the_login_slot_out() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    let mut v = Vault::open(&dir).unwrap();
+    v.unlock(PW).unwrap();
+    add_login_slot(&mut v, b"login pw");
+    let wrapped = v.key_slot(Slot::Login).unwrap().unwrap().wrapped;
+    let copy_dir = tmp.path().join("copy");
+    std::fs::create_dir(&copy_dir).unwrap();
+    std::fs::set_permissions(&copy_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    v.backup_into(&copy_dir.join("vault.db")).unwrap();
+    // Works on a vault without slots too (nothing to drop).
+    let plain = TempDir::new("store");
+    let plain_dir = populated(&plain);
+    Vault::open(&plain_dir).unwrap().backup_into(&plain.path().join("copy.db")).unwrap();
+
+    // The daemon's umask makes this 0600; the test's does not.
+    std::fs::set_permissions(copy_dir.join("vault.db"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let bytes = std::fs::read(copy_dir.join("vault.db")).unwrap();
+    assert!(!bytes.windows(wrapped.len()).any(|w| w == &wrapped[..]), "the login wrap is still in the backup");
+    let mut c = Vault::open(&copy_dir).unwrap();
+    assert!(c.key_slot(Slot::Login).unwrap().is_none());
+    assert!(matches!(unlock_login(&mut c, b"login pw"), Err(StoreError::NotFound)));
+    c.unlock(PW).unwrap();
+    assert_eq!(c.verify_secrets().unwrap(), 4);
+    // The live vault keeps its slot.
+    drop(v);
+    let mut v = Vault::open(&dir).unwrap();
+    unlock_login(&mut v, b"login pw").unwrap();
 }
 
 #[test]

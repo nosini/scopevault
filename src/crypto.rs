@@ -4,6 +4,9 @@
 //! - A wrapping key is derived from the master password with Argon2id
 //!   (fresh 32-byte salt, recorded parameters) and wraps the vault key with
 //!   XChaCha20-Poly1305. Changing the password rewraps the same vault key.
+//! - Other key slots (the login password's) wrap the same vault key the
+//!   same way; the slot is bound into the associated data, so a wrap only
+//!   opens as the slot it was made for.
 //! - Records are sealed with XChaCha20-Poly1305 under a key derived from the
 //!   vault key with HKDF-SHA256. Nonces are 192-bit random values, which
 //!   XChaCha20 makes safe to choose at random. The associated data binds the
@@ -120,8 +123,37 @@ pub struct KeyWrap {
     pub wrapped: Vec<u8>,
 }
 
-fn wrap_aad(kdf: KdfParams, salt: &[u8; SALT_LEN]) -> Vec<u8> {
-    let mut aad = b"scopevault/vault-key\0".to_vec();
+/// Which password a key wrap belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    /// The master password, in the `vault` table.
+    Master,
+    /// The login password, in the `key_slots` table.
+    Login,
+}
+
+impl Slot {
+    /// The slot's number in the `key_slots` table. The master wrap has its
+    /// own table and no number.
+    pub fn kind(self) -> Option<u8> {
+        match self {
+            Slot::Master => None,
+            Slot::Login => Some(1),
+        }
+    }
+}
+
+fn wrap_aad(slot: Slot, kdf: KdfParams, salt: &[u8; SALT_LEN]) -> Vec<u8> {
+    // The master wrap's associated data predates key slots and must not
+    // change, or existing vaults would no longer open.
+    let mut aad = match slot.kind() {
+        None => b"scopevault/vault-key\0".to_vec(),
+        Some(kind) => {
+            let mut a = b"scopevault/key-slot\0".to_vec();
+            a.push(kind);
+            a
+        }
+    };
     aad.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
     for v in [kdf.m_kib, kdf.t, kdf.p] {
         aad.extend_from_slice(&v.to_be_bytes());
@@ -144,20 +176,32 @@ impl VaultKey {
         Ok(VaultKey(Zeroizing::new(random_array()?)))
     }
 
-    /// Wraps this key under `password` with a fresh salt.
+    /// Wraps this key under the master password `password` with a fresh
+    /// salt.
     pub fn wrap(&self, password: &[u8], kdf: KdfParams) -> Result<KeyWrap, CryptoError> {
+        self.wrap_for(Slot::Master, password, kdf)
+    }
+
+    /// Wraps this key for `slot` under `password` with a fresh salt.
+    pub fn wrap_for(&self, slot: Slot, password: &[u8], kdf: KdfParams) -> Result<KeyWrap, CryptoError> {
         let salt = random_array::<SALT_LEN>()?;
         let nonce = random_array::<NONCE_LEN>()?;
         let kek = derive_wrapping_key(password, &salt, kdf)?;
         let cipher = XChaCha20Poly1305::new((&*kek).into());
         let mut buf = self.0.to_vec();
         cipher
-            .encrypt_in_place(&XNonce::from(nonce), &wrap_aad(kdf, &salt), &mut buf)
+            .encrypt_in_place(&XNonce::from(nonce), &wrap_aad(slot, kdf, &salt), &mut buf)
             .map_err(|_| CryptoError::Unwrap)?;
         Ok(KeyWrap { kdf, salt, nonce, wrapped: buf })
     }
 
+    /// Opens the master wrap.
     pub fn unwrap(wrap: &KeyWrap, password: &[u8]) -> Result<Self, CryptoError> {
+        Self::unwrap_for(Slot::Master, wrap, password)
+    }
+
+    /// Opens a wrap made for `slot`.
+    pub fn unwrap_for(slot: Slot, wrap: &KeyWrap, password: &[u8]) -> Result<Self, CryptoError> {
         if wrap.wrapped.len() != KEY_LEN + TAG_LEN {
             return Err(CryptoError::Unwrap);
         }
@@ -165,11 +209,17 @@ impl VaultKey {
         let cipher = XChaCha20Poly1305::new((&*kek).into());
         let mut buf = Zeroizing::new(wrap.wrapped.clone());
         cipher
-            .decrypt_in_place(&XNonce::from(wrap.nonce), &wrap_aad(wrap.kdf, &wrap.salt), &mut *buf)
+            .decrypt_in_place(&XNonce::from(wrap.nonce), &wrap_aad(slot, wrap.kdf, &wrap.salt), &mut *buf)
             .map_err(|_| CryptoError::Unwrap)?;
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         key.copy_from_slice(&buf);
         Ok(VaultKey(key))
+    }
+
+    /// A second copy, for wrapping it under another password without
+    /// holding the vault. Zeroized on drop like the original.
+    pub fn duplicate(&self) -> VaultKey {
+        VaultKey(Zeroizing::new(*self.0))
     }
 
     pub fn record_cipher(&self) -> RecordCipher {
@@ -281,6 +331,28 @@ mod tests {
         let mut bad = w.clone();
         bad.wrapped.pop();
         assert_eq!(VaultKey::unwrap(&bad, b"pw").unwrap_err(), CryptoError::Unwrap);
+    }
+
+    #[test]
+    fn a_wrap_opens_only_as_its_slot() {
+        let key = VaultKey::generate().unwrap();
+        let login = key.wrap_for(Slot::Login, b"pw", FAST).unwrap();
+        assert_eq!(*VaultKey::unwrap_for(Slot::Login, &login, b"pw").unwrap().0, *key.0);
+        assert_eq!(VaultKey::unwrap(&login, b"pw").unwrap_err(), CryptoError::Unwrap);
+        let master = key.wrap(b"pw", FAST).unwrap();
+        assert_eq!(VaultKey::unwrap_for(Slot::Login, &master, b"pw").unwrap_err(), CryptoError::Unwrap);
+    }
+
+    /// Vaults made before key slots existed must keep opening: the master
+    /// wrap's associated data is fixed.
+    #[test]
+    fn master_wrap_associated_data_is_unchanged() {
+        let kdf = KdfParams { m_kib: 0x0102_0304, t: 5, p: 6 };
+        let salt = [7u8; SALT_LEN];
+        let mut expected = b"scopevault/vault-key\0\0\x01".to_vec();
+        expected.extend_from_slice(&[1, 2, 3, 4, 0, 0, 0, 5, 0, 0, 0, 6]);
+        expected.extend_from_slice(&salt);
+        assert_eq!(wrap_aad(Slot::Master, kdf, &salt), expected);
     }
 
     #[test]

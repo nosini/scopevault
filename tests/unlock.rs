@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::tempdir::TempDir;
-use scopevault::crypto::KdfParams;
+use scopevault::crypto::{KdfParams, Slot};
 use scopevault::identity::{AppId, Scope};
 use scopevault::prompts::pinentry::PinentryConfig;
-use scopevault::prompts::unlock::{MAX_ATTEMPTS, UnlockOutcome, UnlockTimings, Unlocker, VaultSlot};
+use scopevault::prompts::unlock::{MAX_ATTEMPTS, SlotUnlock, UnlockOutcome, UnlockTimings, Unlocker, VaultSlot};
 use scopevault::store::Vault;
+use zeroize::Zeroizing;
 
 struct Fixture {
     tmp: TempDir,
@@ -332,4 +333,113 @@ async fn a_retry_shows_the_error_line_again() {
         "the retried dialog shows the error line again: {log}"
     );
     assert_eq!(fx.dialogs(), 3, "wrong password, the FAIL retry, the right one");
+}
+
+impl Fixture {
+    /// Gives the (locked) vault a login slot for `login`, using the master
+    /// password `master`.
+    fn add_login_slot(&self, master: &[u8], login: &[u8]) {
+        let mut slot = self.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        v.unlock(master).unwrap();
+        let wrap = v.vault_key().unwrap().wrap_for(Slot::Login, login, KdfParams::MINIMUM).unwrap();
+        v.replace_key_slot(Slot::Login, None, Some(&wrap)).unwrap();
+        v.lock();
+    }
+
+    fn pinentry_pid(&self) -> i32 {
+        std::fs::read_to_string(self.fake().join("pid")).unwrap().trim().parse().unwrap()
+    }
+
+    async fn wait_for_getpin(&self) {
+        for _ in 0..100 {
+            if self.log().contains("GETPIN") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the dialog never asked for a password");
+    }
+}
+
+fn alive(pid: i32) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    !stat.is_empty() && stat.split_whitespace().nth(2) != Some("Z")
+}
+
+fn pw(s: &str) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(s.as_bytes().to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_login_slot_unlocks_and_closes_an_open_dialog() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::new(&["HANG"], Some(b"master"));
+    fx.add_login_slot(b"master", b"login");
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let u = fx.unlocker.clone();
+            tokio::spawn(async move { u.ensure_unlocked(&app()).await })
+        })
+        .collect();
+    fx.wait_for_getpin().await;
+    let pid = fx.pinentry_pid();
+
+    // A wrong password leaves the vault locked and the dialog open.
+    assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("master")).await, SlotUnlock::WrongPassword);
+    assert!(!fx.unlocked());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(alive(pid), "a failed slot unlock must not close the dialog");
+
+    assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("login")).await, SlotUnlock::Unlocked);
+    assert!(fx.unlocked());
+    for w in waiters {
+        let outcome = tokio::time::timeout(Duration::from_secs(5), w).await.expect("waiter not released").unwrap();
+        assert_eq!(outcome, UnlockOutcome::Unlocked);
+    }
+    let mut gone = false;
+    for _ in 0..100 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "pinentry still running after the vault was unlocked");
+    assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("login")).await, SlotUnlock::AlreadyUnlocked);
+    assert_eq!(fx.dialogs(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_unlock_serves_requests_waiting_out_the_cooldown() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::with_timings(&["CANCEL"], Some(b"master"), timings(Duration::from_secs(10)));
+    fx.add_login_slot(b"master", b"login");
+    // The cancelled dialog starts the cooldown; the request keeps waiting.
+    let u = fx.unlocker.clone();
+    let waiting = tokio::spawn(async move { u.ensure_unlocked_implicit(&app(), Instant::now()).await });
+    for _ in 0..100 {
+        if fx.log().contains("GETPIN") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished());
+    let started = Instant::now();
+    assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("login")).await, SlotUnlock::Unlocked);
+    assert_eq!(waiting.await.unwrap(), UnlockOutcome::Unlocked);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(fx.dialogs(), 1);
+}
+
+#[tokio::test]
+async fn a_slot_unlock_needs_a_vault_with_that_slot() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::new(&[], None);
+    assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("login")).await, SlotUnlock::NoSlot);
+    let fx = Fixture::new(&[], Some(b"master"));
+    assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("master")).await, SlotUnlock::NoSlot);
+    assert!(!fx.unlocked());
+    assert_eq!(fx.dialogs(), 0);
 }

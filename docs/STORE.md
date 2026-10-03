@@ -26,6 +26,19 @@ Whatever the header says, the parameters must stay within fixed bounds
 imported vault cannot make the daemon allocate unbounded memory or run for
 hours.
 
+### The login slot
+
+The vault key can also be wrapped under the login password, so that
+logging in can unlock the vault (see [LOGIN-UNLOCK.md](LOGIN-UNLOCK.md)).
+Either password opens the vault. The slot's associated data starts
+differently from the master wrap's, so neither can be passed off as the
+other, and the master wrap is unchanged from vaults without a slot.
+
+While the vault is unlocked the daemon keeps the vault key in memory, so it
+can wrap it for the login slot without asking for the master password
+again. Changing the master password leaves the slot alone, and backups
+leave it out: a backup only opens with the master password.
+
 The cryptography comes from RustCrypto's `chacha20poly1305`, `argon2`,
 `hkdf` and `sha2`, pinned to exact versions in `Cargo.toml`, plus
 `zeroize`. SQLite is bundled through `rusqlite`.
@@ -71,7 +84,11 @@ keeps a second process from opening the vault.
 ```sql
 vault     (id = 1, kdf_m, kdf_t, kdf_p, salt, nonce, wrapped)
 records   (id, kind, namespace, nonce, ciphertext, PRIMARY KEY (id, kind))
+key_slots (kind PRIMARY KEY, kdf_m, kdf_t, kdf_p, salt, nonce, wrapped)
 ```
+
+`key_slots` only appears with the first slot. Older builds don't look at
+it and still open the vault with the master password.
 
 SQLite runs with a write-ahead log, `synchronous = FULL`, `secure_delete`
 on (freed pages are overwritten), temporary data in memory only and
@@ -83,6 +100,7 @@ index changes only after the commit went through.
 Without the password, someone who has the files can tell:
 
 - that it is a scopevault vault, and its cost parameters;
+- whether it has a login slot;
 - how many namespaces, collections, items and secrets there are, and which
   records belong to the same namespace, because the namespace ID is stored
   in the clear (which app it belongs to is not);
@@ -143,6 +161,8 @@ App-supplied labels are never shown.
   one. Empty passwords are refused.
 - The key derivation runs on a separate thread without holding the vault
   lock.
+- Unlocking through the login slot serves every waiting request and closes
+  an unlock dialog that is open.
 
 ## Process hardening
 

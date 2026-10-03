@@ -1,7 +1,8 @@
 //! On-disk layout: a private directory holding one SQLite database.
 //!
-//! The database contains only the key wrap (KDF parameters, salt, wrapped
-//! key) and records of `(id, kind, namespace, nonce, ciphertext)`. IDs and
+//! The database contains only key wraps (KDF parameters, salt, wrapped
+//! key: the master password's in `vault`, others in `key_slots`) and
+//! records of `(id, kind, namespace, nonce, ciphertext)`. IDs and
 //! namespace IDs are random; labels, attributes, scope names and secrets are
 //! only ever inside ciphertext, so the database, its WAL and its shared
 //! memory file hold no plaintext. What remains visible is described in
@@ -23,6 +24,12 @@ const APPLICATION_ID: i64 = 0x5356_4c54;
 pub const SCHEMA_VERSION: i64 = 1;
 
 pub type RecordId = [u8; 16];
+
+/// Key wraps other than the master password's. Created with the first one.
+const KEY_SLOTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS key_slots (
+    kind INTEGER PRIMARY KEY CHECK (kind BETWEEN 1 AND 255),
+    kdf_m INTEGER NOT NULL, kdf_t INTEGER NOT NULL, kdf_p INTEGER NOT NULL,
+    salt BLOB NOT NULL, nonce BLOB NOT NULL, wrapped BLOB NOT NULL);";
 
 #[derive(Debug, Clone)]
 pub struct RawRecord {
@@ -237,6 +244,69 @@ impl Db {
         Ok(KeyWrap { kdf: KdfParams { m_kib, t, p }, salt, nonce, wrapped })
     }
 
+    /// The wrap stored for key slot `kind`, if any. The `key_slots` table
+    /// is created with the first slot; older vaults do not have it, and
+    /// older builds ignore it.
+    pub fn key_slot(&self, kind: u8) -> Result<Option<KeyWrap>, StoreError> {
+        if !self.has_key_slots()? {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kdf_m, kdf_t, kdf_p, salt, nonce, wrapped FROM key_slots WHERE kind = ?1",
+                params![kind],
+                |r| {
+                    Ok((
+                        r.get::<_, u32>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, u32>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, Vec<u8>>(4)?,
+                        r.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(typed)?;
+        let Some((m_kib, t, p, salt, nonce, wrapped)) = row else { return Ok(None) };
+        let salt: [u8; SALT_LEN] = salt.try_into().map_err(|_| StoreError::Corrupt("bad salt length".into()))?;
+        let nonce: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| StoreError::Corrupt("bad nonce length".into()))?;
+        Ok(Some(KeyWrap { kdf: KdfParams { m_kib, t, p }, salt, nonce, wrapped }))
+    }
+
+    fn has_key_slots(&self) -> Result<bool, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'key_slots'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Stores (or replaces) the wrap of key slot `kind`.
+    pub fn set_key_slot(&mut self, kind: u8, wrap: &KeyWrap) -> Result<(), StoreError> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(KEY_SLOTS_TABLE)?;
+        tx.execute(
+            "INSERT INTO key_slots (kind, kdf_m, kdf_t, kdf_p, salt, nonce, wrapped) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (kind) DO UPDATE SET kdf_m = excluded.kdf_m, kdf_t = excluded.kdf_t,
+                 kdf_p = excluded.kdf_p, salt = excluded.salt, nonce = excluded.nonce, wrapped = excluded.wrapped",
+            params![kind, wrap.kdf.m_kib, wrap.kdf.t, wrap.kdf.p, &wrap.salt[..], &wrap.nonce[..], &wrap.wrapped],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Removes key slot `kind`. Returns whether there was one.
+    pub fn delete_key_slot(&mut self, kind: u8) -> Result<bool, StoreError> {
+        if !self.has_key_slots()? {
+            return Ok(false);
+        }
+        let n = self.conn.execute("DELETE FROM key_slots WHERE kind = ?1", params![kind])?;
+        Ok(n > 0)
+    }
+
     pub fn set_key_wrap(&mut self, wrap: &KeyWrap) -> Result<(), StoreError> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let n = tx.execute(
@@ -299,11 +369,26 @@ impl Db {
             .transpose()
     }
 
-    /// Writes a consistent copy of the database (ciphertext and key wrap,
-    /// as stored) to `dest`, which must not exist.
+    /// Writes a consistent copy of the database (ciphertext and the master
+    /// key wrap, as stored) to `dest`, which must not exist. Other key
+    /// slots are left out, so the copy opens with the master password only.
     pub fn backup_into(&self, dest: &Path) -> Result<(), StoreError> {
-        let dest = dest.to_str().ok_or(StoreError::Invalid("backup path is not UTF-8"))?;
-        self.conn.execute("VACUUM INTO ?1", params![dest])?;
+        let name = dest.to_str().ok_or(StoreError::Invalid("backup path is not UTF-8"))?;
+        self.conn.execute("VACUUM INTO ?1", params![name])?;
+        if self.has_key_slots()? {
+            let copy = Connection::open_with_flags(
+                dest,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            // The final VACUUM rewrites the file, so no page of the dropped
+            // table is left in it.
+            copy.execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 PRAGMA secure_delete = ON;
+                 DROP TABLE key_slots;
+                 VACUUM;",
+            )?;
+        }
         Ok(())
     }
 
