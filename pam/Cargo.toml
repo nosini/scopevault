@@ -1,0 +1,24 @@
+[package]
+name = "pam_scopevault"
+version = "0.10.0"
+edition = "2024"
+description = "PAM module that hands the login password to scopevault (see docs/LOGIN-UNLOCK.md)"
+publish = false
+
+[lib]
+# The module is the cdylib; the rlib lets the tests link the same code.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+zeroize = "1.9"
+
+# A stand-in module for the tests: sets PAM_AUTHTOK and PAM_OLDAUTHTOK as
+# pam_unix would, since applications may not set them.
+[[example]]
+name = "pam_settok"
+crate-type = ["cdylib"]
+
+# Not part of the main package's workspace.
+[workspace]
+members = ["."]

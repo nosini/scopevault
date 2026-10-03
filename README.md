@@ -39,6 +39,8 @@ descriptors, which dbus-broker does.
   the vault.
 - Single items can be shared with another app, read-only or read-write.
 - A small GTK window does the same administration as the command line.
+- Optionally, the login password opens the vault at login and screen
+  unlock.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains
@@ -51,6 +53,8 @@ what it does protect and why.
 - [docs/STORE.md](docs/STORE.md): the encrypted vault.
 - [docs/INSTALL.md](docs/INSTALL.md): switching from gnome-keyring, and
   back.
+- [docs/LOGIN-UNLOCK.md](docs/LOGIN-UNLOCK.md): unlocking with the login
+  password.
 - [docs/TESTING.md](docs/TESTING.md): the tests, and checking scopevault
   against real Flatpak apps without touching your keyring.
 - [CHANGELOG.md](CHANGELOG.md)

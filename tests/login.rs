@@ -37,6 +37,12 @@ const FAST: LoginTimings = LoginTimings { min_interval: Duration::ZERO, keep_for
 /// A vault in `state`; with `slot`, it has a login slot for
 /// [`LOGIN_PASSWORD`] (and is left in `state`).
 async fn env(state: VaultState, slot: bool, timings: LoginTimings) -> Env {
+    env_in(TempDir::new("login"), state, slot, timings).await
+}
+
+/// [`env`] in `tmp`, whose `xdg` directory is the helper's
+/// `XDG_RUNTIME_DIR`.
+async fn env_in(tmp: TempDir, state: VaultState, slot: bool, timings: LoginTimings) -> Env {
     let vault = VaultFixture::new(state);
     if slot {
         let mut s = vault.unlocker.vault().lock().unwrap();
@@ -52,8 +58,8 @@ async fn env(state: VaultState, slot: bool, timings: LoginTimings) -> Env {
     let check = FakeCheck::new(LOGIN_PASSWORD);
     let login = LoginUnlock::new(vault.unlocker.clone(), check.clone(), timings);
 
-    let tmp = TempDir::new("login");
-    let socket = tmp.path().join("run").join("login");
+    let socket = tmp.path().join("xdg").join("scopevault").join("login");
+    std::fs::create_dir_all(socket.parent().unwrap().parent().unwrap()).unwrap();
     let bound = Arc::new(bind(&socket).unwrap());
     let baseline = HostBaseline::capture().unwrap();
     let uid = baseline.uid;
@@ -351,4 +357,95 @@ fn unix_chkpwd_protocol() {
     assert_eq!(check.check(b"a\0b"), Ok(false));
     assert!(check.check(&[b'x'; 513]).is_err());
     assert!(UnixChkpwd::new(tmp.path().join("missing")).unwrap().check(b"x").is_err());
+}
+
+const HELPER: &str = env!("CARGO_BIN_EXE_scopevault-pam-helper");
+
+/// Runs the helper as the PAM module does; returns its exit status and how
+/// long it took (it must not wait for the delivery).
+fn helper(xdg: &std::path::Path, mode: &str, stdin: &[u8]) -> (bool, Duration) {
+    use std::io::Write;
+    let started = std::time::Instant::now();
+    let mut child = std::process::Command::new(HELPER)
+        .arg(mode)
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", xdg)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let ok = child.wait().unwrap().success();
+    (ok, started.elapsed())
+}
+
+impl Env {
+    fn xdg(&self) -> PathBuf {
+        self.tmp.path().join("xdg")
+    }
+
+    async fn wait_unlocked(&self) -> bool {
+        for _ in 0..100 {
+            if self.vault.unlocked() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_helper_delivers_in_the_background() {
+    let e = env(VaultState::Locked, true, FAST).await;
+    let (ok, took) = helper(&e.xdg(), "--if-running", format!("{LOGIN_PASSWORD}\0").as_bytes());
+    assert!(ok);
+    assert!(took < Duration::from_millis(500), "the helper waited for the delivery: {took:?}");
+    assert!(e.wait_unlocked().await);
+    assert_eq!(e.vault.dialogs(), 0);
+
+    // A change, with both passwords NUL-terminated.
+    e.check.set("next");
+    let (ok, _) = helper(&e.xdg(), "--change", format!("{LOGIN_PASSWORD}\0next\0").as_bytes());
+    assert!(ok);
+    assert!(e.wait_for_slot("next").await);
+}
+
+/// At login the daemon starts after PAM: `--wait` keeps trying.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_helper_waits_for_the_daemon_at_login() {
+    let tmp = TempDir::new("login");
+    let xdg = tmp.path().join("xdg");
+    let (ok, took) = helper(&xdg, "--wait", LOGIN_PASSWORD.as_bytes());
+    assert!(ok && took < Duration::from_millis(500), "{took:?}");
+    // `--if-running` gives up at once instead.
+    let (ok, _) = helper(&xdg, "--if-running", b"if-running password");
+    assert!(ok);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let e = env_in(tmp, VaultState::Locked, true, FAST).await;
+    assert!(e.wait_unlocked().await, "the waiting helper did not deliver");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(e.check.calls(), 0, "the if-running helper must have given up");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_helper_refuses_bad_input_before_forking() {
+    let e = env(VaultState::Locked, true, FAST).await;
+    let long = vec![b'x'; 1025];
+    for (mode, input) in [
+        ("--wait", &b""[..]),
+        ("--wait", b"\0"),
+        ("--wait", b"two\0passwords\0"),
+        ("--change", b"only one\0"),
+        ("--change", b"a\0\0"),
+        ("--if-running", &long[..]),
+        ("--bogus", b"x"),
+    ] {
+        let (ok, _) = helper(&e.xdg(), mode, input);
+        assert!(!ok, "{mode} {input:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!e.vault.unlocked());
+    // A password of exactly the maximum length is fine.
+    let (ok, _) = helper(&e.xdg(), "--if-running", &vec![b'x'; 1024]);
+    assert!(ok);
 }

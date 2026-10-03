@@ -12,6 +12,8 @@ as before. Apps keep using the standard API and need no changes.
 
 This file explains the design and the reasons behind it. How the vault is
 encrypted is in [STORE.md](STORE.md).
+Unlocking with the login password has its own file,
+[LOGIN-UNLOCK.md](LOGIN-UNLOCK.md).
 
 ## What it adds, and what it doesn't
 

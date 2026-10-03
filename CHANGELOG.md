@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0
+
+- Logging in, or unlocking the screen, can open the vault with your login
+  password. This needs the new PAM module and helper, set up by hand as
+  root; see docs/LOGIN-UNLOCK.md.
+- The vault can hold a second key wrap for the login password, and a
+  changed login password is picked up at the next unlock.
+- `scopevault-admin login-unlock enable | disable | status`.
+
 ## 0.9.2
 
 - `--version` for the daemon and the CLI, with the commit they were built
