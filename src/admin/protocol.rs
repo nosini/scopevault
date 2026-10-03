@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::login::LoginStatus;
 use crate::store::{CollectionListing, GrantListing, ScopeSummary};
 
 /// Requests are small; this bounds what the daemon reads from a client.
@@ -69,6 +70,12 @@ pub enum Request {
     /// A copy of the encrypted database, which opens with the password
     /// current when it was made.
     Backup,
+    /// Lets the login password unlock the vault: the daemon asks for the
+    /// master password and the login password.
+    LoginUnlockEnable,
+    /// Removes the login slot. Needs the master password.
+    LoginUnlockDisable,
+    LoginUnlockStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +127,7 @@ pub enum Reply {
     Backup {
         bytes: u64,
     },
+    LoginUnlock(LoginStatus),
     Error {
         message: String,
     },

@@ -53,6 +53,12 @@ Commands (the daemon must be running):
                               or the grantee
   backup FILE                 write an encrypted copy of the vault to FILE;
                               it opens with the current master password
+                              (not with the login password)
+  login-unlock enable         let the login password unlock the vault (with
+                              the PAM module installed); asks for the master
+                              password and the login password
+  login-unlock disable        stop that; asks for the master password
+  login-unlock status         whether the login password unlocks the vault
 
 With --json as their last argument, these commands print the daemon's
 reply as one JSON object on standard output, errors included
@@ -190,6 +196,11 @@ fn date(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+fn date_time(secs: u64) -> String {
+    let s = secs % 86_400;
+    format!("{} {:02}:{:02}:{:02} UTC", date(secs), s / 3600, s / 60 % 60, s % 60)
+}
+
 fn print_reply(reply: &Reply, json: bool) -> ExitCode {
     if json {
         println!("{}", serde_json::to_string_pretty(reply).expect("serializable"));
@@ -250,6 +261,12 @@ fn print_reply(reply: &Reply, json: bool) -> ExitCode {
             }
         }
         Reply::Shared { grant } => println!("grant {grant}"),
+        Reply::LoginUnlock(s) => {
+            println!("login unlock:  {}", if s.enabled { "enabled" } else { "not enabled" });
+            let when = |t: Option<u64>| t.map_or_else(|| "not since the daemon started".to_owned(), date_time);
+            println!("last unlock:   {}", when(s.last_unlock));
+            println!("last rewrap:   {}", when(s.last_rewrap));
+        }
         Reply::Backup { .. } => {}
     }
     ExitCode::SUCCESS
@@ -326,6 +343,9 @@ async fn run() -> ExitCode {
             Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: true }
         }
         ("unshare", [grant]) => Request::Unshare { grant: grant.to_string() },
+        ("login-unlock", ["enable"]) => Request::LoginUnlockEnable,
+        ("login-unlock", ["disable"]) => Request::LoginUnlockDisable,
+        ("login-unlock", ["status"]) => Request::LoginUnlockStatus,
         ("grants", []) => Request::Grants { scope: None },
         ("grants", [scope]) => Request::Grants { scope: Some(scope.to_string()) },
         ("backup", [file]) => {

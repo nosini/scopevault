@@ -26,6 +26,7 @@ use super::AdminAuthority;
 use super::peer::peer_credentials;
 use super::protocol::{CANCELLED, MAX_LINE, Reply, Request, Status, VaultState, read_line, write_json};
 use crate::identity::{BusCredentials, IdentityError, Principal, Scope};
+use crate::login::LoginUnlock;
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
 use crate::service_api::dispatch::GrantChange;
 use crate::store::{SHARED_COLLECTION, StoreError, is_valid_portal_app_id};
@@ -65,6 +66,7 @@ pub struct AdminServer {
     classify: PeerClassifier,
     unlocker: Arc<Unlocker>,
     control: Arc<dyn ServiceControl>,
+    login: Arc<LoginUnlock>,
     slots: Arc<Semaphore>,
 }
 
@@ -144,8 +146,13 @@ fn parse_scope(s: &str) -> Result<Scope, Reply> {
 }
 
 impl AdminServer {
-    pub fn new(classify: PeerClassifier, unlocker: Arc<Unlocker>, control: Arc<dyn ServiceControl>) -> Arc<Self> {
-        Arc::new(AdminServer { classify, unlocker, control, slots: Arc::new(Semaphore::new(MAX_CLIENTS)) })
+    pub fn new(
+        classify: PeerClassifier,
+        unlocker: Arc<Unlocker>,
+        control: Arc<dyn ServiceControl>,
+        login: Arc<LoginUnlock>,
+    ) -> Arc<Self> {
+        Arc::new(AdminServer { classify, unlocker, control, login, slots: Arc::new(Semaphore::new(MAX_CLIENTS)) })
     }
 
     /// Serves connections until the process ends.
@@ -458,6 +465,13 @@ impl AdminServer {
                 Ok(Reply::Grants { grants: v.grants(authority, scope.as_ref()).map_err(store_error)? })
             }
             Request::Backup => unreachable!("handled before"),
+            Request::LoginUnlockEnable => {
+                self.login.enable().await.map(|message| Reply::Done { message }).map_err(Reply::error)
+            }
+            Request::LoginUnlockDisable => {
+                self.login.disable().await.map(|message| Reply::Done { message }).map_err(Reply::error)
+            }
+            Request::LoginUnlockStatus => Ok(Reply::LoginUnlock(self.login.status())),
             Request::PortalInit => {
                 self.unlocked().await?;
                 let mut slot = vault.lock().unwrap();

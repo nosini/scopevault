@@ -6,8 +6,8 @@ screen, a small PAM module hands the password to scopevault, and the vault
 opens without a dialog. The master password keeps working everywhere.
 
 So far only part of it exists: the login slot
-and unlocking through it. The socket that receives the password and the
-PAM module come next.
+and the daemon's login socket. The PAM module that hands over the password
+comes next.
 
 Logins that don't involve a password, like fingerprint, smartcard or
 automatic login, still show the usual dialog, and so do SSH and console
@@ -68,3 +68,44 @@ the vault.
 - `change-password` only changes the master password.
 - An attacker who copies the live vault file can attack whichever of the
   two passwords is weaker.
+
+## The daemon's login socket
+
+The daemon listens on `$XDG_RUNTIME_DIR/scopevault/login`, next to the
+admin socket. It is a separate socket because the admin protocol promises
+that no password ever crosses it. The framing is binary, so passwords are
+never copied through a JSON parser.
+
+A delivered password that opens the slot unlocks the vault and closes any
+unlock dialog that is open. One that doesn't is kept, wiped after at most
+five minutes, in case the slot is out of date: once the vault is opened
+with the master password, the daemon checks it with `unix_chkpwd`, and if
+it is the current login password, wraps the slot under it. A password
+change sends the old and the new password; the slot is rewrapped if the
+old one opens it and `unix_chkpwd` confirms the new one.
+
+`unix_chkpwd` is pam_unix's small helper that checks the calling user's
+own password; it is installed with just enough privilege to read
+`/etc/shadow`. The daemon runs it as your user, by its full path
+`/usr/sbin/unix_chkpwd`, with the password on its standard input. It
+refuses to run from a terminal, so trying it by hand needs a pipe:
+`printf 'wrong\0' | /usr/sbin/unix_chkpwd $USER nonull; echo $?` prints
+7 for a wrong password. It only knows accounts in `/etc/shadow`, not SSSD,
+LDAP or systemd-homed. If it can't give an answer, nothing is repaired and
+no dialog opens; `scopevault-admin login-unlock enable` sets the slot
+again.
+
+Who may connect: same user, not a Flatpak, and the same namespaces and
+root as the daemon. Unlike the admin socket, the SELinux label is not
+compared, because the helper runs in GDM's or `passwd`'s domain. That is
+acceptable here because the socket can only unlock with a correct password
+and only rewrap with the current login password.
+
+Only one request is handled at a time, with at most one key derivation per
+five seconds. That limits the memory and CPU a caller can use, and makes
+guessing through the socket no faster than attacking a copy of the file.
+
+`scopevault-admin login-unlock enable` adds the slot (it asks for the
+master password in the daemon's dialog, then for the login password),
+`disable` removes it, and `status` shows whether there is one and when it
+last opened the vault.

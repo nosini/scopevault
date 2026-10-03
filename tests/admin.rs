@@ -15,9 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use common::tempdir::TempDir;
-use common::{PASSWORD, TestBus, VaultFixture, VaultState};
+use common::{FakeCheck, LOGIN_PASSWORD, PASSWORD, TestBus, VaultFixture, VaultState};
 use scopevault::admin::server::{AdminServer, BoundSocket, PeerClassifier, bind};
 use scopevault::identity::{BusIdentityResolver, Classifier, HostBaseline, IdentityPolicy, InstanceRecords};
+use scopevault::login::{LoginTimings, LoginUnlock};
 use scopevault::service_api::SecretService;
 use scopevault::store::Vault;
 
@@ -71,7 +72,12 @@ async fn env(state: VaultState) -> Env {
         let r = resolver.clone();
         Arc::new(move |creds| r.classifier().classify(creds).result)
     };
-    let server = AdminServer::new(classify, vault.unlocker.clone(), service);
+    let login = LoginUnlock::new(
+        vault.unlocker.clone(),
+        FakeCheck::new(LOGIN_PASSWORD),
+        LoginTimings { min_interval: std::time::Duration::ZERO, keep_for_repair: std::time::Duration::from_secs(60) },
+    );
+    let server = AdminServer::new(classify, vault.unlocker.clone(), service, login);
     let b = bound.clone();
     tokio::spawn(async move { server.serve(&b.listener).await });
     Env { bus, vault, tmp, socket, _bound: bound, next_instance: AtomicU32::new(500) }
@@ -490,4 +496,57 @@ fn version_names_the_build() {
         assert_eq!(line, format!("{name} {}", scopevault::VERSION));
         assert!(line.starts_with(&format!("{name} {} (", env!("CARGO_PKG_VERSION"))) && line.ends_with(')'), "{line}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_unlock_enable_status_disable() {
+    let e = env(VaultState::Locked).await;
+    let json = |out: &Out| -> serde_json::Value {
+        serde_json::from_str(&out.stdout).unwrap_or_else(|err| panic!("{err}: {}{}", out.stdout, out.stderr))
+    };
+    let v = json(&e.admin(&Who::Host, &["login-unlock", "status", "--json"]).await);
+    assert_eq!((v["reply"].as_str(), v["enabled"].as_bool()), (Some("login-unlock"), Some(false)), "{v}");
+    assert!(!e.vault.unlocked(), "status works while locked");
+
+    // Unlock, confirm with the master password, then the login password;
+    // a password the checker refuses is not stored.
+    e.vault.set_pins(&[PASSWORD, PASSWORD, "not it"]);
+    let out = e.admin(&Who::Host, &["login-unlock", "enable"]).await;
+    assert!(out.stderr.contains("that is not your login password"), "{}{}", out.stdout, out.stderr);
+    let v = json(&e.admin(&Who::Host, &["login-unlock", "status", "--json"]).await);
+    assert_eq!(v["enabled"], false);
+    // A cancelled confirmation stops it before the login password is asked.
+    e.vault.set_pins(&["CANCEL"]);
+    let before = e.vault.dialogs();
+    let out = e.admin(&Who::Host, &["login-unlock", "enable"]).await;
+    assert!(out.stderr.contains(scopevault::admin::protocol::CANCELLED), "{}", out.stderr);
+    assert_eq!(e.vault.dialogs(), before + 1);
+
+    e.vault.set_pins(&[PASSWORD, LOGIN_PASSWORD]);
+    let out = e.admin(&Who::Host, &["login-unlock", "enable"]).await;
+    assert_eq!(out.stdout.trim(), "your login password now unlocks the keyring", "{}", out.stderr);
+    let out = e.admin(&Who::Host, &["login-unlock", "status"]).await;
+    assert!(out.stdout.contains("login unlock:  enabled"), "{}", out.stdout);
+    {
+        let slot = e.vault.unlocker.vault().lock().unwrap();
+        let wrap = slot.vault.as_ref().unwrap().key_slot(scopevault::crypto::Slot::Login).unwrap().unwrap();
+        scopevault::crypto::VaultKey::unwrap_for(scopevault::crypto::Slot::Login, &wrap, LOGIN_PASSWORD.as_bytes())
+            .expect("the slot opens with the login password");
+    }
+
+    // Sandboxes get nothing.
+    for args in [&["login-unlock", "disable"][..], &["login-unlock", "enable"], &["login-unlock", "status"]] {
+        let out = e.admin(&Who::Sandbox("ok", A), args).await;
+        assert!(out.stderr.contains(DENIED), "{args:?}: {}", out.stderr);
+    }
+
+    e.vault.set_pins(&["CANCEL"]);
+    assert!(!e.admin(&Who::Host, &["login-unlock", "disable"]).await.ok);
+    assert_eq!(json(&e.admin(&Who::Host, &["login-unlock", "status", "--json"]).await)["enabled"], true);
+    e.vault.set_pins(&[PASSWORD]);
+    let out = e.admin(&Who::Host, &["login-unlock", "disable"]).await;
+    assert_eq!(out.stdout.trim(), "your login password no longer unlocks the keyring", "{}", out.stderr);
+    assert_eq!(json(&e.admin(&Who::Host, &["login-unlock", "status", "--json"]).await)["enabled"], false);
+    let out = e.admin(&Who::Host, &["login-unlock", "disable"]).await;
+    assert_eq!(out.stdout.trim(), "login unlock was not enabled");
 }

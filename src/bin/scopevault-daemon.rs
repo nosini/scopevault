@@ -4,7 +4,8 @@
 //! vault, the Secret portal backend (page.codeberg.nosini.ScopeVault.Portal,
 //! the `org.freedesktop.impl.portal.Secret` backend for xdg-desktop-portal)
 //! from a second bus connection, and the administrative interface
-//! (scopevault-admin) on a Unix socket. It refuses to start if another
+//! (scopevault-admin) and the login socket (scopevault-pam-helper) on Unix
+//! sockets. It refuses to start if another
 //! process owns one of the names; it never replaces a running keyring. It
 //! exits when a bus connection closes, because identity caches are valid
 //! for one bus connection only.
@@ -18,6 +19,9 @@ use scopevault::admin::default_data_dir;
 use scopevault::admin::server::{AdminServer, PeerClassifier, default_socket_path};
 use scopevault::crypto::KdfParams;
 use scopevault::identity::{BusIdentityResolver, Classifier, IdentityPolicy};
+use scopevault::login::chkpwd::{DEFAULT_PROGRAM, UnixChkpwd};
+use scopevault::login::server::{LoginServer, relaxed_classifier};
+use scopevault::login::{LoginTimings, LoginUnlock};
 use scopevault::portal_backend::{BACKEND_NAME, PortalBackend};
 use scopevault::prompts::pinentry::PinentryConfig;
 use scopevault::prompts::unlock::{Unlocker, VaultSlot};
@@ -32,16 +36,22 @@ const QUEUE_CHECK: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "\
 usage: scopevault-daemon [--data-dir DIR] [--pinentry PROGRAM] [--admin-socket PATH]
+                         [--login-socket PATH] [--unix-chkpwd PROGRAM]
        scopevault-daemon --version
 
 Serves org.freedesktop.secrets on the session bus, the Secret portal
-backend (page.codeberg.nosini.ScopeVault.Portal), and the administrative
-interface (scopevault-admin) on a Unix socket.
+backend (page.codeberg.nosini.ScopeVault.Portal), the administrative
+interface (scopevault-admin) on a Unix socket, and the login socket, where
+scopevault-pam-helper delivers the login password.
 
   --data-dir DIR        vault directory (default: $XDG_DATA_HOME/scopevault)
   --pinentry PROGRAM    pinentry program for password dialogs (default: pinentry)
   --admin-socket PATH   administrative socket
                         (default: $XDG_RUNTIME_DIR/scopevault/admin)
+  --login-socket PATH   login socket (default: `login` beside the
+                        administrative socket)
+  --unix-chkpwd PROGRAM pam_unix's helper that checks the login password
+                        (default: /usr/sbin/unix_chkpwd)
 
 Logging is controlled by RUST_LOG (for example RUST_LOG=info).
 ";
@@ -50,12 +60,16 @@ struct Options {
     data_dir: PathBuf,
     pinentry: PathBuf,
     admin_socket: PathBuf,
+    login_socket: PathBuf,
+    unix_chkpwd: PathBuf,
 }
 
 fn parse_args() -> Result<Options, String> {
     let mut data_dir = None;
     let mut pinentry = PathBuf::from("pinentry");
     let mut admin_socket = None;
+    let mut login_socket = None;
+    let mut unix_chkpwd = PathBuf::from(DEFAULT_PROGRAM);
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         match a.to_str() {
@@ -64,6 +78,10 @@ fn parse_args() -> Result<Options, String> {
             Some("--admin-socket") => {
                 admin_socket = Some(PathBuf::from(args.next().ok_or("--admin-socket needs a value")?))
             }
+            Some("--login-socket") => {
+                login_socket = Some(PathBuf::from(args.next().ok_or("--login-socket needs a value")?))
+            }
+            Some("--unix-chkpwd") => unix_chkpwd = PathBuf::from(args.next().ok_or("--unix-chkpwd needs a value")?),
             Some("-h" | "--help") => return Err(String::new()),
             _ => return Err(format!("unknown argument {a:?}")),
         }
@@ -82,7 +100,11 @@ fn parse_args() -> Result<Options, String> {
     if !admin_socket.is_absolute() {
         return Err("--admin-socket must be an absolute path".into());
     }
-    Ok(Options { data_dir, pinentry, admin_socket })
+    let login_socket = login_socket.unwrap_or_else(|| admin_socket.with_file_name("login"));
+    if !login_socket.is_absolute() || login_socket == admin_socket {
+        return Err("--login-socket must be an absolute path other than the administrative socket".into());
+    }
+    Ok(Options { data_dir, pinentry, admin_socket, login_socket, unix_chkpwd })
 }
 
 fn main() -> ExitCode {
@@ -267,13 +289,24 @@ async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
         let r = resolver.clone();
         Arc::new(move |creds| r.classifier().classify(creds).result)
     };
-    let admin = AdminServer::new(classify, unlocker, service);
+    let checker = UnixChkpwd::new(opts.unix_chkpwd.clone())?;
+    let login = LoginUnlock::new(unlocker.clone(), Arc::new(checker), LoginTimings::default());
+    let admin = AdminServer::new(classify, unlocker, service, login.clone());
     tracing::info!(socket = %opts.admin_socket.display(), "administrative interface ready");
+    let login_bound = scopevault::admin::server::bind(&opts.login_socket)
+        .map_err(|e| format!("cannot create the login socket {}: {e}", opts.login_socket.display()))?;
+    let login_classify: PeerClassifier = {
+        let relaxed = Arc::new(relaxed_classifier(resolver.classifier()));
+        Arc::new(move |creds| relaxed.classify(creds).result)
+    };
+    let login_server = LoginServer::new(login_classify, login);
+    tracing::info!(socket = %opts.login_socket.display(), "login socket ready");
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("cannot handle SIGTERM: {e}"))?;
     tokio::select! {
         () = admin.serve(&socket.listener) => Ok(()),
+        () = login_server.serve(&login_bound.listener) => Ok(()),
         () = watch_queue(&dbus) => Ok(()),
         r = serving => match r {
             Ok(()) => Err("the session bus connection closed".into()),

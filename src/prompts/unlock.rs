@@ -397,6 +397,31 @@ impl Unlocker {
         UnlockOutcome::Cancelled
     }
 
+    /// The key derivation cost for new wraps.
+    pub fn kdf(&self) -> KdfParams {
+        self.new_vault_kdf
+    }
+
+    /// Asks for a password that is not the master password (the login
+    /// password, to set up the login slot) in the daemon's dialog. The
+    /// caller checks it.
+    pub async fn ask_password(&self, title: &str, description: &str) -> Result<Zeroizing<String>, UnlockOutcome> {
+        let _gate = self.dialog_gate.lock().await;
+        let req = PinRequest {
+            title: title.into(),
+            description: description.into(),
+            prompt: "Password:".into(),
+            error: None,
+            repeat: None,
+        };
+        match pinentry::ask(&self.pinentry, &req).await {
+            Ok(PinOutcome::Entered(p)) if p.is_empty() => Err(UnlockOutcome::Cancelled),
+            Ok(PinOutcome::Entered(p)) => Ok(p),
+            Ok(PinOutcome::Cancelled) => Err(UnlockOutcome::Cancelled),
+            Err(e) => Err(UnlockOutcome::Failed(e.to_string())),
+        }
+    }
+
     /// Asks for the current password, then a new one (twice), and rewraps
     /// the vault key. The passwords go only to this process. The slow key
     /// derivations run without holding the vault.

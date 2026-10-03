@@ -100,6 +100,46 @@ pub mod service;
 /// Password of vaults made by [`VaultFixture`].
 pub const PASSWORD: &str = "correct horse";
 
+/// The login password [`FakeCheck::new`] accepts.
+pub const LOGIN_PASSWORD: &str = "login password";
+
+/// Stands in for `unix_chkpwd`: accepts one password, or cannot check at
+/// all (`broken`). Counts its calls.
+pub struct FakeCheck {
+    pub accept: std::sync::Mutex<Vec<u8>>,
+    pub broken: std::sync::atomic::AtomicBool,
+    pub calls: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeCheck {
+    pub fn new(accept: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(FakeCheck {
+            accept: std::sync::Mutex::new(accept.as_bytes().to_vec()),
+            broken: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// The login password changes (as `passwd` would change it).
+    pub fn set(&self, accept: &str) {
+        *self.accept.lock().unwrap() = accept.as_bytes().to_vec();
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl scopevault::login::PasswordCheck for FakeCheck {
+    fn check(&self, password: &[u8]) -> Result<bool, String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the checker is broken".into());
+        }
+        Ok(*self.accept.lock().unwrap() == password)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultState {
     Unlocked,
