@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0
+
+- A graphical front end, `scopevault-gui`, for the administration tasks.
+- Every `scopevault-admin` command that talks to the daemon accepts
+  `--json`, and errors come back as JSON too.
+
 ## 0.8.1
 
 - At login, gnome-shell can dismiss the unlock dialog before showing it.

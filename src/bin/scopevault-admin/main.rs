@@ -32,7 +32,7 @@ Commands (the daemon must be running):
                               before it could be answered (within 5 s)
   change-password             change the master password (asked in a dialog)
   scopes                      scopes that have data, with their sizes
-  list SCOPE [--json]         collections and items of SCOPE (no secrets)
+  list SCOPE                  collections and items of SCOPE (no secrets)
   move FROM TO ITEM...        move items (COLLECTION/ITEM, as shown by list)
                               from scope FROM into TO's default collection;
                               asks for the master password
@@ -49,10 +49,14 @@ Commands (the daemon must be running):
                               list) of scope FROM; TO sees the item in its
                               `Shared` collection. Asks for the master password
   unshare GRANT               revoke a grant (its ID as shown by grants)
-  grants [SCOPE] [--json]     list grants, or those where SCOPE is the owner
+  grants [SCOPE]              list grants, or those where SCOPE is the owner
                               or the grantee
   backup FILE                 write an encrypted copy of the vault to FILE;
                               it opens with the current master password
+
+With --json as their last argument, these commands print the daemon's
+reply as one JSON object on standard output, errors included
+(an error is a reply of type `error` too).
 
 Commands that need the daemon stopped (they open the vault themselves and
 ask for its password with pinentry):
@@ -85,6 +89,14 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// [`fail`], or with `--json` an error reply on standard output.
+fn fail_as(json: bool, msg: impl std::fmt::Display) -> ExitCode {
+    if json {
+        return print_reply(&Reply::error(msg.to_string()), true);
+    }
+    fail(msg)
+}
+
 fn usage() -> ExitCode {
     eprint!("{USAGE}");
     ExitCode::from(2)
@@ -99,14 +111,14 @@ const UNLOCK_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// `unlock`. With `wait` (the login unit), a dialog cancelled within
 /// [`QUICK_CANCEL`] is opened again until the wait has passed; without it,
 /// a cancel is final.
-async fn unlock(socket: &PathBuf, wait: Option<Duration>) -> ExitCode {
+async fn unlock(socket: &PathBuf, wait: Option<Duration>, json: bool) -> ExitCode {
     let deadline = wait.map(|w| Instant::now() + w);
     loop {
         let asked = Instant::now();
         let remaining = deadline.map(|d| d.saturating_duration_since(asked));
         let reply = match request(socket, &Request::Unlock, remaining).await {
             Ok((reply, _)) => reply,
-            Err(e) => return fail(e),
+            Err(e) => return fail_as(json, e),
         };
         let quick_cancel =
             matches!(&reply, Reply::Error { message } if message == CANCELLED) && asked.elapsed() < QUICK_CANCEL;
@@ -119,7 +131,7 @@ async fn unlock(socket: &PathBuf, wait: Option<Duration>) -> ExitCode {
             tokio::time::sleep(UNLOCK_RETRY_DELAY).await;
             continue;
         }
-        return print_reply(&reply, false);
+        return print_reply(&reply, json);
     }
 }
 
@@ -248,7 +260,7 @@ async fn run() -> ExitCode {
         args.remove(0);
     }
     let Some((cmd, rest)) = args.split_first() else { return usage() };
-    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let mut rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     if matches!(cmd.as_str(), "restore" | "import" | "export") {
         let (opts, positional) = match offline::parse(&rest) {
             Ok(p) => p,
@@ -264,8 +276,12 @@ async fn run() -> ExitCode {
             _ => usage(),
         };
     }
+    let json = rest.last() == Some(&"--json");
+    if json {
+        rest.pop();
+    }
     let Some(socket) = socket.or_else(default_socket_path) else {
-        return fail("XDG_RUNTIME_DIR is not set; use --socket");
+        return fail_as(json, "XDG_RUNTIME_DIR is not set; use --socket");
     };
     // `unlock --wait` exists for the login unit: the daemon's socket may not
     // be there yet.
@@ -278,59 +294,56 @@ async fn run() -> ExitCode {
             },
             _ => return usage(),
         };
-        return unlock(&socket, wait).await;
+        return unlock(&socket, wait, json).await;
     }
-    let (req, json) = match (cmd.as_str(), rest.as_slice()) {
-        ("status", []) => (Request::Status, false),
-        ("lock", []) => (Request::Lock, false),
-        ("change-password", []) => (Request::ChangePassword, false),
-        ("scopes", []) => (Request::Scopes, false),
-        ("scopes", ["--json"]) => (Request::Scopes, true),
-        ("list", [scope]) => (Request::List { scope: scope.to_string() }, false),
-        ("list", [scope, "--json"]) => (Request::List { scope: scope.to_string() }, true),
+    let req = match (cmd.as_str(), rest.as_slice()) {
+        ("status", []) => Request::Status,
+        ("lock", []) => Request::Lock,
+        ("change-password", []) => Request::ChangePassword,
+        ("scopes", []) => Request::Scopes,
+        ("list", [scope]) => Request::List { scope: scope.to_string() },
         ("move", [from, to, items @ ..]) if !items.is_empty() => {
             let items = items.iter().map(|s| s.to_string()).collect();
-            (Request::Move { from: from.to_string(), to: to.to_string(), items }, false)
+            Request::Move { from: from.to_string(), to: to.to_string(), items }
         }
-        ("reset-scope", [scope]) => (Request::ResetScope { scope: scope.to_string() }, false),
-        ("portal", ["init"]) => (Request::PortalInit, false),
-        ("portal", ["new-key", app_id]) => (Request::PortalNewKey { app_id: app_id.to_string() }, false),
+        ("reset-scope", [scope]) => Request::ResetScope { scope: scope.to_string() },
+        ("portal", ["init"]) => Request::PortalInit,
+        ("portal", ["new-key", app_id]) => Request::PortalNewKey { app_id: app_id.to_string() },
         ("share", [from, item, to]) => {
-            (Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: false }, false)
+            Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: false }
         }
         ("share", [from, item, to, "--write"]) => {
-            (Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: true }, false)
+            Request::Share { from: from.to_string(), item: item.to_string(), to: to.to_string(), write: true }
         }
-        ("unshare", [grant]) => (Request::Unshare { grant: grant.to_string() }, false),
-        ("grants", []) => (Request::Grants { scope: None }, false),
-        ("grants", ["--json"]) => (Request::Grants { scope: None }, true),
-        ("grants", [scope]) => (Request::Grants { scope: Some(scope.to_string()) }, false),
-        ("grants", [scope, "--json"]) => (Request::Grants { scope: Some(scope.to_string()) }, true),
+        ("unshare", [grant]) => Request::Unshare { grant: grant.to_string() },
+        ("grants", []) => Request::Grants { scope: None },
+        ("grants", [scope]) => Request::Grants { scope: Some(scope.to_string()) },
         ("backup", [file]) => {
             // Create the file first: nothing is asked of the daemon if it
             // cannot be written, and an existing file is never replaced.
             let path = PathBuf::from(file);
             let mut out = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
                 Ok(f) => f,
-                Err(e) => return fail(format!("cannot create {}: {e}", path.display())),
+                Err(e) => return fail_as(json, format!("cannot create {}: {e}", path.display())),
             };
             let (reply, data) = match request(&socket, &Request::Backup, None).await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = std::fs::remove_file(&path);
-                    return fail(e);
+                    return fail_as(json, e);
                 }
             };
             if let Reply::Error { message } = reply {
                 let _ = std::fs::remove_file(&path);
-                return fail(message);
+                return fail_as(json, message);
             }
             if let Err(e) = out.write_all(&data).and_then(|()| out.sync_all()) {
                 let _ = std::fs::remove_file(&path);
-                return fail(format!("cannot write {}: {e}", path.display()));
+                return fail_as(json, format!("cannot write {}: {e}", path.display()));
             }
-            println!("wrote {} ({} bytes); it opens with the current master password", path.display(), data.len());
-            return ExitCode::SUCCESS;
+            let message =
+                format!("wrote {} ({} bytes); it opens with the current master password", path.display(), data.len());
+            return print_reply(&Reply::Done { message }, json);
         }
         ("-h" | "--help", []) => {
             print!("{USAGE}");
@@ -340,7 +353,7 @@ async fn run() -> ExitCode {
     };
     match request(&socket, &req, None).await {
         Ok((reply, _)) => print_reply(&reply, json),
-        Err(e) => fail(e),
+        Err(e) => fail_as(json, e),
     }
 }
 

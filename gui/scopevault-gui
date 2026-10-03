@@ -1,0 +1,929 @@
+#!/usr/bin/python3
+"""Graphical front end for scopevault-admin.
+
+A host program only: the daemon's administrative socket refuses sandboxed
+callers, so this must never be packaged as a Flatpak. It runs
+`scopevault-admin ... --json` for every request and never asks for or
+handles a password: the daemon asks in its own dialog.
+
+Labels and attributes are chosen by applications, so they are shown as
+plain text only (never Pango markup), with control and bidirectional
+formatting characters replaced.
+
+Every admin request is logged by the daemon, and listing scopes, items or
+grants of a locked vault opens the unlock dialog. So nothing is polled:
+the window reads the status first, lists only an unlocked vault, and
+refreshes after each operation or on request. The daemon serves at most
+four clients at once; reads run one after another, and only one operation
+runs at a time.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from collections.abc import Callable
+from typing import Any
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk, Pango
+
+APP_ID = "page.codeberg.nosini.ScopeVault"
+# The daemon's error message for a cancelled password dialog
+# (src/admin/protocol.rs, CANCELLED).
+CANCELLED = "cancelled in the password dialog"
+# What scopevault-admin accepts as a scope; the daemon checks app IDs
+# exactly. This keeps typos and anything resembling an option out of the
+# argument list.
+SCOPE_RE = re.compile(r"(host|portal|flatpak/[A-Za-z_][A-Za-z0-9_.-]{0,254})")
+OTHER_SCOPE = "Other scope…"
+MAX_SHOWN = 300
+
+Reply = dict[str, Any]
+
+# Characters that could make one label look like another: bidirectional
+# overrides, isolates and marks.
+BIDI = set("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def plain(text: str, limit: int = MAX_SHOWN) -> str:
+    """App-controlled text, made safe to show in a plain-text label."""
+    out = []
+    for c in text:
+        if c in "\n\t\r":
+            out.append(" ")
+        elif c in BIDI or unicodedata.category(c) == "Cc":
+            out.append("\ufffd")
+        else:
+            out.append(c)
+    s = "".join(out)
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def when(secs: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(secs))
+
+
+def text_row(title: str, subtitle: str = "") -> Adw.ActionRow:
+    """A row that shows its title and subtitle as plain text."""
+    row = Adw.ActionRow(use_markup=False)
+    row.set_title(title)
+    if subtitle:
+        row.set_subtitle(subtitle)
+    return row
+
+
+def text_label(text: str, *classes: str) -> Gtk.Label:
+    label = Gtk.Label(use_markup=False, xalign=0, wrap=True, selectable=True)
+    label.set_text(text)
+    for c in classes:
+        label.add_css_class(c)
+    return label
+
+
+def later(fn: Callable[[], None]) -> None:
+    """Runs `fn` from the main loop, as an asynchronous result would."""
+
+    def once() -> bool:
+        fn()
+        return GLib.SOURCE_REMOVE
+
+    GLib.idle_add(once)
+
+
+class Admin:
+    """Runs scopevault-admin with --json; every call ends with one reply."""
+
+    def __init__(self, program: str | None, socket: str | None) -> None:
+        self.program = program
+        self.socket = socket
+
+    def run(self, args: list[str], done: Callable[[Reply], None]) -> None:
+        if self.program is None:
+            later(lambda: done(error("scopevault-admin was not found")))
+            return
+        argv = [self.program]
+        if self.socket:
+            argv += ["--socket", self.socket]
+        argv += args + ["--json"]
+        flags = Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        try:
+            proc = Gio.Subprocess.new(argv, flags)
+        except GLib.Error as e:
+            message = f"cannot run {self.program}: {e.message}"
+            later(lambda: done(error(message)))
+            return
+
+        def finished(p: Gio.Subprocess, result: Gio.AsyncResult) -> None:
+            try:
+                _, out, err = p.communicate_utf8_finish(result)
+            except GLib.Error as e:
+                done(error(f"scopevault-admin failed: {e.message}"))
+                return
+            reply = None
+            try:
+                reply = json.loads(out or "")
+            except ValueError:
+                pass
+            if not isinstance(reply, dict) or not isinstance(reply.get("reply"), str):
+                message = (err or "").strip() or f"scopevault-admin exited with status {p.get_exit_status()}"
+                reply = error(message)
+            done(reply)
+
+        proc.communicate_utf8_async(None, None, finished)
+
+
+def error(message: str) -> Reply:
+    return {"reply": "error", "message": message}
+
+
+def is_error(reply: Reply) -> bool:
+    return reply.get("reply") == "error"
+
+
+def flatpak_app_ids() -> list[str]:
+    """Apps that have run at some point; only a hint for choosing a scope."""
+    try:
+        names = os.listdir(os.path.expanduser("~/.var/app"))
+    except OSError:
+        return []
+    return sorted(f"flatpak/{n}" for n in names if SCOPE_RE.fullmatch(f"flatpak/{n}"))
+
+
+class ScopeChooser(Gtk.Box):
+    """Pick a scope from a list, or type another one."""
+
+    def __init__(self, choices: list[str], on_change: Callable[[], None]) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.choices = choices
+        self.dropdown = Gtk.DropDown.new_from_strings(choices + [OTHER_SCOPE])
+        self.entry = Gtk.Entry(placeholder_text="flatpak/org.example.App", visible=False)
+        self.append(self.dropdown)
+        self.append(self.entry)
+
+        def changed(*_: object) -> None:
+            self.entry.set_visible(self.dropdown.get_selected() >= len(self.choices))
+            on_change()
+
+        self.dropdown.connect("notify::selected", changed)
+        self.entry.connect("changed", changed)
+        changed()
+
+    def scope(self) -> str | None:
+        i = self.dropdown.get_selected()
+        s = self.choices[i] if i < len(self.choices) else self.entry.get_text().strip()
+        return s if SCOPE_RE.fullmatch(s) else None
+
+
+class ScopeRow(Gtk.ListBoxRow):
+    def __init__(self, summary: Reply) -> None:
+        super().__init__()
+        self.scope: str = summary["scope"]
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_top=6, margin_bottom=6)
+        name = Gtk.Label(use_markup=False, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        name.set_text(plain(self.scope))
+        box.append(name)
+        count = Gtk.Label(use_markup=False, xalign=0)
+        count.set_text(f"{summary['items']} items in {summary['collections']} collections")
+        count.add_css_class("dim-label")
+        count.add_css_class("caption")
+        box.append(count)
+        self.set_child(box)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application, admin: Admin) -> None:
+        super().__init__(application=app, title="ScopeVault", default_width=980, default_height=680)
+        self.admin = admin
+        self.status: Reply | None = None
+        self.scopes: list[Reply] = []
+        self.grants: list[Reply] = []
+        self.selected: str | None = None
+        # The listing shown, as (scope, collections).
+        self.listing: tuple[str, list[Reply]] | None = None
+        self.checked: set[str] = set()
+        self.busy = False
+        self.refreshing = False
+        self.refresh_again = False
+        # The scope a listing request is out for, and whether its reply is
+        # already outdated (an operation finished meanwhile).
+        self.listing_for: str | None = None
+        self.listing_stale = False
+        # Rebuilding the scope list emits row-selected; ignore it then.
+        self.rebuilding = False
+
+        self.actions: dict[str, Gio.SimpleAction] = {}
+        for name, param, handler in [
+            ("refresh", None, lambda *_: self.refresh()),
+            ("lock", None, lambda *_: self.do_lock()),
+            ("unlock", None, lambda *_: self.do_unlock()),
+            ("change-password", None, lambda *_: self.do_change_password()),
+            ("backup", None, lambda *_: self.do_backup()),
+            ("move", None, lambda *_: self.do_move()),
+            ("reset-scope", None, lambda *_: self.do_reset_scope()),
+            ("share", "s", lambda _a, p: self.do_share(p.get_string())),
+            ("unshare", "s", lambda _a, p: self.do_unshare(p.get_string())),
+        ]:
+            action = Gio.SimpleAction.new(name, GLib.VariantType.new(param) if param else None)
+            action.connect("activate", handler)
+            self.add_action(action)
+            self.actions[name] = action
+
+        self.toasts = Adw.ToastOverlay()
+        self.banner = Adw.Banner(use_markup=False)
+        self.stack = Adw.ViewStack()
+        self.stack.add_titled_with_icon(self.build_vault_page(), "vault", "Vault", "channel-secure-symbolic")
+        self.stack.add_titled_with_icon(self.build_scopes_page(), "scopes", "Scopes", "folder-symbolic")
+        self.stack.add_titled_with_icon(self.build_grants_page(), "grants", "Sharing", "emblem-shared-symbolic")
+
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE))
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", action_name="win.refresh", tooltip_text="Refresh")
+        header.pack_start(refresh)
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.add_top_bar(self.banner)
+        self.toasts.set_child(self.stack)
+        view.set_content(self.toasts)
+        self.set_content(view)
+
+        self.update_actions()
+        if admin.program is None:
+            self.show_status(error("scopevault-admin was not found next to scopevault-gui or on PATH"))
+        else:
+            self.refresh()
+
+    # Pages
+
+    def build_vault_page(self) -> Gtk.Widget:
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title="Vault")
+        self.state_row = text_row("State", "…")
+        self.lock_button = Gtk.Button(label="Lock", action_name="win.lock", valign=Gtk.Align.CENTER)
+        self.unlock_button = Gtk.Button(label="Unlock…", action_name="win.unlock", valign=Gtk.Align.CENTER)
+        self.unlock_button.add_css_class("suggested-action")
+        self.state_row.add_suffix(self.lock_button)
+        self.state_row.add_suffix(self.unlock_button)
+        group.add(self.state_row)
+        self.dir_row = text_row("Vault directory", "…")
+        self.dir_row.set_subtitle_selectable(True)
+        group.add(self.dir_row)
+        self.clients_row = text_row("Clients", "…")
+        group.add(self.clients_row)
+        page.add(group)
+
+        group = Adw.PreferencesGroup(title="Password and backups")
+        row = text_row("Master password", "The daemon asks for the old and the new password")
+        row.add_suffix(Gtk.Button(label="Change…", action_name="win.change-password", valign=Gtk.Align.CENTER))
+        group.add(row)
+        row = text_row("Backup", "An encrypted copy; it opens with the current master password")
+        row.add_suffix(Gtk.Button(label="Back Up…", action_name="win.backup", valign=Gtk.Align.CENTER))
+        group.add(row)
+        page.add(group)
+
+        group = Adw.PreferencesGroup(
+            title="Offline operations",
+            description="Restore, import and export need the daemon stopped. "
+            "Run them with scopevault-admin in a terminal (see docs/INSTALL.md).",
+        )
+        page.add(group)
+        return page
+
+    def build_scopes_page(self) -> Gtk.Widget:
+        self.scope_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.scope_list.add_css_class("navigation-sidebar")
+        self.scope_list.connect("row-selected", self.on_scope_selected)
+        sidebar = Gtk.ScrolledWindow(width_request=260, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sidebar.set_child(self.scope_list)
+
+        self.scope_title = text_label("", "title-2")
+        self.scope_title.set_hexpand(True)
+        move = Gtk.Button(label="Move Selected…", action_name="win.move")
+        reset = Gtk.Button(label="Reset Scope…", action_name="win.reset-scope")
+        reset.add_css_class("destructive-action")
+        bar = Gtk.Box(spacing=6, margin_start=18, margin_end=18, margin_top=12, margin_bottom=6)
+        bar.append(self.scope_title)
+        bar.append(move)
+        bar.append(reset)
+        self.items_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        clamp = Adw.Clamp(maximum_size=800, margin_start=12, margin_end=12, margin_bottom=24)
+        clamp.set_child(self.items_box)
+        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_child(clamp)
+        listing = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        listing.append(bar)
+        listing.append(scroller)
+
+        self.scope_stack = Gtk.Stack(hexpand=True)
+        self.scope_stack.add_named(listing, "listing")
+        self.scope_stack.add_named(self.locked_page(), "locked")
+        self.scope_stack.add_named(Adw.StatusPage(icon_name="folder-symbolic", title="Select a scope"), "none")
+        spinner = Gtk.Spinner(spinning=True, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        spinner.set_size_request(32, 32)
+        self.scope_stack.add_named(spinner, "loading")
+        self.scope_message = Adw.StatusPage(icon_name="dialog-warning-symbolic")
+        self.scope_stack.add_named(self.scope_message, "message")
+
+        self.scopes_outer = Gtk.Stack()
+        content = Gtk.Box()
+        content.append(sidebar)
+        content.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        content.append(self.scope_stack)
+        self.scopes_outer.add_named(content, "content")
+        self.scopes_outer.add_named(self.locked_page(), "locked")
+        return self.scopes_outer
+
+    def build_grants_page(self) -> Gtk.Widget:
+        self.grants_group = Adw.PreferencesGroup(
+            title="Grants",
+            description="Items one scope shares with another. The grantee sees them in its Shared collection. "
+            "Share items from the Scopes page.",
+        )
+        page = Adw.PreferencesPage()
+        page.add(self.grants_group)
+        self.grant_rows: list[Gtk.Widget] = []
+        self.grants_stack = Gtk.Stack()
+        self.grants_stack.add_named(page, "list")
+        self.grants_stack.add_named(self.locked_page(), "locked")
+        self.grants_message = Adw.StatusPage(icon_name="dialog-warning-symbolic")
+        self.grants_stack.add_named(self.grants_message, "message")
+        return self.grants_stack
+
+    def locked_page(self) -> Gtk.Widget:
+        button = Gtk.Button(label="Unlock…", action_name="win.unlock", halign=Gtk.Align.CENTER)
+        button.add_css_class("pill")
+        button.add_css_class("suggested-action")
+        return Adw.StatusPage(
+            icon_name="channel-secure-symbolic",
+            title="The vault is locked",
+            description="Unlock it to see its scopes and grants.",
+            child=button,
+        )
+
+    def set_message(self, page: Adw.StatusPage, title: str, message: str) -> None:
+        # A status page's description is markup; a daemon message may quote
+        # app-controlled labels.
+        page.set_title(title)
+        page.set_description(GLib.markup_escape_text(plain(message, 2000)))
+
+    # State
+
+    def unlocked(self) -> bool:
+        return self.status is not None and self.status.get("vault") == "unlocked"
+
+    def update_actions(self) -> None:
+        reachable = self.status is not None
+        state = self.status.get("vault") if self.status else None
+        free = not self.busy
+        listing = self.listing[0] if self.listing else None
+        enabled = {
+            "refresh": True,
+            "lock": free and state == "unlocked",
+            "unlock": free and state == "locked",
+            "change-password": free and reachable and state != "missing",
+            "backup": free and reachable and state != "missing",
+            "move": free and self.unlocked() and listing not in (None, "portal") and bool(self.checked),
+            "reset-scope": free and self.unlocked() and listing is not None,
+            "share": free and self.unlocked() and listing not in (None, "portal"),
+            "unshare": free and self.unlocked(),
+        }
+        for name, on in enabled.items():
+            self.actions[name].set_enabled(on)
+        self.lock_button.set_visible(state == "unlocked")
+        self.unlock_button.set_visible(state != "unlocked")
+
+    def toast(self, text: str) -> None:
+        self.toasts.add_toast(Adw.Toast(title=plain(text, 500), use_markup=False, timeout=4))
+
+    def fail(self, heading: str, message: str) -> None:
+        dialog = Adw.AlertDialog(heading=heading, heading_use_markup=False, body_use_markup=False)
+        dialog.set_body(plain(message, 2000))
+        dialog.add_response("close", "Close")
+        dialog.present(self)
+
+    # Reading
+
+    def refresh(self) -> None:
+        if self.refreshing:
+            self.refresh_again = True
+            return
+        self.refreshing = True
+        self.admin.run(["status"], self.got_status)
+
+    def refresh_done(self) -> None:
+        self.refreshing = False
+        if self.refresh_again:
+            self.refresh_again = False
+            self.refresh()
+
+    def got_status(self, reply: Reply) -> None:
+        self.show_status(reply)
+        if not self.unlocked():
+            self.refresh_done()
+            return
+        self.admin.run(["scopes"], self.got_scopes)
+
+    def got_scopes(self, reply: Reply) -> None:
+        if is_error(reply):
+            self.scopes = []
+            self.show_scopes()
+            self.scopes_outer.set_visible_child_name("content")
+            self.set_message(self.scope_message, "Cannot list the scopes", reply["message"])
+            self.scope_stack.set_visible_child_name("message")
+        else:
+            self.scopes = reply.get("scopes", [])
+            self.show_scopes()
+        self.admin.run(["grants"], self.got_grants)
+
+    def got_grants(self, reply: Reply) -> None:
+        self.show_grants(reply)
+        self.refresh_done()
+        self.load_listing()
+
+    def load_listing(self) -> None:
+        """Lists the selected scope; one listing request at a time."""
+        if self.listing_for is not None:
+            self.listing_stale = True
+            return
+        if self.selected is None or not self.unlocked():
+            return
+        scope = self.listing_for = self.selected
+        self.listing_stale = False
+
+        def got(reply: Reply) -> None:
+            self.listing_for = None
+            if self.selected != scope or self.listing_stale:
+                self.load_listing()
+                return
+            self.show_listing(scope, reply)
+
+        self.admin.run(["list", scope], got)
+
+    # Showing
+
+    def show_status(self, reply: Reply) -> None:
+        if is_error(reply):
+            self.status = None
+            self.state_row.set_subtitle(f"Not reachable: {plain(reply['message'], 2000)}")
+            self.dir_row.set_subtitle("—")
+            self.clients_row.set_subtitle("—")
+        else:
+            self.status = reply
+            state = {
+                "unlocked": "Unlocked",
+                "locked": "Locked",
+                "missing": "Not created yet: the first application that stores a secret creates it",
+            }.get(str(reply.get("vault")), str(reply.get("vault")))
+            self.state_row.set_subtitle(state)
+            self.dir_row.set_subtitle(plain(str(reply.get("data_dir", "")), 2000))
+            self.clients_row.set_subtitle(
+                f"{reply.get('connections', 0)} connections · {reply.get('sessions', 0)} transfer sessions · "
+                f"{reply.get('prompts', 0)} pending prompts"
+            )
+        if not self.unlocked():
+            self.scopes = []
+            self.listing = None
+            self.checked.clear()
+            self.show_scopes()
+            self.scopes_outer.set_visible_child_name("locked" if self.status else "content")
+            self.grants_stack.set_visible_child_name("locked" if self.status else "message")
+            if not self.status:
+                self.set_message(self.scope_message, "The daemon is not reachable", reply["message"])
+                self.scope_stack.set_visible_child_name("message")
+                self.set_message(self.grants_message, "The daemon is not reachable", reply["message"])
+        else:
+            self.scopes_outer.set_visible_child_name("content")
+        self.update_actions()
+
+    def show_scopes(self) -> None:
+        self.rebuilding = True
+        self.scope_list.remove_all()
+        names = [s["scope"] for s in self.scopes]
+        if self.selected not in names:
+            self.selected = None
+            self.listing = None
+            self.checked.clear()
+        selected_row = None
+        for s in self.scopes:
+            row = ScopeRow(s)
+            self.scope_list.append(row)
+            if s["scope"] == self.selected:
+                selected_row = row
+        if selected_row is not None:
+            self.scope_list.select_row(selected_row)
+        self.rebuilding = False
+        if self.selected is None:
+            self.scope_stack.set_visible_child_name("none")
+        self.update_actions()
+
+    def on_scope_selected(self, _box: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
+        scope = row.scope if isinstance(row, ScopeRow) else None
+        if self.rebuilding or scope == self.selected:
+            return
+        self.selected = scope
+        self.listing = None
+        self.checked.clear()
+        self.update_actions()
+        if scope is None:
+            self.scope_stack.set_visible_child_name("none")
+            return
+        self.scope_stack.set_visible_child_name("loading")
+        self.load_listing()
+
+    def show_listing(self, scope: str, reply: Reply) -> None:
+        if is_error(reply):
+            self.listing = None
+            self.set_message(self.scope_message, f"Cannot list {scope}", reply["message"])
+            self.scope_stack.set_visible_child_name("message")
+            self.update_actions()
+            return
+        collections: list[Reply] = reply.get("collections", [])
+        self.listing = (scope, collections)
+        present = {f"{c['name']}/{i['name']}" for c in collections for i in c.get("items", [])}
+        self.checked &= present
+        self.scope_title.set_text(plain(scope))
+        child = self.items_box.get_first_child()
+        while child is not None:
+            self.items_box.remove(child)
+            child = self.items_box.get_first_child()
+        portal = scope == "portal"
+        if not collections:
+            self.items_box.append(text_label("No data in this scope.", "dim-label"))
+        for c in collections:
+            heading = text_label(plain(c["label"]) or "(no label)", "heading")
+            heading.set_margin_top(18)
+            self.items_box.append(heading)
+            notes = [plain(c["name"])]
+            if c.get("aliases"):
+                notes.append("alias " + ", ".join(plain(a) for a in c["aliases"]))
+            if c.get("locked"):
+                notes.append("locked by its application")
+            notes.append(f"{len(c.get('items', []))} items")
+            self.items_box.append(text_label(" · ".join(notes), "dim-label", "caption"))
+            box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            box.add_css_class("boxed-list")
+            for i in c.get("items", []):
+                box.append(self.item_row(c["name"], i, portal))
+            if c.get("items"):
+                self.items_box.append(box)
+        self.scope_stack.set_visible_child_name("listing")
+        self.update_actions()
+
+    def item_row(self, collection: str, item: Reply, portal: bool) -> Gtk.Widget:
+        spec = f"{collection}/{item['name']}"
+        row = Adw.ExpanderRow(use_markup=False)
+        row.set_title(plain(item["label"]) or "(no label)")
+        row.set_subtitle(f"{plain(spec)} · modified {when(item['modified'])}")
+        if not portal:
+            check = Gtk.CheckButton(active=spec in self.checked, valign=Gtk.Align.CENTER, tooltip_text="Select to move")
+
+            def toggled(b: Gtk.CheckButton) -> None:
+                if b.get_active():
+                    self.checked.add(spec)
+                else:
+                    self.checked.discard(spec)
+                self.update_actions()
+
+            check.connect("toggled", toggled)
+            row.add_prefix(check)
+            share = Gtk.Button(
+                label="Share…",
+                action_name="win.share",
+                action_target=GLib.Variant("s", spec),
+                valign=Gtk.Align.CENTER,
+            )
+            share.add_css_class("flat")
+            row.add_suffix(share)
+        attributes: dict[str, str] = item.get("attributes", {})
+        for key, value in attributes.items():
+            a = text_row(plain(key), plain(value, 2000))
+            a.set_subtitle_selectable(True)
+            a.add_css_class("property")
+            row.add_row(a)
+        if not attributes:
+            row.add_row(text_row("No attributes"))
+        row.add_row(text_row("Created", when(item["created"])))
+        return row
+
+    def show_grants(self, reply: Reply) -> None:
+        for row in self.grant_rows:
+            self.grants_group.remove(row)
+        self.grant_rows = []
+        self.grants = []
+        if is_error(reply):
+            self.set_message(self.grants_message, "Cannot list the grants", reply["message"])
+            self.grants_stack.set_visible_child_name("message")
+            return
+        grants: list[Reply] = reply.get("grants", [])
+        self.grants = grants
+        for g in grants:
+            access = "read and write" if g.get("write") else "read"
+            row = text_row(
+                plain(g["label"]) or "(no label)",
+                f"{plain(g['grantee'])} may {access} {plain(g['owner'])} {plain(g['collection'])}/{plain(g['item'])}"
+                f" · since {when(g['created'])}",
+            )
+            revoke = Gtk.Button(
+                label="Revoke…",
+                action_name="win.unshare",
+                action_target=GLib.Variant("s", g["id"]),
+                valign=Gtk.Align.CENTER,
+            )
+            revoke.add_css_class("flat")
+            row.add_suffix(revoke)
+            self.grants_group.add(row)
+            self.grant_rows.append(row)
+        if not grants:
+            row = text_row("No grants")
+            self.grants_group.add(row)
+            self.grant_rows.append(row)
+        self.grants_stack.set_visible_child_name("list")
+
+    # Operations
+
+    def act(
+        self,
+        args: list[str],
+        waiting: str | None,
+        heading: str,
+        done: Callable[[Reply], None],
+    ) -> None:
+        """Runs one operation; `waiting` is shown while a dialog may be open."""
+        if self.busy:
+            self.toast("Another operation is still running")
+            return
+        self.busy = True
+        if waiting:
+            self.banner.set_title(waiting)
+            self.banner.set_revealed(True)
+        self.update_actions()
+
+        def finished(reply: Reply) -> None:
+            self.busy = False
+            self.banner.set_revealed(False)
+            if not is_error(reply):
+                done(reply)
+            elif reply.get("message") == CANCELLED:
+                self.toast("Cancelled")
+            else:
+                self.fail(heading, reply.get("message", ""))
+            self.update_actions()
+            self.refresh()
+
+        self.admin.run(args, finished)
+
+    def show_done(self, reply: Reply) -> None:
+        self.toast(str(reply.get("message", "Done")))
+
+    def do_lock(self) -> None:
+        self.act(["lock"], None, "Could not lock the vault", self.show_done)
+
+    def do_unlock(self) -> None:
+        self.act(["unlock"], "Enter the master password in the dialog", "Could not unlock the vault", self.show_done)
+
+    def do_change_password(self) -> None:
+        self.act(
+            ["change-password"],
+            "Answer the password dialogs",
+            "Could not change the password",
+            self.show_done,
+        )
+
+    def do_backup(self) -> None:
+        dialog = Gtk.FileDialog(title="Back Up the Vault", initial_name=f"scopevault-{time.strftime('%Y-%m-%d')}.db")
+
+        def chosen(d: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+            try:
+                file = d.save_finish(result)
+            except GLib.Error:
+                return  # dismissed
+            path = file.get_path() if file else None
+            if not path:
+                self.fail("Could not back up the vault", "Choose a local file.")
+                return
+            # scopevault-admin never replaces a file, even if the file
+            # dialog asked whether to.
+            self.act(["backup", path], None, "Could not back up the vault", self.show_done)
+
+        dialog.save(self, None, chosen)
+
+    def target_choices(self, source: str) -> list[str]:
+        known = ["host"] + [s["scope"] for s in self.scopes] + flatpak_app_ids()
+        seen: list[str] = []
+        for s in known:
+            if s not in seen and s not in (source, "portal") and SCOPE_RE.fullmatch(s):
+                seen.append(s)
+        return seen
+
+    def ask(
+        self,
+        heading: str,
+        body: str,
+        verb: str,
+        go: Callable[[], None],
+        destructive: bool = False,
+        extra: Gtk.Widget | None = None,
+    ) -> Adw.AlertDialog:
+        dialog = Adw.AlertDialog(heading=heading, heading_use_markup=False, body_use_markup=False)
+        dialog.set_body(body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("go", verb)
+        dialog.set_response_appearance(
+            "go", Adw.ResponseAppearance.DESTRUCTIVE if destructive else Adw.ResponseAppearance.SUGGESTED
+        )
+        dialog.set_default_response("cancel" if destructive else "go")
+        dialog.set_close_response("cancel")
+        if extra is not None:
+            dialog.set_extra_child(extra)
+
+        def response(_d: Adw.AlertDialog, r: str) -> None:
+            if r == "go":
+                go()
+
+        dialog.connect("response", response)
+        return dialog
+
+    def do_move(self) -> None:
+        if not self.listing or not self.checked:
+            return
+        source = self.listing[0]
+        items = sorted(self.checked)
+        what = "1 item" if len(items) == 1 else f"{len(items)} items"
+        dialog: Adw.AlertDialog | None = None
+
+        def changed() -> None:
+            if dialog is not None:
+                dialog.set_response_enabled("go", chooser.scope() is not None)
+
+        chooser = ScopeChooser(self.target_choices(source), changed)
+
+        def go() -> None:
+            target = chooser.scope()
+            if target is None:
+                return
+
+            def moved(reply: Reply) -> None:
+                self.checked.clear()
+                n = len(reply.get("items", []))
+                self.toast(f"Moved {n} item{'s' if n != 1 else ''} to {target}")
+
+            self.act(
+                ["move", source, target] + items,
+                "Confirm the move in the password dialog",
+                "Could not move the items",
+                moved,
+            )
+
+        dialog = self.ask(
+            f"Move {what}",
+            f"The selected items leave {source} and go into the default collection of the scope chosen "
+            "below, which can then read them. The daemon asks for the master password.",
+            "Move",
+            go,
+            extra=chooser,
+        )
+        changed()
+        dialog.present(self)
+
+    def do_reset_scope(self) -> None:
+        if not self.listing:
+            return
+        scope, collections = self.listing
+        items = sum(len(c.get("items", [])) for c in collections)
+        body = (
+            f"This deletes all {items} items in {len(collections)} collections of {scope}, including their "
+            "secrets. It cannot be undone, except by restoring a backup. The daemon asks for the master password."
+        )
+        if scope == "portal":
+            body += (
+                "\n\nThese are the Secret portal keys: Flatpak apps encrypt their own keyring files with them, "
+                "and lose access to what they stored."
+            )
+
+        def go() -> None:
+            self.act(
+                ["reset-scope", scope],
+                "Confirm the deletion in the password dialog",
+                f"Could not reset {scope}",
+                lambda r: self.toast(f"Deleted {r.get('items', 0)} items in {r.get('collections', 0)} collections"),
+            )
+
+        self.ask(f"Delete everything in {scope}?", body, "Delete", go, destructive=True).present(self)
+
+    def item_label(self, spec: str) -> str:
+        if self.listing:
+            col, _, name = spec.partition("/")
+            for c in self.listing[1]:
+                for i in c.get("items", []) if c["name"] == col else []:
+                    if i["name"] == name:
+                        return plain(i["label"], 80) or spec
+        return spec
+
+    def do_share(self, spec: str) -> None:
+        if not self.listing:
+            return
+        source = self.listing[0]
+        label = self.item_label(spec)
+        dialog: Adw.AlertDialog | None = None
+
+        def changed() -> None:
+            if dialog is not None:
+                dialog.set_response_enabled("go", chooser.scope() is not None)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        chooser = ScopeChooser(self.target_choices(source), changed)
+        write = Gtk.CheckButton(label="Allow changes (read and write access)")
+        box.append(chooser)
+        box.append(write)
+
+        def go() -> None:
+            target = chooser.scope()
+            if target is None:
+                return
+            args = ["share", source, spec, target] + (["--write"] if write.get_active() else [])
+            self.act(
+                args,
+                "Confirm the grant in the password dialog",
+                "Could not share the item",
+                lambda _r: self.toast(f"Shared with {target}"),
+            )
+
+        dialog = self.ask(
+            "Share an Item",
+            f"Give the scope chosen below access to “{label}” from {source}. It sees the item in its "
+            "Shared collection. The daemon asks for the master password.",
+            "Share",
+            go,
+            extra=box,
+        )
+        changed()
+        dialog.present(self)
+
+    def do_unshare(self, grant: str) -> None:
+        def go() -> None:
+            self.act(["unshare", grant], None, "Could not revoke the grant", self.show_done)
+
+        grantee, label = "The grantee", "the item"
+        for g in self.grants:
+            if g["id"] == grant:
+                grantee, label = plain(g["grantee"]), f"“{plain(g['label'], 80)}”"
+        self.ask(
+            "Revoke the Grant?",
+            f"{grantee} loses access to {label} at once. Sharing it again needs the master password.",
+            "Revoke",
+            go,
+            destructive=True,
+        ).present(self)
+
+
+class App(Adw.Application):
+    def __init__(self, admin: Admin) -> None:
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.admin = admin
+        self.connect("activate", self.on_activate)
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_action)
+        self.set_accels_for_action("app.quit", ["<Control>q"])
+        self.set_accels_for_action("win.refresh", ["<Control>r", "F5"])
+
+    def on_activate(self, _app: Adw.Application) -> None:
+        window = self.get_active_window()
+        if window is None:
+            window = Window(self, self.admin)
+        window.present()
+
+
+def find_admin(explicit: str | None) -> str | None:
+    if explicit:
+        return os.path.abspath(explicit)
+    sibling = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "scopevault-admin")
+    if os.access(sibling, os.X_OK):
+        return sibling
+    return GLib.find_program_in_path("scopevault-admin")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Graphical front end for scopevault-admin.")
+    parser.add_argument("--admin", metavar="PATH", help="the scopevault-admin program")
+    parser.add_argument("--socket", metavar="PATH", help="the daemon's administrative socket")
+    args = parser.parse_args()
+    if (Adw.get_major_version(), Adw.get_minor_version()) < (1, 5):
+        print("scopevault-gui: needs libadwaita 1.5 or later", file=sys.stderr)
+        return 1
+    if os.path.exists("/.flatpak-info"):
+        print("scopevault-gui: runs on the host only; the daemon refuses sandboxed callers", file=sys.stderr)
+        return 1
+    app = App(Admin(find_admin(args.admin), args.socket))
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

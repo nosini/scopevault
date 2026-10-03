@@ -403,3 +403,40 @@ async fn unlock_wait_reopens_a_dialog_dismissed_at_once() {
     assert_eq!(e.vault.dialogs(), dialogs + 1);
     assert!(!e.vault.unlocked());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_replies_include_errors() {
+    let e = env(VaultState::Locked).await;
+    let json = |out: &Out| -> serde_json::Value {
+        serde_json::from_str(&out.stdout).unwrap_or_else(|err| panic!("{err}: {}{}", out.stdout, out.stderr))
+    };
+    let out = e.admin(&Who::Host, &["status", "--json"]).await;
+    assert!(out.ok);
+    let v = json(&out);
+    assert_eq!((v["reply"].as_str(), v["vault"].as_str()), (Some("status"), Some("locked")), "{v}");
+
+    // A cancelled dialog is an error reply on stdout, not a message on stderr.
+    e.vault.set_pins(&["CANCEL"]);
+    let out = e.admin(&Who::Host, &["unlock", "--json"]).await;
+    assert!(!out.ok);
+    let v = json(&out);
+    assert_eq!(v["reply"], "error");
+    assert_eq!(v["message"], scopevault::admin::protocol::CANCELLED);
+
+    e.vault.set_pins(&[PASSWORD]);
+    let v = json(&e.admin(&Who::Host, &["unlock", "--json"]).await);
+    assert_eq!((v["reply"].as_str(), v["message"].as_str()), (Some("done"), Some("unlocked")), "{v}");
+    let file = e.tmp.path().join("backup.db");
+    let v = json(&e.admin(&Who::Host, &["backup", file.to_str().unwrap(), "--json"]).await);
+    assert_eq!(v["reply"], "done", "{v}");
+    let v = json(&e.admin(&Who::Host, &["backup", file.to_str().unwrap(), "--json"]).await);
+    assert!(v["message"].as_str().unwrap().contains("cannot create"), "{v}");
+
+    // So is a daemon that cannot be reached.
+    let mut cmd = Command::new(ADMIN);
+    cmd.args(["--socket", e.tmp.path().join("nothing").to_str().unwrap(), "status", "--json"]);
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap()).await.unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["message"].as_str().unwrap().contains("cannot connect"), "{v}");
+}

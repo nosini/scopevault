@@ -13,10 +13,11 @@ including the passwords of all other apps.
 
 ## Status
 
-The daemon implements the whole Secret Service API and the Secret portal
-backend on an encrypted vault, and has been tested with real Flatpak
-apps. It can replace gnome-keyring on a GNOME desktop, with migration and
-a way back.
+scopevault implements the whole Secret Service API and the Secret portal
+backend, and replaces gnome-keyring on a GNOME desktop, with migration and
+a way back. It has been tested on openSUSE Tumbleweed with GNOME and
+SELinux enforcing, but it is young software: keep a backup of your
+keyring.
 
 It is written in Rust and needs a session bus that hands out process file
 descriptors, which dbus-broker does.
@@ -37,6 +38,7 @@ descriptors, which dbus-broker does.
 - It can serve the Secret portal too, so Flatpak apps' portal keys live in
   the vault.
 - Single items can be shared with another app, read-only or read-write.
+- A small GTK window does the same administration as the command line.
 
 It does not protect secrets from unsandboxed programs running as you;
 nothing that runs as you can. [docs/DESIGN.md](docs/DESIGN.md) explains

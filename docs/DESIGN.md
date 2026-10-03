@@ -310,6 +310,19 @@ Deleting or moving the item, or resetting either scope, removes the grant.
 If the owner locks the collection, the item disappears from the other
 scope too. Grants are part of backups but not of export and import.
 
+## The graphical front end
+
+`scopevault-gui` is a GTK 4 window over `scopevault-admin --json`. It is a
+host program only, never a Flatpak: the admin socket refuses sandboxed
+callers, and an exception for one would be the weak point. It never sees a
+password, since every password goes to the daemon's own dialog.
+
+Labels and attributes come from apps, so the GUI treats them as untrusted:
+it shows them as plain text only, never as markup, and replaces control
+and bidirectional formatting characters so one label cannot pass for
+another. Listing a locked vault would open the unlock dialog, so the GUI
+asks for the status first.
+
 ## What scopevault does not protect against
 
 - Host code running as your user, or root. It can read the daemon's

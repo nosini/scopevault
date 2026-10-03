@@ -225,3 +225,28 @@ moment. `scopevault-admin restore` needs the daemon stopped.
 The portal keys are in the vault and therefore in its backups, but the
 files they decrypt stay in `~/.var/app/<app-id>/`. Back those up as well,
 and restore them together with the vault.
+
+## The graphical front end
+
+`gui/scopevault-gui` shows the vault's state, the scopes with their items
+(labels and attributes, never secrets) and the grants. It can lock and
+unlock, change the password, move items, reset a scope, share and unshare,
+and make backups. It needs Python 3 with PyGObject, GTK 4 and libadwaita
+1.5 or newer. Every password still goes to the daemon's own dialog, and
+restoring, importing and exporting stay on the command line.
+
+```sh
+install -m 755 gui/scopevault-gui ~/.local/bin/
+sed "s|@BINDIR@|$HOME/.local/bin|" packaging/page.codeberg.nosini.ScopeVault.desktop \
+    > ~/.local/share/applications/page.codeberg.nosini.ScopeVault.desktop
+```
+
+To check that PyGObject and the libraries are there:
+
+```sh
+python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Adw; print(Adw.get_major_version(), Adw.get_minor_version())'
+```
+
+It runs the `scopevault-admin` next to it, or else the one on `PATH`;
+`--admin PATH` and `--socket PATH` override that. Don't package it as a
+Flatpak: the admin socket refuses sandboxed programs on purpose.

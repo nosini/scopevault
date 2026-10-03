@@ -1,0 +1,15 @@
+# Desktop entry for scopevault-gui, the graphical front end of
+# scopevault-admin. Install with @BINDIR@ replaced by the directory that
+# holds scopevault-gui and scopevault-admin, as
+# ~/.local/share/applications/page.codeberg.nosini.ScopeVault.desktop
+# (see docs/INSTALL.md). The file name must match the application ID.
+[Desktop Entry]
+Type=Application
+Name=ScopeVault
+Comment=Manage the scoped Secret Service: lock, scopes, sharing, backups
+Exec=@BINDIR@/scopevault-gui
+Icon=channel-secure-symbolic
+Terminal=false
+Categories=Utility;Security;
+Keywords=secret;keyring;password;scopevault;
+StartupNotify=true
