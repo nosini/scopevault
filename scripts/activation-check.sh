@@ -84,7 +84,7 @@ fi
 
 echo
 echo "-- the other names"
-portal_name=page.codeberg.nosini.ScopeVault.Portal
+portal_name=eu.nosini.ScopeVault.Portal
 portal_owner_cmd=
 for name in org.gnome.keyring org.freedesktop.impl.portal.Secret "$portal_name"; do
     o=$(names "$(bus GetNameOwner "$name" 2>/dev/null || true)")

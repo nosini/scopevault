@@ -13,8 +13,8 @@
 # The probe terminal shows the full evidence for every call; this script
 # prints only the verdicts.
 set -u
-NAME=page.codeberg.nosini.ScopeVault.IdentityProbe
-OBJ=/page/codeberg/nosini/ScopeVault/IdentityProbe
+NAME=eu.nosini.ScopeVault.IdentityProbe
+OBJ=/eu/nosini/ScopeVault/IdentityProbe
 ARGS="call --session --dest $NAME --object-path $OBJ --method"
 
 # Prints the verdict fields, or the raw output if there are none (an error).

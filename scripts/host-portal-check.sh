@@ -417,10 +417,10 @@ DBUS_SESSION_BUS_ADDRESS="unix:path=$work/bus" RUST_LOG=${RUST_LOG:-scopevault=i
         2>>"$work/daemon.log" &
 daemon_pid=$!
 for _ in $(seq 100); do
-    if owns org.freedesktop.secrets && owns page.codeberg.nosini.ScopeVault.Portal; then break; fi
+    if owns org.freedesktop.secrets && owns eu.nosini.ScopeVault.Portal; then break; fi
     sleep 0.1
 done
-if ! owns org.freedesktop.secrets || ! owns page.codeberg.nosini.ScopeVault.Portal; then
+if ! owns org.freedesktop.secrets || ! owns eu.nosini.ScopeVault.Portal; then
     echo "scopevault-daemon did not take org.freedesktop.secrets and its portal name:" >&2
     cat "$work/daemon.log" >&2
     exit 1

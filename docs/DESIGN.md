@@ -292,7 +292,7 @@ them.
   during package updates and would not stop host code anyway. A host
   program that replaces xdg-desktop-portal does become the frontend for
   every app, but host code is trusted.
-- The backend has its own bus name, `page.codeberg.nosini.ScopeVault.Portal`, on a
+- The backend has its own bus name, `eu.nosini.ScopeVault.Portal`, on a
   separate connection. A Flatpak app allowed to talk to
   `org.freedesktop.secrets` can therefore not reach it through the same
   connection.

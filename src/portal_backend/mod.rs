@@ -32,7 +32,7 @@ use crate::store::{Secret, is_valid_portal_app_id};
 
 /// The backend's own well-known name. It never owns
 /// `org.freedesktop.impl.portal.Secret` (see the module documentation).
-pub const BACKEND_NAME: &str = "page.codeberg.nosini.ScopeVault.Portal";
+pub const BACKEND_NAME: &str = "eu.nosini.ScopeVault.Portal";
 
 /// Where the Secret interface is exported.
 pub const BACKEND_PATH: &str = "/org/freedesktop/portal/desktop";

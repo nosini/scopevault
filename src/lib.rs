@@ -17,4 +17,4 @@ pub mod sleep;
 pub mod store;
 
 /// Prefix for this project's own D-Bus names and object paths.
-pub const DBUS_PREFIX: &str = "page.codeberg.nosini.ScopeVault";
+pub const DBUS_PREFIX: &str = "eu.nosini.ScopeVault";

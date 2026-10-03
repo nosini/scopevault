@@ -23,7 +23,7 @@ lines where it belongs:
 install -D -m 644 packaging/scopevault.service ~/.config/systemd/user/scopevault.service
 install -D -m 644 packaging/scopevault-unlock.service ~/.config/systemd/user/scopevault-unlock.service
 install -D -m 644 packaging/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
-install -D -m 644 packaging/page.codeberg.nosini.ScopeVault.Portal.service ~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service
+install -D -m 644 packaging/eu.nosini.ScopeVault.Portal.service ~/.local/share/dbus-1/services/eu.nosini.ScopeVault.Portal.service
 install -D -m 644 packaging/gnome-keyring-secrets.desktop ~/.config/autostart/gnome-keyring-secrets.desktop
 install -D -m 644 packaging/scopevault.portal ~/.local/share/xdg-desktop-portal/portals/scopevault.portal
 install -D -m 644 packaging/gnome-portals.conf ~/.config/xdg-desktop-portal/gnome-portals.conf
@@ -47,7 +47,7 @@ What they do:
   portal backend, which hands Flatpak apps the keys they encrypt their own
   files with. Your `gnome-portals.conf` only names the Secret portal;
   everything else still comes from the system's configuration. The
-  backend has its own bus name, `page.codeberg.nosini.ScopeVault.Portal`, and
+  backend has its own bus name, `eu.nosini.ScopeVault.Portal`, and
   its activation file starts the same unit.
 - `scopevault-unlock.service` opens the unlock dialog as soon as you are
   logged in, so the vault is usually open before apps ask for it. Apps
@@ -168,6 +168,18 @@ On a desktop that never had gnome-keyring, run `scopevault-admin portal
 init` instead of importing. From then on every app without a keyring file
 of its own gets a new key when it first asks.
 
+### Updating from a version before 0.12.0
+
+The bus names and file names used to start with
+`page.codeberg.nosini.ScopeVault`. Remove the old files,
+`~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service`
+and `~/.local/share/applications/page.codeberg.nosini.ScopeVault.desktop`,
+then install the new ones as above (`scopevault.portal` changed too), the
+GUI's desktop entry and the new binaries. Restart the daemon, restart
+`goa-daemon`, then log out and back in so xdg-desktop-portal picks up the
+new backend. `scripts/activation-check.sh` shows whether it is served.
+Nothing in the vault depends on the name.
+
 ## Known risk
 
 Whenever something starts gnome-keyring's Secret Service, gnome-keyring
@@ -257,8 +269,8 @@ restoring, importing and exporting stay on the command line.
 
 ```sh
 install -m 755 gui/scopevault-gui ~/.local/bin/
-sed "s|@BINDIR@|$HOME/.local/bin|" packaging/page.codeberg.nosini.ScopeVault.desktop \
-    > ~/.local/share/applications/page.codeberg.nosini.ScopeVault.desktop
+sed "s|@BINDIR@|$HOME/.local/bin|" packaging/eu.nosini.ScopeVault.desktop \
+    > ~/.local/share/applications/eu.nosini.ScopeVault.desktop
 ```
 
 To check that PyGObject and the libraries are there:

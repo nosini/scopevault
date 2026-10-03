@@ -154,8 +154,8 @@ status() { sed -n "${2}p" "$1" | cut -f2; }
 if [ -z "$app" ]; then
     echo
     echo "== part 1: Flatpak's proxy on the private bus (identity probe)"
-    probe_name=page.codeberg.nosini.ScopeVault.IdentityProbe
-    probe_obj=/page/codeberg/nosini/ScopeVault/IdentityProbe
+    probe_name=eu.nosini.ScopeVault.IdentityProbe
+    probe_obj=/eu/nosini/ScopeVault/IdentityProbe
     "$bindir/scopevault-probe" serve >"$work/probe.log" 2>&1 &
     probe_pid=$!
     wait_name $probe_name || { echo "the probe did not start:" >&2; cat "$work/probe.log" >&2; exit 1; }

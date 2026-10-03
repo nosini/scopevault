@@ -1,7 +1,7 @@
 //! The Scoped Secret Service daemon.
 //!
 //! Serves `org.freedesktop.secrets` on the session bus from the encrypted
-//! vault, the Secret portal backend (page.codeberg.nosini.ScopeVault.Portal,
+//! vault, the Secret portal backend (eu.nosini.ScopeVault.Portal,
 //! the `org.freedesktop.impl.portal.Secret` backend for xdg-desktop-portal)
 //! from a second bus connection, and the administrative interface
 //! (scopevault-admin) and the login socket (scopevault-pam-helper) on Unix
@@ -41,7 +41,7 @@ usage: scopevault-daemon [--data-dir DIR] [--pinentry PROGRAM] [--admin-socket P
        scopevault-daemon --version
 
 Serves org.freedesktop.secrets on the session bus, the Secret portal
-backend (page.codeberg.nosini.ScopeVault.Portal), the administrative
+backend (eu.nosini.ScopeVault.Portal), the administrative
 interface (scopevault-admin) on a Unix socket, and the login socket, where
 scopevault-pam-helper delivers the login password.
 

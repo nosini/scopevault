@@ -34,7 +34,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
-APP_ID = "page.codeberg.nosini.ScopeVault"
+APP_ID = "eu.nosini.ScopeVault"
 # The daemon's error message for a cancelled password dialog
 # (src/admin/protocol.rs, CANCELLED).
 CANCELLED = "cancelled in the password dialog"

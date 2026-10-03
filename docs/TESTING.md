@@ -54,7 +54,7 @@ openSUSE's `dbus-daemon` doesn't report `ProcessFD`.
 
 ### Identity probe
 
-`scopevault-probe` owns only `page.codeberg.nosini.ScopeVault.IdentityProbe`,
+`scopevault-probe` owns only `eu.nosini.ScopeVault.IdentityProbe`,
 stores nothing and doesn't touch gnome-keyring. It reports how scopevault
 would classify each caller.
 

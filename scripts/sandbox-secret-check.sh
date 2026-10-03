@@ -38,7 +38,7 @@ import gi
 gi.require_version("Secret", "1")
 from gi.repository import Secret
 
-schema = Secret.Schema.new("page.codeberg.nosini.ScopeVault.Check", Secret.SchemaFlags.DONT_MATCH_NAME,
+schema = Secret.Schema.new("eu.nosini.ScopeVault.Check", Secret.SchemaFlags.DONT_MATCH_NAME,
                            {"check": Secret.SchemaAttributeType.STRING})
 attrs = {"check": os.environ["ATTR"]}
 Secret.password_store_sync(schema, attrs, Secret.COLLECTION_DEFAULT, "scopevault sandbox check", os.environ["VALUE"], None)

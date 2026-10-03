@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.0
+
+- The D-Bus names and the application ID now start with
+  `eu.nosini.ScopeVault` instead of `page.codeberg.nosini.ScopeVault`.
+  The portal backend's activation file and the GUI's desktop entry were
+  renamed to match. An existing installation needs the new files; see
+  "Updating from a version before 0.12.0" in docs/INSTALL.md.
+
 ## 0.11.1
 
 - The daemon keeps running when you log out, and the vault is locked

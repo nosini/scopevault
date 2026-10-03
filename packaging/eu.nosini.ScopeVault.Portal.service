@@ -1,8 +1,8 @@
 # D-Bus activation for scopevault's Secret portal backend. Install as
-# ~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service.
+# ~/.local/share/dbus-1/services/eu.nosini.ScopeVault.Portal.service.
 # xdg-desktop-portal contacts the backend when it starts; this starts the
 # same unit as org.freedesktop.secrets. Exec is only a fallback that fails.
 [D-BUS Service]
-Name=page.codeberg.nosini.ScopeVault.Portal
+Name=eu.nosini.ScopeVault.Portal
 Exec=/bin/false
 SystemdService=scopevault.service

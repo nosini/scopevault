@@ -35,7 +35,7 @@ fn report(c: &Classification) -> serde_json::Value {
     }
 }
 
-#[zbus::interface(name = "page.codeberg.nosini.ScopeVault.IdentityProbe")]
+#[zbus::interface(name = "eu.nosini.ScopeVault.IdentityProbe")]
 impl Probe {
     /// Returns the classification of the calling connection as JSON.
     async fn who_am_i(&self, #[zbus(header)] header: Header<'_>) -> String {
