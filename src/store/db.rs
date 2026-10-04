@@ -9,6 +9,7 @@
 //! docs/STORE.md.
 
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -29,6 +30,29 @@ pub type RecordId = [u8; 16];
 /// 512 KiB secret and an item whose 64 attributes JSON-escape to about
 /// 1.7 MiB; this leaves room above both.
 pub const MAX_CIPHERTEXT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The daemon's backup copies are made in the vault directory under
+/// names like these, and removed after reading. [`Db::open`] removes any
+/// that a crash left behind.
+pub const BACKUP_TMP_PREFIX: &str = "backup-";
+pub const BACKUP_TMP_SUFFIX: &str = ".tmp";
+
+/// The format: the master password's key wrap and the records, in the
+/// database attached as `db`.
+fn schema(db: &str) -> String {
+    format!(
+        "PRAGMA {db}.application_id = {APPLICATION_ID};
+         PRAGMA {db}.user_version = {SCHEMA_VERSION};
+         CREATE TABLE {db}.vault (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             kdf_m INTEGER NOT NULL, kdf_t INTEGER NOT NULL, kdf_p INTEGER NOT NULL,
+             salt BLOB NOT NULL, nonce BLOB NOT NULL, wrapped BLOB NOT NULL);
+         CREATE TABLE {db}.records (
+             id BLOB NOT NULL, kind INTEGER NOT NULL, namespace BLOB NOT NULL,
+             nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+             PRIMARY KEY (id, kind)) WITHOUT ROWID;"
+    )
+}
 
 /// Key wraps other than the master password's. Created with the first one.
 const KEY_SLOTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS key_slots (
@@ -125,6 +149,20 @@ fn take_lock(dir_fd: &OwnedFd) -> Result<OwnedFd, StoreError> {
     Ok(fd)
 }
 
+/// Removes backup copies a crash left in the vault directory: they hold
+/// an old state of the vault. Only called with the lock held, so no copy
+/// is still being made.
+fn remove_backup_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(BACKUP_TMP_PREFIX) && name.ends_with(BACKUP_TMP_SUFFIX) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 impl Db {
     pub fn exists(dir: &Path) -> bool {
         dir.join(DB_FILE).exists()
@@ -185,18 +223,7 @@ impl Db {
     fn initialise(dir_fd: &OwnedFd, dir: &Path, wrap: &KeyWrap) -> Result<Connection, StoreError> {
         let mut conn = Self::connect(dir_fd, dir)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        tx.execute_batch(&format!(
-            "PRAGMA application_id = {APPLICATION_ID};
-             PRAGMA user_version = {SCHEMA_VERSION};
-             CREATE TABLE vault (
-                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                 kdf_m INTEGER NOT NULL, kdf_t INTEGER NOT NULL, kdf_p INTEGER NOT NULL,
-                 salt BLOB NOT NULL, nonce BLOB NOT NULL, wrapped BLOB NOT NULL);
-             CREATE TABLE records (
-                 id BLOB NOT NULL, kind INTEGER NOT NULL, namespace BLOB NOT NULL,
-                 nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
-                 PRIMARY KEY (id, kind)) WITHOUT ROWID;"
-        ))?;
+        tx.execute_batch(&schema("main"))?;
         tx.execute(
             "INSERT INTO vault (id, kdf_m, kdf_t, kdf_p, salt, nonce, wrapped) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
             params![wrap.kdf.m_kib, wrap.kdf.t, wrap.kdf.p, &wrap.salt[..], &wrap.nonce[..], &wrap.wrapped],
@@ -211,6 +238,7 @@ impl Db {
         if !Self::exists(dir) {
             return Err(StoreError::NotFound);
         }
+        remove_backup_leftovers(dir);
         let conn = Self::connect(&dir_fd, dir)?;
         let app_id: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         if app_id != APPLICATION_ID {
@@ -410,24 +438,42 @@ impl Db {
 
     /// Writes a consistent copy of the database (ciphertext and the master
     /// key wrap, as stored) to `dest`, which must not exist. Other key
-    /// slots are left out, so the copy opens with the master password only.
+    /// slots are never written to it, not even for a moment, so the copy
+    /// opens with the master password only. On failure `dest` is removed.
     pub fn backup_into(&self, dest: &Path) -> Result<(), StoreError> {
         let name = dest.to_str().ok_or(StoreError::Invalid("backup path is not UTF-8"))?;
-        self.conn.execute("VACUUM INTO ?1", params![name])?;
-        if self.has_key_slots()? {
-            let copy = Connection::open_with_flags(
-                dest,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            // The final VACUUM rewrites the file, so no page of the dropped
-            // table is left in it.
-            copy.execute_batch(
-                "PRAGMA journal_mode = DELETE;
-                 PRAGMA secure_delete = ON;
-                 DROP TABLE key_slots;
-                 VACUUM;",
-            )?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+            .open(dest)?;
+        let result = self.copy_into(name);
+        if result.is_err() {
+            let _ = std::fs::remove_file(dest);
         }
+        result
+    }
+
+    /// Fills the empty database file `name` with the format and the
+    /// `vault` and `records` tables, in one transaction.
+    fn copy_into(&self, name: &str) -> Result<(), StoreError> {
+        self.conn.execute("ATTACH DATABASE ?1 AS backup", params![name])?;
+        let copied = self.conn.execute_batch(&format!(
+            "PRAGMA backup.journal_mode = DELETE;
+             BEGIN;
+             {}
+             INSERT INTO backup.vault SELECT * FROM main.vault;
+             INSERT INTO backup.records SELECT * FROM main.records;
+             COMMIT;",
+            schema("backup")
+        ));
+        if copied.is_err() && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        let detached = self.conn.execute("DETACH DATABASE backup", []);
+        copied?;
+        detached?;
         Ok(())
     }
 

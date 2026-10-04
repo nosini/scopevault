@@ -491,8 +491,12 @@ fn backups_leave_the_login_slot_out() {
     let plain_dir = populated(&plain);
     Vault::open(&plain_dir).unwrap().backup_into(&plain.path().join("copy.db")).unwrap();
 
-    // The daemon's umask makes this 0600; the test's does not.
-    std::fs::set_permissions(copy_dir.join("vault.db"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mode = std::fs::metadata(copy_dir.join("vault.db")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "private whatever the umask");
+    let tables: i64 = raw(&copy_dir)
+        .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'key_slots'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "the slot table is never in the copy");
     let bytes = std::fs::read(copy_dir.join("vault.db")).unwrap();
     assert!(!bytes.windows(wrapped.len()).any(|w| w == &wrapped[..]), "the login wrap is still in the backup");
     let mut c = Vault::open(&copy_dir).unwrap();
@@ -504,6 +508,25 @@ fn backups_leave_the_login_slot_out() {
     drop(v);
     let mut v = Vault::open(&dir).unwrap();
     unlock_login(&mut v, b"login pw").unwrap();
+}
+
+#[test]
+fn opening_removes_backup_copies_a_crash_left_behind() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    let leftover = dir.join("backup-0123456789abcdef0123456789abcdef.tmp");
+    let unrelated = dir.join("notes.tmp");
+    // Not while another opener holds the vault: it may be making one.
+    let held = Vault::open(&dir).unwrap();
+    for f in [&leftover, &unrelated] {
+        std::fs::write(f, b"x").unwrap();
+    }
+    assert!(matches!(Vault::open(&dir), Err(StoreError::InUse)));
+    assert!(leftover.exists());
+    drop(held);
+    Vault::open(&dir).unwrap();
+    assert!(!leftover.exists());
+    assert!(unrelated.exists(), "only backup copies are removed");
 }
 
 #[test]

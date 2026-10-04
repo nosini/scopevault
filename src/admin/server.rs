@@ -29,6 +29,7 @@ use crate::identity::{BusCredentials, IdentityError, Principal, Scope};
 use crate::login::LoginUnlock;
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
 use crate::service_api::dispatch::GrantChange;
+use crate::store::db::{BACKUP_TMP_PREFIX, BACKUP_TMP_SUFFIX};
 use crate::store::{SHARED_COLLECTION, StoreError, is_valid_portal_app_id};
 
 /// Administrative connections served at once; more are closed at once.
@@ -515,7 +516,7 @@ impl AdminServer {
             let slot = vault.lock().unwrap();
             let v = slot.vault.as_ref().ok_or("there is no vault yet")?;
             let name = format!(
-                "backup-{}.tmp",
+                "{BACKUP_TMP_PREFIX}{}{BACKUP_TMP_SUFFIX}",
                 crate::store::payload::hex(&crate::crypto::random_array::<16>().map_err(|e| e.to_string())?)
             );
             let tmp = slot.dir.join(name);
