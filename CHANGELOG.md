@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.2
+
+- Moving an item into a scope whose `default` alias pointed at its
+  in-memory `session` collection lost the item at the next lock. The
+  `session` alias now only ever names that collection, and no other alias
+  can; a `session` alias saved by an older version that names a stored
+  collection is dropped at unlock.
+- Unlocking read every secret into memory, so an app that stored enough
+  data could make the vault impossible to open. It now reads only the
+  metadata, and checks every record's size first.
+- A scope's `session` collection may hold at most 8 MiB of secrets, and a
+  write no longer copies the scope's whole index, which slowed every app
+  down as one app's data grew.
+- A daemon that died while making a backup left a full copy of the vault,
+  login slot included, in the vault directory. The copy never contains
+  the slot now, and leftovers are removed when the vault opens.
+- A record write can no longer replace a record of another namespace.
+- Hash states are wiped from memory; docs/STORE.md now lists exactly what
+  is and isn't wiped.
+
 ## 0.12.1
 
 - The daemon logs a warning when an installed `scopevault.portal` names

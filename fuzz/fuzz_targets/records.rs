@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use scopevault::store::payload::{
-    CollectionPayload, ItemPayload, NamespacePayload, decode, decode_secret, encode_secret, unhex,
+    CollectionPayload, GrantPayload, ItemPayload, NamespacePayload, decode, decode_secret, encode_secret, unhex,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = decode::<NamespacePayload>(data, "namespace");
     let _ = decode::<CollectionPayload>(data, "collection");
     let _ = decode::<ItemPayload>(data, "item");
+    let _ = decode::<GrantPayload>(data, "grant");
     if let Ok(s) = std::str::from_utf8(data) {
         let _ = unhex(s);
     }

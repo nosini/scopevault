@@ -1489,6 +1489,43 @@ mod tests {
         assert!(created && s.collection_entry(&session).unwrap().ephemeral, "a new in-memory collection");
     }
 
+    /// Unlocks a vault holding one grant record written behind the
+    /// store's back (as a damaged file or an older bug could have), or two
+    /// identical ones with `twice`.
+    fn unlock_with_grant(owner: Scope, grantee: &str, twice: bool) -> Result<(), StoreError> {
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("vault");
+        let mut v = Vault::create(&dir, b"pw", KdfParams::MINIMUM).unwrap();
+        {
+            let mut s = v.scoped_admin(&AdminAuthority::offline(), owner).unwrap();
+            let (c, _) = s.create_collection("C", "").unwrap();
+            let (item, _) = s.create_item(&c, "i", BTreeMap::new(), &Secret::new("x", ""), false).unwrap();
+            let ns_id = s.ns().unwrap().id;
+            let p = GrantPayload { item, grantee: grantee.into(), write: false, created: 0 };
+            let writes: Vec<RawRecord> =
+                (0..if twice { 2 } else { 1 }).map(|_| s.grant_record(ns_id, new_id().unwrap(), &p).unwrap()).collect();
+            s.vault.db.apply(&writes, &[]).unwrap();
+        }
+        drop(v);
+        let mut v = Vault::open(&dir).unwrap();
+        v.unlock(b"pw")
+    }
+
+    #[test]
+    fn unlocking_checks_every_grant() {
+        unlock_with_grant(Scope::Host, "flatpak/org.example.B", false).unwrap();
+        for (what, owner, grantee, twice) in [
+            ("to the portal scope", Scope::Host, "portal", false),
+            ("to its own scope", Scope::Host, "host", false),
+            ("of a portal key", Scope::Portal, "host", false),
+            ("given twice", Scope::Host, "flatpak/org.example.B", true),
+            ("to no valid scope", Scope::Host, "flatpak/", false),
+        ] {
+            let r = unlock_with_grant(owner, grantee, twice);
+            assert!(matches!(r, Err(StoreError::Corrupt(_))), "a grant {what}: {r:?}");
+        }
+    }
+
     #[test]
     fn a_write_shares_what_it_does_not_change() {
         let tmp = TempDir::new();
