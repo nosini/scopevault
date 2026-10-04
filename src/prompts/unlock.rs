@@ -457,9 +457,13 @@ impl Unlocker {
         UnlockOutcome::Cancelled
     }
 
-    /// The key derivation cost for new wraps.
+    /// The key derivation cost for new wraps of the vault key: the master
+    /// wrap's, so the login slot or a new master password costs an attacker
+    /// as much as the vault's password does now. Without a vault, the cost
+    /// chosen for a new one.
     pub fn kdf(&self) -> KdfParams {
-        self.new_vault_kdf
+        let slot = self.vault.lock().unwrap();
+        slot.vault.as_ref().and_then(|v| v.key_wrap().ok()).map_or(self.new_vault_kdf, |w| w.kdf)
     }
 
     /// Asks for a password that is not the master password (the login
@@ -504,7 +508,7 @@ impl Unlocker {
             Ok(PinOutcome::Cancelled) => return UnlockOutcome::Cancelled,
             Err(e) => return UnlockOutcome::Failed(e.to_string()),
         };
-        let kdf = self.new_vault_kdf;
+        let kdf = old_wrap.kdf;
         let new_wrap = match tokio::task::spawn_blocking(move || key.wrap(new.as_bytes(), kdf)).await {
             Ok(Ok(w)) => w,
             Ok(Err(e)) => return UnlockOutcome::Failed(e.to_string()),

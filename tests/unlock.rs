@@ -130,6 +130,25 @@ async fn a_lock_during_the_derivation_cancels_the_dialogs_unlock() {
     assert!(!fx.unlocked());
 }
 
+/// New wraps of the vault key, a new master password or the login slot,
+/// keep the cost the vault's master wrap has, not the default.
+#[tokio::test]
+async fn new_wraps_keep_the_vaults_key_derivation_cost() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::new(&["old password", "new password"], None);
+    // Not the fixture's cost for new vaults (MINIMUM).
+    let cost = KdfParams { t: 2, ..KdfParams::MINIMUM };
+    {
+        let mut slot = fx.unlocker.vault().lock().unwrap();
+        let v = Vault::create(&slot.dir, b"old password", cost).unwrap();
+        slot.vault = Some(v);
+    }
+    assert_eq!(fx.unlocker.kdf(), cost);
+    assert_eq!(fx.unlocker.change_password().await, UnlockOutcome::Unlocked);
+    let wrap = fx.unlocker.vault().lock().unwrap().vault.as_ref().unwrap().key_wrap().unwrap();
+    assert_eq!(wrap.kdf, cost);
+}
+
 #[tokio::test]
 async fn wrong_then_right_password() {
     let _s = SERIAL.lock().await;

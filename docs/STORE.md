@@ -20,7 +20,8 @@ salt; the records themselves are not re-encrypted.
 
 The default cost is 256 MiB of memory, 3 passes and 1 lane.
 When the daemon creates a vault, it measures the machine and picks the
-number of passes so that unlocking takes about a second.
+number of passes so that unlocking takes about a second. A new master
+password and the login slot are wrapped with the cost the master wrap has.
 Whatever the header says, the parameters must stay within fixed bounds
 (19 MiB to 2 GiB, 1 to 20 passes, 1 to 16 lanes), so a tampered or
 imported vault cannot make the daemon allocate unbounded memory or run for
