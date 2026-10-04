@@ -16,12 +16,12 @@ use std::sync::Arc;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zeroize::Zeroizing;
 
-use crate::identity::{CallerResolver, Principal};
+use crate::identity::{CallerResolver, Principal, Scope};
 use crate::prompts::unlock::UnlockOutcome;
 use crate::store::{SHARED_COLLECTION, ScopedVault, Secret};
 
 use super::dispatch::{
-    Call, CallResult, Event, Fault, MAX_PROMPTS_PER_CONNECTION, MAX_SECRET_BYTES_PER_REPLY,
+    Call, CallResult, Event, Fault, GrantChange, MAX_PROMPTS_PER_CONNECTION, MAX_SECRET_BYTES_PER_REPLY,
     MAX_SESSIONS_PER_CONNECTION, MAX_UNLOCK_PATHS_PER_SCOPE, Node, PromptAction, PromptEntry, SecretService,
     SignalBody, Target, TransferSession, service_path, value,
 };
@@ -76,6 +76,36 @@ fn resolve_obj(v: &ScopedVault<'_>, path: &str) -> Option<Obj> {
 
 fn is_locked(v: &ScopedVault<'_>, o: &Obj) -> bool {
     v.collection(o.collection()).is_none_or(|c| c.locked)
+}
+
+/// Sets a collection's logical lock state. Its shared items disappear from
+/// their grantees' `Shared` collections while it is locked; returns what
+/// the grantees must be told.
+fn set_locked(v: &mut ScopedVault<'_>, collection: &str, locked: bool) -> Result<Vec<GrantChange>, Fault> {
+    let Some(info) = v.collection(collection) else { return Err(Fault::no_such_object()) };
+    if info.locked == locked {
+        return Ok(Vec::new());
+    }
+    let items = info.items;
+    let grants: Vec<(Scope, String)> = items.iter().flat_map(|i| v.grantees_of(collection, i)).collect();
+    let had: BTreeMap<Scope, bool> = grants.iter().map(|(g, _)| (g.clone(), v.grantee_sees_shared(g))).collect();
+    v.set_collection_locked(collection, locked)?;
+    let mut told = BTreeSet::new();
+    Ok(grants
+        .into_iter()
+        .map(|(grantee, grant)| {
+            // `Collections` changes at most once per grantee.
+            let (had, has) = (had[&grantee], v.grantee_sees_shared(&grantee));
+            let first = told.insert(grantee.clone());
+            GrantChange {
+                grantee,
+                grant,
+                created: !locked,
+                shared_appeared: first && !had && has,
+                shared_disappeared: first && had && !has,
+            }
+        })
+        .collect())
 }
 
 fn args<T>(call: &Call<'_>) -> Result<T, Fault>
@@ -434,20 +464,24 @@ impl<R: CallerResolver> SecretService<R> {
             }
             "Lock" => {
                 let (objects,): (Vec<OwnedObjectPath>,) = args(call)?;
-                let (locked, newly) = self.with_vault(&call.principal, |v| {
+                let (locked, newly, grants) = self.with_vault(&call.principal, |v| {
                     let resolved: BTreeSet<Obj> = objects.iter().filter_map(|p| resolve_obj(v, p.as_str())).collect();
                     let mut newly = BTreeSet::new();
+                    let mut grants = Vec::new();
                     for o in &resolved {
                         if !is_locked(v, o) {
-                            v.set_collection_locked(o.collection(), true)?;
+                            grants.extend(set_locked(v, o.collection(), true)?);
                             newly.insert(o.collection().to_owned());
                         }
                     }
-                    Ok((resolved.iter().map(Obj::path).collect::<Vec<_>>(), newly))
+                    Ok((resolved.iter().map(Obj::path).collect::<Vec<_>>(), newly, grants))
                 })?;
                 for c in newly {
                     let events = self.lock_events(&call.principal, &c, true)?;
                     call.events.extend(events);
+                }
+                for g in &grants {
+                    call.events.extend(self.grant_events(g));
                 }
                 call.reply(&(locked, paths::none()))
             }
@@ -786,8 +820,11 @@ impl<R: CallerResolver> SecretService<R> {
                     }
                     for c in &locked_collections {
                         // The collection may have been deleted meanwhile.
-                        if self.with_vault(principal, |v| Ok(v.set_collection_locked(c, false)?)).is_ok() {
+                        if let Ok(grants) = self.with_vault(principal, |v| set_locked(v, c, false)) {
                             events.extend(self.lock_events(principal, c, false).map_err(fail)?);
+                            for g in &grants {
+                                events.extend(self.grant_events(g));
+                            }
                         }
                     }
                 }

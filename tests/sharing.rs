@@ -241,15 +241,42 @@ async fn locking_hides_or_locks_shared_items() {
     let bs = ClientSession::plain(&b).await;
     let from = fx.service_name().await;
 
-    // The owner locks its collection: the item is invisible to B.
+    // The owner locks its collection: the item is invisible to B, and B is
+    // told that it and Shared disappeared.
+    let b_log = SignalLog::start(&b, &from);
+    let b_collections = |log: &SignalLog| -> Vec<Vec<String>> {
+        log.changed_values(SERVICE, "Collections")
+            .into_iter()
+            .map(|v| {
+                let paths: Vec<zbus::zvariant::OwnedObjectPath> = v.try_into().unwrap();
+                paths.iter().map(|p| p.to_string()).collect()
+            })
+            .collect()
+    };
     xlock(&host, "Lock", &[LOGIN_COL]).await.unwrap();
     let err = call(&b, &grant_path, ITEM_IFACE, "GetSecret", &(bs.path.clone(),)).await.unwrap_err();
     assert_eq!(err.0, UNKNOWN_OBJECT, "{err:?}");
     let cols = collections(&b).await;
     assert!(!cols.contains(&SHARED_COL.to_owned()), "{cols:?}");
+    let m = b_log.wait_for(SHARED_COL, "ItemDeleted", Duration::from_secs(5)).await.expect("B's ItemDeleted");
+    let (p,): (zbus::zvariant::OwnedObjectPath,) = m.body().deserialize().unwrap();
+    assert_eq!(p.as_str(), grant_path);
+    b_log.wait_for(SERVICE, "PropertiesChanged", Duration::from_secs(5)).await.expect("B's Collections change");
+    assert_eq!(b_collections(&b_log), [vec![LOGIN_COL.to_owned()]]);
+
+    // Unlocking brings both back, and B is told.
     fx.vault.set_pins(&[PASSWORD]);
     let (_, prompt) = xlock(&host, "Unlock", &[LOGIN_COL]).await.unwrap();
     run_prompt(&host, &from, &prompt).await;
+    let m = b_log.wait_for(SHARED_COL, "ItemCreated", Duration::from_secs(5)).await.expect("B's ItemCreated");
+    let (p,): (zbus::zvariant::OwnedObjectPath,) = m.body().deserialize().unwrap();
+    assert_eq!(p.as_str(), grant_path);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while b_collections(&b_log).len() < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(b_collections(&b_log), [vec![LOGIN_COL.to_owned()], vec![SHARED_COL.to_owned(), LOGIN_COL.to_owned()]]);
+    drop(b_log);
 
     // B locks Shared: only B's view is affected.
     xlock(&b, "Lock", &[SHARED_COL]).await.unwrap();

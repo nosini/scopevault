@@ -877,6 +877,11 @@ impl ScopedVault<'_> {
     /// This scope's visible shared items, sorted by grant ID. Grants are few
     /// (at most [`MAX_GRANTS_PER_SCOPE`] per owner), so they are scanned.
     fn shared_items(&self) -> Vec<SharedItem> {
+        self.shared_items_of(&self.scope)
+    }
+
+    /// [`ScopedVault::shared_items`] of another scope's view.
+    fn shared_items_of(&self, scope: &Scope) -> Vec<SharedItem> {
         let st = self.state();
         // Staged changes replace whole namespaces (see `ns`); inside a
         // transaction the walk follows them.
@@ -884,15 +889,15 @@ impl ScopedVault<'_> {
         let mut out = Vec::new();
         for (owner, ns) in &st.namespaces {
             match staged.and_then(|s| s.get(owner)) {
-                Some(Some(replacement)) => Self::collect_shared(st, &self.scope, owner, replacement, &mut out),
+                Some(Some(replacement)) => Self::collect_shared(st, scope, owner, replacement, &mut out),
                 Some(None) => {}
-                None => Self::collect_shared(st, &self.scope, owner, ns, &mut out),
+                None => Self::collect_shared(st, scope, owner, ns, &mut out),
             }
         }
         if let Some(s) = staged {
             for (owner, ns) in s.iter().filter(|(o, _)| !st.namespaces.contains_key(*o)) {
                 if let Some(ns) = ns {
-                    Self::collect_shared(st, &self.scope, owner, ns, &mut out);
+                    Self::collect_shared(st, scope, owner, ns, &mut out);
                 }
             }
         }
@@ -946,6 +951,12 @@ impl ScopedVault<'_> {
             return Err(StoreError::Corrupt("secret record is misfiled".into()));
         }
         payload::decode_secret(&open_record(&self.state().cipher, &raw)?)
+    }
+
+    /// Whether `grantee`'s view has a `Shared` collection, for telling it
+    /// when a change here makes one appear or disappear.
+    pub fn grantee_sees_shared(&self, grantee: &Scope) -> bool {
+        !self.shared_items_of(grantee).is_empty()
     }
 
     /// The grants of one of this (owner's) view's items, as (grantee, grant

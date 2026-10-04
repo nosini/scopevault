@@ -942,35 +942,41 @@ impl<R: CallerResolver> SecretService<R> {
     pub fn grant_changed(self: &Arc<Self>, change: GrantChange) {
         let this = self.clone();
         tokio::spawn(async move {
-            let member = if change.created { "ItemCreated" } else { "ItemDeleted" };
-            this.emit(Event {
-                target: Target::Scope(change.grantee.clone()),
-                path: paths::collection(SHARED_COLLECTION),
-                interface: interfaces::COLLECTION.name,
-                member,
-                body: SignalBody::Path(paths::item(SHARED_COLLECTION, &change.grant)),
-            })
-            .await;
-            if !change.shared_appeared && !change.shared_disappeared {
-                return;
+            for e in this.grant_events(&change) {
+                this.emit(e).await;
             }
-            // The property value is the grantee's own view, so only a
-            // connected principal of that scope can compute it; without one,
-            // nobody receives anything anyway.
-            let Some(principal) = this.active_principals().into_iter().find(|p| p.scope() == change.grantee) else {
-                return;
-            };
-            let Ok(cols) = this.with_vault(&principal, |v| Ok(v.collection_names())) else { return };
-            let Ok(v) = value(cols.iter().map(|c| paths::collection(c)).collect::<Vec<_>>()) else { return };
-            this.emit(Event {
-                target: Target::Scope(change.grantee.clone()),
-                path: service_path(),
-                interface: interfaces::PROPERTIES.name,
-                member: "PropertiesChanged",
-                body: SignalBody::PropertiesChanged(interfaces::SERVICE.name, BTreeMap::from([("Collections", v)])),
-            })
-            .await;
         });
+    }
+
+    /// The signals for a [`GrantChange`], to the grantee scope only.
+    pub(crate) fn grant_events(&self, change: &GrantChange) -> Vec<Event> {
+        let member = if change.created { "ItemCreated" } else { "ItemDeleted" };
+        let mut events = vec![Event {
+            target: Target::Scope(change.grantee.clone()),
+            path: paths::collection(SHARED_COLLECTION),
+            interface: interfaces::COLLECTION.name,
+            member,
+            body: SignalBody::Path(paths::item(SHARED_COLLECTION, &change.grant)),
+        }];
+        if !change.shared_appeared && !change.shared_disappeared {
+            return events;
+        }
+        // The property value is the grantee's own view, so only a connected
+        // principal of that scope can compute it; without one, nobody
+        // receives anything anyway.
+        let Some(principal) = self.active_principals().into_iter().find(|p| p.scope() == change.grantee) else {
+            return events;
+        };
+        let Ok(cols) = self.with_vault(&principal, |v| Ok(v.collection_names())) else { return events };
+        let Ok(v) = value(cols.iter().map(|c| paths::collection(c)).collect::<Vec<_>>()) else { return events };
+        events.push(Event {
+            target: Target::Scope(change.grantee.clone()),
+            path: service_path(),
+            interface: interfaces::PROPERTIES.name,
+            member: "PropertiesChanged",
+            body: SignalBody::PropertiesChanged(interfaces::SERVICE.name, BTreeMap::from([("Collections", v)])),
+        });
+        events
     }
 }
 
