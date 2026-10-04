@@ -121,7 +121,7 @@ only acts for the account it runs for.
 | PAM phase | What it does |
 | --- | --- |
 | `auth` | Keeps the password for the session, and starts the helper in `--if-running` mode, which delivers only if the daemon is already up. This is the screen-unlock case. |
-| `open_session` | Starts the helper in `--wait` mode with the kept password, then forgets it. This is the login case: the daemon starts with the graphical session, a little later. |
+| `open_session` | Starts the helper in `--wait` mode with the kept password, then forgets it. This is the login case: the daemon starts with the graphical session, a little later. The password is kept with the account it was entered for; if the application switched the PAM user to another account in between (sudo does), it is dropped instead. |
 | `chauthtok` | In the update phase only, passes the old and the new password with `--change`. |
 
 Starting the helper: everything that isn't safe after `fork` happens

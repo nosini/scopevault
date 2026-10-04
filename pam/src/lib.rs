@@ -147,14 +147,19 @@ fn account(pamh: *mut PamHandle) -> Option<Account> {
     Some(Account { uid: pwd.pw_uid, gid: pwd.pw_gid, home, groups })
 }
 
+/// [`account`], logging when there is none.
+fn known_account(pamh: *mut PamHandle) -> Option<Account> {
+    let acct = account(pamh);
+    if acct.is_none() {
+        log(pamh, libc::LOG_NOTICE, "unknown user; password not passed on");
+    }
+    acct
+}
+
 /// Starts the helper as the user with `passwords` (each NUL-terminated) on
 /// its stdin, and waits briefly for it: it reads its input and forks into
 /// the background.
-fn run_helper(pamh: *mut PamHandle, helper: &CStr, mode: &CStr, passwords: &[&[u8]]) {
-    let Some(acct) = account(pamh) else {
-        log(pamh, libc::LOG_NOTICE, "unknown user; password not passed on");
-        return;
-    };
+fn run_helper(pamh: *mut PamHandle, acct: &Account, helper: &CStr, mode: &CStr, passwords: &[&[u8]]) {
     if acct.uid == 0 {
         return;
     }
@@ -204,9 +209,7 @@ fn run_helper(pamh: *mut PamHandle, helper: &CStr, mode: &CStr, passwords: &[&[u
     // memory prepared above, and ends in execve or _exit.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        unsafe {
-            child(theirs, devnull.as_ptr(), drop_privileges, &acct, helper.as_ptr(), argv.as_ptr(), envp.as_ptr())
-        }
+        unsafe { child(theirs, devnull.as_ptr(), drop_privileges, acct, helper.as_ptr(), argv.as_ptr(), envp.as_ptr()) }
     }
     // SAFETY: closing our copy of the child's end.
     unsafe { libc::close(theirs) };
@@ -306,16 +309,32 @@ unsafe fn child(
     }
 }
 
+/// The password from `auth`, kept for `open_session`, with the account it
+/// was given for: the application may change `PAM_USER` in between (sudo
+/// does, to the target user), and the password must only ever reach the
+/// account it belongs to.
+struct Stash {
+    uid: libc::uid_t,
+    password: Zeroizing<Vec<u8>>,
+}
+
+impl Stash {
+    /// The password, if `acct` is the account it was stashed for.
+    fn password_for(&self, acct: &Account) -> Option<&[u8]> {
+        (self.uid == acct.uid).then_some(&self.password[..])
+    }
+}
+
 unsafe extern "C" fn drop_stash(_pamh: *mut PamHandle, data: *mut c_void, _status: c_int) {
     if !data.is_null() {
         // SAFETY: `data` came from Box::into_raw in `stash`; PAM calls this
         // once per stored value. Dropping zeroizes the password.
-        drop(unsafe { Box::from_raw(data.cast::<Zeroizing<Vec<u8>>>()) });
+        drop(unsafe { Box::from_raw(data.cast::<Stash>()) });
     }
 }
 
-fn stash(pamh: *mut PamHandle, password: &[u8]) {
-    let data = Box::into_raw(Box::new(Zeroizing::new(password.to_vec())));
+fn stash(pamh: *mut PamHandle, uid: libc::uid_t, password: &[u8]) {
+    let data = Box::into_raw(Box::new(Stash { uid, password: Zeroizing::new(password.to_vec()) }));
     // SAFETY: PAM owns `data` from here and frees it through `drop_stash`.
     let rc = unsafe { ffi::pam_set_data(pamh, STASH.as_ptr(), data.cast(), Some(drop_stash)) };
     if rc != ffi::PAM_SUCCESS {
@@ -324,15 +343,16 @@ fn stash(pamh: *mut PamHandle, password: &[u8]) {
     }
 }
 
-fn take_stash(pamh: *mut PamHandle) -> Option<Zeroizing<Vec<u8>>> {
+fn take_stash(pamh: *mut PamHandle) -> Option<Stash> {
     let mut ptr: *const c_void = std::ptr::null();
     // SAFETY: a valid out-pointer.
     let rc = unsafe { ffi::pam_get_data(pamh, STASH.as_ptr(), &mut ptr) };
     if rc != ffi::PAM_SUCCESS || ptr.is_null() {
         return None;
     }
-    // SAFETY: stored by `stash` as a boxed Zeroizing<Vec<u8>>.
-    let copy = Zeroizing::new(unsafe { &*ptr.cast::<Zeroizing<Vec<u8>>>() }.to_vec());
+    // SAFETY: stored by `stash` as a boxed Stash.
+    let stored = unsafe { &*ptr.cast::<Stash>() };
+    let copy = Stash { uid: stored.uid, password: Zeroizing::new(stored.password.to_vec()) };
     // Replacing the value runs `drop_stash` on the old one.
     // SAFETY: storing a null pointer without cleanup.
     unsafe { ffi::pam_set_data(pamh, STASH.as_ptr(), std::ptr::null_mut(), None) };
@@ -352,8 +372,9 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     guarded(pamh, || {
         let Some(helper) = helper_path(argc, argv) else { return };
         let Some(password) = item(pamh, ffi::PAM_AUTHTOK) else { return };
-        stash(pamh, &password);
-        run_helper(pamh, &helper, c"--if-running", &[&password]);
+        let Some(acct) = known_account(pamh) else { return };
+        stash(pamh, acct.uid, &password);
+        run_helper(pamh, &acct, &helper, c"--if-running", &[&password]);
     })
 }
 
@@ -381,9 +402,14 @@ pub unsafe extern "C" fn pam_sm_open_session(
     argv: *const *const c_char,
 ) -> c_int {
     guarded(pamh, || {
-        let Some(password) = take_stash(pamh) else { return };
+        let Some(stash) = take_stash(pamh) else { return };
         let Some(helper) = helper_path(argc, argv) else { return };
-        run_helper(pamh, &helper, c"--wait", &[&password]);
+        let Some(acct) = known_account(pamh) else { return };
+        let Some(password) = stash.password_for(&acct) else {
+            log(pamh, libc::LOG_NOTICE, "the account changed since authentication; password not passed on");
+            return;
+        };
+        run_helper(pamh, &acct, &helper, c"--wait", &[password]);
     })
 }
 
@@ -416,7 +442,8 @@ pub unsafe extern "C" fn pam_sm_chauthtok(
         }
         let Some(helper) = helper_path(argc, argv) else { return };
         let (Some(old), Some(new)) = (item(pamh, ffi::PAM_OLDAUTHTOK), item(pamh, ffi::PAM_AUTHTOK)) else { return };
-        run_helper(pamh, &helper, c"--change", &[&old, &new]);
+        let Some(acct) = known_account(pamh) else { return };
+        run_helper(pamh, &acct, &helper, c"--change", &[&old, &new]);
     })
 }
 
@@ -426,6 +453,14 @@ mod tests {
 
     fn args(list: &[&CStr]) -> Vec<*const c_char> {
         list.iter().map(|a| a.as_ptr()).collect()
+    }
+
+    #[test]
+    fn the_stash_is_only_for_its_own_account() {
+        let acct = |uid| Account { uid, gid: uid, home: c"/home/x".to_owned(), groups: Vec::new() };
+        let stash = Stash { uid: 1000, password: Zeroizing::new(b"secret".to_vec()) };
+        assert_eq!(stash.password_for(&acct(1000)), Some(&b"secret"[..]));
+        assert_eq!(stash.password_for(&acct(1001)), None);
     }
 
     #[test]
