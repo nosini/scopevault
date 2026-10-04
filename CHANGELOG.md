@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.12.3
+
+- An `Unlock` prompt kept every path of its request until it completed,
+  so one app could make the daemon hold gigabytes and get it killed. A
+  prompt now keeps only the distinct paths that can name an object, and
+  an app's pending prompts hold at most 4096 of them.
+- An app that started many unlock prompts at once got a password dialog
+  for each, past the limit of three cancelled dialogs. The limit is now
+  checked when each dialog's turn comes.
+- Locking or unlocking a collection now signals each of its items'
+  `Locked` change; libsecret caches it per item and skipped unlocked
+  items as still locked.
+- Apps that an item is shared with are told when the owner's lock hides
+  or shows it, and when `CreateItem` replaces it.
+- A request caught by a lock right after an unlock is answered with
+  `IsLocked` instead of "No such object".
+- Every copy of a transfer session's shared value is wiped.
+
 ## 0.12.2
 
 - Moving an item into a scope whose `default` alias pointed at its
