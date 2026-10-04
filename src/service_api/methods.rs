@@ -8,7 +8,10 @@
 //! else is treated exactly like a path that does not exist.
 //!
 //! Secrets received from clients are moved into zeroizing buffers at once.
-//! The D-Bus message buffers themselves belong to zbus and are not wiped.
+//! Secrets sent to clients are decrypted into zeroizing buffers, but the
+//! reply's copy (the plain value, or its encryption for the session) is an
+//! ordinary buffer, like the D-Bus message buffers themselves, which belong
+//! to zbus: none of these are wiped.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

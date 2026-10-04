@@ -212,8 +212,9 @@ through `/proc`.
   so are the hash functions' states. Not wiped: decrypted labels,
   attributes and names, which are freed as they are; Argon2's working
   memory, which goes back to the kernel; intermediate values on the stack
-  inside the crypto libraries; and copies made by the allocator, the
-  kernel or swap. Memory is not locked with `mlock`, because Argon2's
+  inside the crypto libraries; the D-Bus messages that carry secrets to
+  and from clients, including a reply's copy of a secret; and copies made
+  by the allocator, the kernel or swap. Memory is not locked with `mlock`, because Argon2's
   256 MiB would exceed the usual limits.
 - Root, or programs running as you. They can read the daemon's memory by
   other means, replace the daemon, or capture the password as you type it.

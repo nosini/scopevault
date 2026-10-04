@@ -18,7 +18,7 @@
 //! service already runs as the user.
 
 use crypto_bigint::modular::{FixedMontyForm, FixedMontyParams};
-use crypto_bigint::{Odd, U1024};
+use crypto_bigint::{Odd, U1024, Word};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::dispatch::Fault;
@@ -80,8 +80,6 @@ pub fn negotiate(algorithm: &str, input: &zbus::zvariant::Value<'_>) -> Result<(
     }
 }
 
-/// Performs the server side of the key agreement. Returns the AES key and
-/// our public value.
 /// Parses and checks a peer's public value: 1 < y < p - 1.
 fn parse_public(peer: &[u8]) -> Result<U1024, Fault> {
     let trimmed: &[u8] = &peer[peer.iter().position(|&b| b != 0).unwrap_or(peer.len())..];
@@ -115,9 +113,15 @@ fn random_exponent() -> Result<U1024, Fault> {
 /// The AES key both sides derive: HKDF-SHA256 of the shared value, no salt,
 /// no info (libsecret's choice).
 fn derive_key(y: &U1024, x: &U1024) -> Zeroizing<[u8; 16]> {
-    let mut shared = FixedMontyForm::new(y, &params()).pow(x).retrieve();
+    // The shared value, in Montgomery form and as an integer: both copies
+    // are wiped. Its big-endian bytes are written straight into `ikm`.
+    let mut monty = FixedMontyForm::new(y, &params()).pow(x);
+    let mut shared = monty.retrieve();
+    monty.zeroize();
     let mut ikm = Zeroizing::new([0u8; PRIME_BYTES]);
-    ikm.copy_from_slice(shared.to_be_bytes().as_ref());
+    for (chunk, word) in ikm.as_chunks_mut::<{ size_of::<Word>() }>().0.iter_mut().zip(shared.as_words().iter().rev()) {
+        *chunk = word.to_be_bytes();
+    }
     shared.zeroize();
     let mut key = Zeroizing::new([0u8; 16]);
     hkdf::Hkdf::<sha2::Sha256>::new(None, ikm.as_ref())
