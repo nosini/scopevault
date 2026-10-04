@@ -265,6 +265,36 @@ fn unlocking_does_not_read_secret_values() {
 }
 
 #[test]
+fn a_record_is_never_moved_to_another_namespace() {
+    use scopevault::store::db::{Db, RawRecord};
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    let (id, other_ns, nonce, ciphertext): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = raw(&dir)
+        .query_row(
+            "SELECT r.id, (SELECT n.id FROM records AS n WHERE n.kind = 1 AND n.id != r.namespace), r.nonce, r.ciphertext
+             FROM records AS r WHERE r.kind = 3 LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    let mut db = Db::open(&dir).unwrap();
+    let r = RawRecord {
+        id: id.clone().try_into().unwrap(),
+        kind: 3,
+        namespace: other_ns.try_into().unwrap(),
+        nonce: nonce.clone(),
+        ciphertext: b"overwritten".to_vec(),
+    };
+    assert!(matches!(db.apply(&[r], &[]), Err(StoreError::Invalid(_))));
+    drop(db);
+    let kept: Vec<u8> =
+        raw(&dir).query_row("SELECT ciphertext FROM records WHERE id = ?1 AND kind = 3", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(kept, ciphertext, "the record in its own namespace is untouched");
+    let mut v = Vault::open(&dir).unwrap();
+    v.unlock(PW).unwrap();
+}
+
+#[test]
 fn tampered_secret_fails_on_read_only() {
     let tmp = TempDir::new("store");
     let dir = populated(&tmp);

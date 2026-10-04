@@ -490,15 +490,24 @@ impl Db {
         {
             let mut put = tx.prepare_cached(
                 "INSERT INTO records (id, kind, namespace, nonce, ciphertext) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (id, kind) DO UPDATE SET namespace = excluded.namespace,
-                     nonce = excluded.nonce, ciphertext = excluded.ciphertext",
+                 ON CONFLICT (id, kind) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext
+                     WHERE records.namespace = excluded.namespace",
             )?;
             let mut del = tx.prepare_cached("DELETE FROM records WHERE id = ?1 AND kind = ?2")?;
             for op in ops {
                 match op {
-                    Op::Put(r) => put.execute(params![&r.id[..], r.kind, &r.namespace[..], &r.nonce, &r.ciphertext])?,
-                    Op::Delete(id, kind) => del.execute(params![&id[..], kind])?,
-                };
+                    Op::Put(r) => {
+                        // A record never changes namespace. An ID that is
+                        // already taken in another one is a bug, which must
+                        // not overwrite that namespace's record.
+                        if put.execute(params![&r.id[..], r.kind, &r.namespace[..], &r.nonce, &r.ciphertext])? != 1 {
+                            return Err(StoreError::Invalid("record ID taken in another namespace"));
+                        }
+                    }
+                    Op::Delete(id, kind) => {
+                        del.execute(params![&id[..], kind])?;
+                    }
+                }
             }
         }
         tx.commit()?;
