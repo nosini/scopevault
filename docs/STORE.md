@@ -133,6 +133,11 @@ lives in memory only: neither it nor its items or secrets are ever written
 to disk, and it is gone after a global lock or a restart. A stored
 collection with that name counts as corruption.
 
+The `session` alias only ever names that collection, and no other alias
+names it, so whatever is stored through `default` or another alias reaches
+the disk. The alias can't be removed or pointed elsewhere; it goes away
+with the collection.
+
 ## The `login` collection
 
 The first time a scope uses the unlocked vault, it gets a collection named

@@ -618,3 +618,33 @@ fn session_collection_is_memory_only() {
     assert!(s.alias("session").is_none());
     assert_eq!(s.alias("default"), Some(persistent));
 }
+
+#[test]
+fn the_session_alias_names_only_the_session_collection() {
+    let tmp = TempDir::new("store");
+    let mut v = Vault::create(&vault_dir(&tmp), PW, KDF).unwrap();
+    let mut s = v.scoped(&app("org.example.Session")).unwrap();
+    let login = s.create_collection("Login", "default").unwrap().0;
+    let session = s.create_collection("Temporary", "session").unwrap().0;
+    let refused = |r: Result<(), StoreError>| assert!(matches!(r, Err(StoreError::NotPermitted(_))), "{r:?}");
+
+    // Anything stored through `default` or another alias must reach the disk.
+    refused(s.set_alias("default", Some(&session)));
+    refused(s.set_alias("other", Some(&session)));
+    // Anything stored through `session` must not.
+    refused(s.set_alias("session", Some(&login)));
+    // Removing it would let CreateCollection replace the collection and its items.
+    refused(s.set_alias("session", None));
+    assert_eq!(s.alias("default"), Some(login.clone()));
+    assert_eq!(s.alias("session"), Some(session.clone()));
+    assert_eq!(s.alias("other"), None);
+    s.set_alias("session", Some(&session)).unwrap();
+    s.set_alias("other", Some(&login)).unwrap();
+    s.set_alias("other", None).unwrap();
+
+    // Without a session collection, `session` cannot be set at all.
+    s.delete_collection(&session).unwrap();
+    assert_eq!(s.alias("session"), None);
+    refused(s.set_alias("session", Some(&login)));
+    s.set_alias("session", None).unwrap();
+}

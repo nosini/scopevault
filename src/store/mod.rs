@@ -379,6 +379,12 @@ fn build_index(cipher: &RecordCipher, records: &[RawRecord]) -> Result<HashMap<S
             if !paths::is_valid_element(&alias) || ns.collection_by_id(&cid).is_none() {
                 return Err(corrupt("alias to a missing collection".into()));
             }
+            // Versions before 0.12.2 let `session` point at a persistent
+            // collection; that alias is dropped, so `session` is in memory
+            // again.
+            if alias == SESSION_ALIAS {
+                continue;
+            }
             ns.aliases.insert(alias, cid);
         }
         out.insert(scope, ns);
@@ -1186,12 +1192,22 @@ impl ScopedVault<'_> {
         let (mut ns, new) = self.ns_or_new()?;
         match target {
             None => {
+                if alias == SESSION_ALIAS && ns.aliases.contains_key(alias) {
+                    return Err(StoreError::NotPermitted("the session alias is reserved"));
+                }
                 if new || ns.aliases.remove(alias).is_none() {
                     return Ok(());
                 }
             }
             Some(name) => {
-                let id = ns.collections.get(name).ok_or(StoreError::NoSuchObject)?.id;
+                let c = ns.collections.get(name).ok_or(StoreError::NoSuchObject)?;
+                // Only `session` names the in-memory collection, and it names
+                // nothing else: whatever follows another alias must reach
+                // the disk, and whatever is stored under `session` must not.
+                if (alias == SESSION_ALIAS) != c.ephemeral {
+                    return Err(StoreError::NotPermitted("the session alias is reserved"));
+                }
+                let id = c.id;
                 if ns.aliases.len() >= MAX_ALIASES_PER_SCOPE && !ns.aliases.contains_key(alias) {
                     return Err(StoreError::Limit("too many aliases"));
                 }
@@ -1378,5 +1394,54 @@ impl ScopedVault<'_> {
         }
         let writes = vec![self.collection_record(ns.id, collection, &ns.collections[collection])?];
         self.commit(ns, &writes, &deletes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::DirBuilderExt;
+
+    use super::*;
+
+    /// A private directory, removed when dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let base = std::env::var_os("TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            let p = base.join(format!("scopevault-store-{}", hex(&random_array::<16>().unwrap())));
+            std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            TempDir(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_stored_session_alias_to_a_persistent_collection_is_dropped() {
+        let tmp = TempDir::new();
+        let dir = tmp.0.join("vault");
+        let mut v = Vault::create(&dir, b"pw", KdfParams::MINIMUM).unwrap();
+        {
+            let mut s = v.scoped(&Principal::Host).unwrap();
+            let (name, _) = s.create_collection("Login", DEFAULT_ALIAS).unwrap();
+            // What versions before 0.12.2 stored after SetAlias("session", login).
+            let mut ns = s.ns().cloned().unwrap();
+            ns.aliases.insert(SESSION_ALIAS.into(), ns.collections[&name].id);
+            let writes = vec![s.namespace_record(&ns).unwrap()];
+            s.commit(ns, &writes, &[]).unwrap();
+        }
+        drop(v);
+        let mut v = Vault::open(&dir).unwrap();
+        v.unlock(b"pw").unwrap();
+        let mut s = v.scoped(&Principal::Host).unwrap();
+        assert_eq!(s.alias(SESSION_ALIAS), None);
+        assert_eq!(s.alias(DEFAULT_ALIAS).as_deref(), Some(LOGIN_COLLECTION));
+        let (session, created) = s.create_collection("Temporary", SESSION_ALIAS).unwrap();
+        assert!(created && s.collection_entry(&session).unwrap().ephemeral, "a new in-memory collection");
     }
 }

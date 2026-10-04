@@ -297,9 +297,14 @@ impl ScopedVault<'_> {
     }
 
     /// The collection the `default` alias points to; if there is none, a
-    /// new "Login" collection that the alias then points to.
+    /// new "Login" collection that the alias then points to. Never the
+    /// in-memory `session` collection, which a move would empty at the next
+    /// lock.
     fn default_collection_or_create(&mut self) -> Result<String, StoreError> {
         if let Some(name) = self.alias(DEFAULT_ALIAS) {
+            if self.collection_entry(&name)?.ephemeral {
+                return Err(StoreError::Invalid("the default collection is the session collection"));
+            }
             return Ok(name);
         }
         let (name, _) = self.create_collection("Login", "")?;
