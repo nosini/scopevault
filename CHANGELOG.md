@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.12.4
+
+- The PAM module delivers the password kept from authentication only to
+  the account it was entered for. An application that switched the PAM
+  user before opening the session (sudo does) could otherwise pass one
+  user's password to another user's helper.
+- An unlock still deriving its key when the vault is locked (before the
+  system sleeps, for example) no longer completes after the lock, and a
+  login unlock no longer completes with a slot that was replaced
+  meanwhile.
+- A login password kept for repairing the login slot is wiped when its
+  five minutes are over and at every lock, not only at the next unlock.
+- A new master password and the login slot keep the key derivation cost
+  of the vault's master wrap; the daemon used the lower default for
+  vaults it had not created itself in this run.
+- `unix_chkpwd` is stopped after 10 seconds instead of holding up login
+  requests for as long as it hangs.
+- The PAM module kills and reaps a helper that does not finish within
+  five seconds, and does not start the helper at all when `close_range`
+  is unavailable (Linux before 5.9), since it could not close every
+  descriptor of the host process.
+- Password buffers on the login path are allocated in full before any
+  password is copied in, so no unwiped copies are left behind.
+
 ## 0.12.3
 
 - An `Unlock` prompt kept every path of its request until it completed,
