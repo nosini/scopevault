@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.12.5
+
+- `scopevault-admin restore` swaps the backup in for the vault in one
+  step and syncs the directory, so a crash can no longer leave the data
+  directory without a vault. A restore that fails removes only its own
+  staging directory, not that of another restore started in the same
+  second.
+- `export` writes the default collection only into the provider's
+  default collection (creating one if needed), and checks portal keys
+  there. Portal keys could otherwise land in a collection that merely had
+  the same label, where gnome-keyring's portal backend does not look.
+- An admin request is cancelled when its client goes away: its dialog
+  closes, nothing is changed and its slot is free again. An interrupted
+  `reset-scope` no longer deletes the scope once the password is entered.
+- `scopevault-admin` escapes control, line break and bidirectional
+  formatting characters in app-chosen text it prints.
+- `reset-scope portal` is refused: it would make every Flatpak app's own
+  encrypted files unreadable. The GUI no longer offers it.
+
 ## 0.12.4
 
 - The PAM module delivers the password kept from authentication only to
