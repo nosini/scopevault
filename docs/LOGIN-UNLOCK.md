@@ -90,7 +90,8 @@ own password; it is installed with just enough privilege to read
 refuses to run from a terminal, so trying it by hand needs a pipe:
 `printf 'wrong\0' | /usr/sbin/unix_chkpwd $USER nonull; echo $?` prints
 7 for a wrong password. It only knows accounts in `/etc/shadow`, not SSSD,
-LDAP or systemd-homed. If it can't give an answer, nothing is repaired and
+LDAP or systemd-homed. If it can't give an answer, or takes longer than
+10 seconds (it is stopped then), nothing is repaired and
 no dialog opens; `scopevault-admin login-unlock enable` sets the slot
 again.
 

@@ -10,6 +10,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::PasswordCheck;
 
@@ -19,16 +20,25 @@ pub const DEFAULT_PROGRAM: &str = "/usr/sbin/unix_chkpwd";
 const MAX_PASSWORD: usize = 512;
 /// What `unix_chkpwd` exits with for a wrong password (`PAM_AUTH_ERR`).
 const PAM_AUTH_ERR: i32 = 7;
+/// How long a check may take before the checker is stopped. Login requests
+/// wait for it one at a time, holding the password.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct UnixChkpwd {
     program: PathBuf,
     user: String,
+    timeout: Duration,
 }
 
 impl UnixChkpwd {
     /// For the account the daemon runs as.
     pub fn new(program: PathBuf) -> Result<Self, String> {
-        Ok(UnixChkpwd { program, user: current_user()? })
+        Ok(UnixChkpwd { program, user: current_user()?, timeout: DEFAULT_TIMEOUT })
+    }
+
+    /// Another limit than [`DEFAULT_TIMEOUT`].
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        UnixChkpwd { timeout, ..self }
     }
 }
 
@@ -56,7 +66,19 @@ impl PasswordCheck for UnixChkpwd {
         // exit status says why.
         let _ = stdin.write_all(&input);
         drop(stdin);
-        let status = child.wait().map_err(|e| format!("{}: {e}", self.program.display()))?;
+        // It runs setuid as the caller's real user, so it can be stopped.
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait().map_err(|e| format!("{}: {e}", self.program.display()))? {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{} did not finish within {:?}", self.program.display(), self.timeout));
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
         match status.code() {
             Some(0) => Ok(true),
             Some(PAM_AUTH_ERR) => Ok(false),

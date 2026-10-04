@@ -359,6 +359,24 @@ fn unix_chkpwd_protocol() {
     assert!(UnixChkpwd::new(tmp.path().join("missing")).unwrap().check(b"x").is_err());
 }
 
+/// A checker that hangs is stopped after the timeout and the check fails,
+/// so login requests are not held up for good.
+#[test]
+fn a_hanging_unix_chkpwd_is_stopped() {
+    let tmp = TempDir::new("chkpwd-hang");
+    let fake = tmp.path().join("unix_chkpwd");
+    let pid = tmp.path().join("pid");
+    std::fs::write(&fake, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pid.display())).unwrap();
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let check = UnixChkpwd::new(fake).unwrap().with_timeout(Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let e = check.check(b"password").unwrap_err();
+    assert!(e.contains("did not finish"), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let pid = std::fs::read_to_string(&pid).unwrap();
+    assert!(!std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(), "the checker is still there");
+}
+
 const HELPER: &str = env!("CARGO_BIN_EXE_scopevault-pam-helper");
 
 /// Runs the helper as the PAM module does; returns its exit status and how
