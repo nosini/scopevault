@@ -241,7 +241,9 @@ creating new keys that would clash with the ones you export.
 
 `scopevault-admin backup FILE` writes an encrypted copy of the vault while
 the daemon runs. It opens with the master password you have at that
-moment. `scopevault-admin restore` needs the daemon stopped.
+moment. `scopevault-admin restore` needs the daemon stopped. It checks the
+backup, swaps it in for the vault in one step and keeps the previous vault
+beside it as `<data dir>.before-restore-<time>-<random>`.
 The portal keys are in the vault and therefore in its backups, but the
 files they decrypt stay in `~/.var/app/<app-id>/`. Back those up as well,
 and restore them together with the vault.

@@ -379,6 +379,36 @@ pub async fn restore(file: &Path, opts: Options) -> ExitCode {
     }
 }
 
+/// Puts `staging` in place of `dir` and moves the old vault to `kept`.
+/// Both directories are swapped in one step, so a crash leaves one vault
+/// or the other at `dir`, never none; until the old one is renamed to
+/// `kept` it is at `staging`. The parent is synced in between, so the swap
+/// is on disk before anything else happens. Filesystems that cannot swap
+/// get two renames, synced, and a short window without a vault.
+fn swap_in(staging: &Path, dir: &Path, kept: &Path) -> Result<(), String> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    let parent = dir.parent().unwrap_or(Path::new("/"));
+    let sync_parent = || std::fs::File::open(parent).and_then(|d| d.sync_all());
+    match renameat_with(CWD, staging, CWD, dir, RenameFlags::EXCHANGE) {
+        Ok(()) => {
+            sync_parent().map_err(|e| format!("cannot sync {}: {e}", parent.display()))?;
+            std::fs::rename(staging, kept).map_err(|e| {
+                format!("the backup is in place, but the previous vault stays in {}: {e}", staging.display())
+            })
+        }
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP) => {
+            std::fs::rename(dir, kept).map_err(|e| format!("cannot move the current vault aside: {e}"))?;
+            sync_parent().map_err(|e| format!("cannot sync {}: {e}", parent.display()))?;
+            if let Err(e) = std::fs::rename(staging, dir) {
+                let _ = std::fs::rename(kept, dir);
+                return Err(format!("cannot put the backup in place: {e}"));
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("cannot put the backup in place: {e}")),
+    }
+}
+
 /// A staging directory to remove when dropped, unless taken (`None`).
 struct Staging<'a>(Option<&'a Path>);
 
@@ -428,20 +458,18 @@ async fn restore_into(
         let scopes = v.scope_summaries(&AdminAuthority::offline()).map_err(|e| e.to_string())?;
         format!("{} scopes, {} items", scopes.len(), scopes.iter().map(|s| s.items).sum::<usize>())
     };
+    let sync_parent = || std::fs::File::open(parent).and_then(|d| d.sync_all());
     let kept = if dir.exists() {
         let kept = parent.join(format!("{name}.before-restore-{tag}"));
-        std::fs::rename(dir, &kept).map_err(|e| format!("cannot move the current vault aside: {e}"))?;
+        swap_in(staging, dir, &kept)?;
+        cleanup.0 = None;
         Some(kept)
     } else {
+        std::fs::rename(staging, dir).map_err(|e| format!("cannot put the backup in place: {e}"))?;
+        cleanup.0 = None;
         None
     };
-    if let Err(e) = std::fs::rename(staging, dir) {
-        if let Some(k) = &kept {
-            let _ = std::fs::rename(k, dir);
-        }
-        return Err(format!("cannot put the backup in place: {e}"));
-    }
-    cleanup.0 = None;
+    sync_parent().map_err(|e| format!("cannot sync {}: {e}", parent.display()))?;
     drop(current);
     Ok(match kept {
         Some(k) => format!("restored {summary}; the previous vault is kept in {}", k.display()),
