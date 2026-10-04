@@ -213,7 +213,11 @@ still get theirs.
 
 An app can lock its own collections. That locks them for every connection
 of its scope, and reading secrets from them then needs the master password
-again. Other collections and other scopes are not affected.
+again. Other collections and other scopes are not affected. Changing the
+items of a locked collection, deleting single items included, needs it
+unlocked; deleting the whole collection does not, because libsecret
+deletes collections without unlocking them first, and the data is the
+app's own.
 Locking the whole vault is only possible through the administrative
 interface.
 
