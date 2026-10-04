@@ -546,6 +546,41 @@ async fn restore_checks_the_backup_and_keeps_the_old_vault() {
     assert_eq!(host_items(&kept, TARGET_PW).len(), 2);
 }
 
+/// A restore that fails (here: the vault is in use) removes nothing but
+/// what it created itself, not the files of another restore started in
+/// the same second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_restore_leaves_other_restores_alone() {
+    let tmp = TempDir::new("restore-two");
+    let dir = tmp.path().join("vault");
+    let backup = tmp.path().join("backup.db");
+    let v = Vault::create(&dir, TARGET_PW.as_bytes(), KdfParams::MINIMUM).unwrap();
+    v.backup_into(&backup).unwrap();
+    // What another restore's staging directory looked like, for each second
+    // this test may run in.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let others: Vec<_> = (now..now + 5).map(|t| tmp.path().join(format!(".vault.restore-{t:x}"))).collect();
+    for o in &others {
+        std::fs::create_dir(o).unwrap();
+        std::fs::write(o.join("vault.db"), b"another restore's copy").unwrap();
+    }
+    let pins = Pins::new();
+    pins.set(&[TARGET_PW]);
+    // `v` keeps the vault open, as a running daemon would.
+    let out = admin(&["restore", backup.to_str().unwrap()], &dir, &pins, None).await;
+    assert!(!out.ok, "{}", out.stdout);
+    drop(v);
+    for o in &others {
+        assert!(o.join("vault.db").exists(), "{} was removed", o.display());
+    }
+    let ours: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".vault.restore-") && n.len() > ".vault.restore-".len() + 9)
+        .collect();
+    assert!(ours.is_empty(), "{ours:?}");
+}
+
 // ---- the Secret portal's keys ----
 
 #[tokio::test(flavor = "multi_thread")]

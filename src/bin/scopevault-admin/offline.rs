@@ -357,19 +357,36 @@ pub async fn restore(file: &Path, opts: Options) -> ExitCode {
         return fail("the data directory has no parent");
     };
     let name = name.to_string_lossy();
+    // The time, and a random part: another restore started in the same
+    // second must not pick the same names.
+    let mut random = [0u8; 4];
+    if getrandom::fill(&mut random).is_err() {
+        return fail("randomness unavailable");
+    }
     let tag = format!(
-        "{:x}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+        "{:x}-{:08x}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        u32::from_be_bytes(random)
     );
     let staging = parent.join(format!(".{name}.restore-{tag}"));
     let result = restore_into(file, dir, parent, &name, &tag, &staging, &opts.pinentry).await;
-    let _ = std::fs::remove_dir_all(&staging);
     match result {
         Ok(msg) => {
             println!("{msg}");
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
+    }
+}
+
+/// A staging directory to remove when dropped, unless taken (`None`).
+struct Staging<'a>(Option<&'a Path>);
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 }
 
@@ -387,6 +404,8 @@ async fn restore_into(
 
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     std::fs::DirBuilder::new().mode(0o700).create(staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    // Removed again unless it is put in place; only what this run created.
+    let mut cleanup = Staging(Some(staging));
     {
         let mut src = std::fs::File::open(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
         let mut dst = std::fs::OpenOptions::new()
@@ -422,6 +441,7 @@ async fn restore_into(
         }
         return Err(format!("cannot put the backup in place: {e}"));
     }
+    cleanup.0 = None;
     drop(current);
     Ok(match kept {
         Some(k) => format!("restored {summary}; the previous vault is kept in {}", k.display()),
