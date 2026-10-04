@@ -238,7 +238,7 @@ fn other_users_and_missing_helpers_change_nothing() {
 
 #[test]
 fn a_hanging_helper_does_not_hold_up_the_login_for_long() {
-    let fx = Fixture::new("hang", "cat > /dev/null\nexec sleep 30\n", None);
+    let fx = Fixture::new("hang", "echo $$ > \"$LOG.pid\"\ncat > /dev/null\nexec sleep 30\n", None);
     let (user, ..) = me();
     let pamh = fx.start(&user);
     let started = Instant::now();
@@ -249,4 +249,7 @@ fn a_hanging_helper_does_not_hold_up_the_login_for_long() {
     }
     let took = started.elapsed();
     assert!(took >= Duration::from_secs(4) && took < Duration::from_secs(8), "{took:?}");
+    // Stopped and reaped: neither running nor left as a zombie.
+    let pid = std::fs::read_to_string(fx.log.with_extension("pid")).unwrap();
+    assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists(), "the helper {} is still there", pid.trim());
 }

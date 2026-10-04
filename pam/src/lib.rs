@@ -239,8 +239,10 @@ fn run_helper(pamh: *mut PamHandle, acct: &Account, helper: &CStr, mode: &CStr, 
 }
 
 /// Waits up to 5 s for the helper's first process, which exits as soon as
-/// it has read its input. If the host process ignores SIGCHLD, the kernel
-/// reaps it and `waitpid` reports ECHILD, which is fine.
+/// it has read its input; one that takes longer is killed and reaped, so
+/// no child is left behind in the host process. If the host process
+/// ignores SIGCHLD, the kernel reaps it and `waitpid` reports ECHILD, which
+/// is fine.
 fn reap(pamh: *mut PamHandle, pid: libc::pid_t) {
     for _ in 0..500 {
         let mut status = 0;
@@ -257,7 +259,15 @@ fn reap(pamh: *mut PamHandle, pid: libc::pid_t) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    log(pamh, libc::LOG_NOTICE, "the helper did not return within 5 s");
+    log(pamh, libc::LOG_NOTICE, "the helper did not return within 5 s; stopped");
+    // SAFETY: our own child, not yet reaped, so the PID is still its.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        let mut status = 0;
+        while libc::waitpid(pid, &mut status, 0) < 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {}
+    }
 }
 
 /// The forked child. Async-signal-safe calls only; never returns.
