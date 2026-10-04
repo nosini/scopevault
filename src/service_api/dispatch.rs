@@ -696,7 +696,7 @@ impl<R: CallerResolver> SecretService<R> {
             }
         }
 
-        let node = self.resolve_node(&call.principal, &call.sender, &parsed).ok_or_else(Fault::unknown_object)?;
+        let node = self.resolve_node(&call.principal, &call.sender, &parsed)?.ok_or_else(Fault::unknown_object)?;
         let iface = match interface.as_deref() {
             Some(name) => interfaces::STANDARD
                 .iter()
@@ -722,7 +722,7 @@ impl<R: CallerResolver> SecretService<R> {
 
         match (iface.name, &node) {
             ("org.freedesktop.DBus.Introspectable", _) => {
-                let xml = interfaces::introspect(node.interfaces(), &self.children(call, &node));
+                let xml = interfaces::introspect(node.interfaces(), &self.children(call, &node)?);
                 call.reply(&(xml,))
             }
             ("org.freedesktop.DBus.Properties", _) => self.properties(call, &member, &node),
@@ -753,11 +753,17 @@ impl<R: CallerResolver> SecretService<R> {
     }
 
     /// Resolves a path for this caller, or `None` if it is outside the
-    /// caller's view (whether or not it exists elsewhere).
-    fn resolve_node(&self, principal: &Principal, sender: &UniqueName<'_>, parsed: &Parsed<'_>) -> Option<Node> {
-        let in_vault =
-            |f: &dyn Fn(&ScopedVault<'_>) -> Option<Node>| self.with_vault(principal, |v| Ok(f(v))).ok().flatten();
-        match *parsed {
+    /// caller's view (whether or not it exists elsewhere). Fails if the
+    /// vault was locked since the request waited for it: the object may
+    /// well exist.
+    fn resolve_node(
+        &self,
+        principal: &Principal,
+        sender: &UniqueName<'_>,
+        parsed: &Parsed<'_>,
+    ) -> Result<Option<Node>, Fault> {
+        let in_vault = |f: &dyn Fn(&ScopedVault<'_>) -> Option<Node>| self.with_vault(principal, |v| Ok(f(v)));
+        Ok(match *parsed {
             Parsed::Root => Some(Node::Intermediate("org")),
             Parsed::Org => Some(Node::Intermediate("freedesktop")),
             Parsed::Freedesktop => Some(Node::Intermediate("secrets")),
@@ -766,11 +772,11 @@ impl<R: CallerResolver> SecretService<R> {
             Parsed::AliasDir => Some(Node::AliasDir),
             Parsed::SessionDir => Some(Node::SessionDir),
             Parsed::PromptDir => Some(Node::PromptDir),
-            Parsed::Collection(c) => in_vault(&|v| v.collection(c).map(|_| Node::Collection(c.to_owned()))),
-            Parsed::AliasedCollection(a) => in_vault(&|v| v.alias(a).map(Node::Collection)),
-            Parsed::Item(c, i) => in_vault(&|v| v.item(c, i).map(|_| Node::Item(c.to_owned(), i.to_owned()))),
+            Parsed::Collection(c) => in_vault(&|v| v.collection(c).map(|_| Node::Collection(c.to_owned())))?,
+            Parsed::AliasedCollection(a) => in_vault(&|v| v.alias(a).map(Node::Collection))?,
+            Parsed::Item(c, i) => in_vault(&|v| v.item(c, i).map(|_| Node::Item(c.to_owned(), i.to_owned())))?,
             Parsed::AliasedItem(a, i) => {
-                in_vault(&|v| v.alias(a).filter(|c| v.item(c, i).is_some()).map(|c| Node::Item(c, i.to_owned())))
+                in_vault(&|v| v.alias(a).filter(|c| v.item(c, i).is_some()).map(|c| Node::Item(c, i.to_owned())))?
             }
             Parsed::Session(id) => {
                 let s = self.sessions.lock().unwrap();
@@ -781,21 +787,21 @@ impl<R: CallerResolver> SecretService<R> {
                 p.get(id).filter(|p| p.owner.as_str() == sender.as_str()).map(|_| Node::Prompt(id.to_owned()))
             }
             Parsed::Unknown => None,
-        }
+        })
     }
 
-    fn children(&self, call: &Call<'_>, node: &Node) -> Vec<String> {
+    fn children(&self, call: &Call<'_>, node: &Node) -> Result<Vec<String>, Fault> {
         let owned_by_caller = |owner: &OwnedUniqueName| owner == &call.sender;
-        match node {
+        Ok(match node {
             Node::Intermediate(child) => vec![(*child).to_owned()],
             Node::Service => ["collection", "aliases", "session", "prompt"].map(String::from).to_vec(),
-            Node::CollectionDir => self.with_vault(&call.principal, |v| Ok(v.collection_names())).unwrap_or_default(),
-            Node::AliasDir => self
-                .with_vault(&call.principal, |v| Ok(v.aliases().into_iter().filter(|a| v.alias(a).is_some()).collect()))
-                .unwrap_or_default(),
-            Node::Collection(c) => self
-                .with_vault(&call.principal, |v| Ok(v.collection(c).map(|c| c.items).unwrap_or_default()))
-                .unwrap_or_default(),
+            Node::CollectionDir => self.with_vault(&call.principal, |v| Ok(v.collection_names()))?,
+            Node::AliasDir => self.with_vault(&call.principal, |v| {
+                Ok(v.aliases().into_iter().filter(|a| v.alias(a).is_some()).collect())
+            })?,
+            Node::Collection(c) => {
+                self.with_vault(&call.principal, |v| Ok(v.collection(c).map(|c| c.items).unwrap_or_default()))?
+            }
             Node::SessionDir => self
                 .sessions
                 .lock()
@@ -813,7 +819,7 @@ impl<R: CallerResolver> SecretService<R> {
                 .map(|(k, _)| k.clone())
                 .collect(),
             Node::Item(..) | Node::Session(_) | Node::Prompt(_) => Vec::new(),
-        }
+        })
     }
 
     /// Delivers an event to its target connections.

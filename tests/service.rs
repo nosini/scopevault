@@ -312,6 +312,45 @@ async fn locked_vault_unlocks_on_demand() {
     assert!(fx.vault.log().contains("org.example.A"), "the dialog names the requesting app");
 }
 
+/// A request that waited for the unlock while a global lock lands right
+/// after it is told the vault is locked, not that its object is missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_right_after_the_unlock_is_not_a_missing_object() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let a = fx.client(Some(app_a())).await;
+    let s = ClientSession::plain(&a).await;
+    let item = create_item(&a, "/org/freedesktop/secrets/aliases/default", &s, "i", &[], b"x", false).await.unwrap();
+    fx.vault.lock_vault();
+    // Locks again as soon as a dialog has unlocked the vault, before the
+    // requests that waited for it go on.
+    let mut unlocked = fx.vault.unlocker.subscribe_unlocked();
+    let unlocker = fx.vault.unlocker.clone();
+    let relock = tokio::spawn(async move {
+        while unlocked.recv().await.is_ok() {
+            if let Some(v) = unlocker.vault().lock().unwrap().vault.as_mut() {
+                v.lock();
+            }
+        }
+    });
+    fx.vault.set_pins(&[PASSWORD; 4]);
+    let mut raced = 0;
+    for _ in 0..4 {
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            clients.push(fx.client(Some(app_a())).await);
+        }
+        let reads = clients.iter().map(|c| get(c, &item, ITEM_IFACE, "Label"));
+        for r in futures_util::future::join_all(reads).await {
+            if let Err(e) = r {
+                assert_eq!(e.0, IS_LOCKED, "{e:?}");
+                raced += 1;
+            }
+        }
+    }
+    relock.abort();
+    assert!(raced > 0, "no request met the lock");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_missing_vault_is_created_on_first_use() {
     let fx = fixture(VaultState::Missing).await;
