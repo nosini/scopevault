@@ -70,7 +70,11 @@ same namespace, and it must name a valid scope other than the owner's.
 
 Metadata is stored as JSON that rejects unknown fields; secrets use a
 small binary format. Unlocking decrypts and cross-checks all metadata.
-Secrets are only decrypted when one is read.
+Secrets stay on disk: unlocking only checks that every item has one, and a
+secret is read and decrypted when it is asked for. Before reading
+anything, unlocking checks every record's size: IDs and nonces must have
+their exact length and no ciphertext may exceed 4 MiB, so a damaged file
+can't make it allocate without bound.
 
 ## On disk
 

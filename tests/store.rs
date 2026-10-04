@@ -186,7 +186,7 @@ fn populated(tmp: &TempDir) -> std::path::PathBuf {
 #[test]
 fn tampering_is_detected() {
     type Tamper = fn(&Connection);
-    let cases: [(&str, Tamper); 7] = [
+    let cases: [(&str, Tamper); 9] = [
         ("flipped item ciphertext", |c| {
             c.execute("UPDATE records SET ciphertext = CAST(X'00' || substr(ciphertext, 2) AS BLOB) WHERE id = (SELECT id FROM records WHERE kind = 3 LIMIT 1) AND kind = 3", []).unwrap();
         }),
@@ -223,6 +223,14 @@ fn tampering_is_detected() {
             )
             .unwrap();
         }),
+        // Checked before anything is read: a secret is never decrypted at
+        // unlock, but its size alone could exhaust memory.
+        ("oversized secret ciphertext", |c| {
+            c.execute("UPDATE records SET ciphertext = zeroblob(4 * 1024 * 1024 + 1) WHERE id = (SELECT id FROM records WHERE kind = 4 LIMIT 1) AND kind = 4", []).unwrap();
+        }),
+        ("secret nonce of the wrong length", |c| {
+            c.execute("UPDATE records SET nonce = X'00' WHERE id = (SELECT id FROM records WHERE kind = 4 LIMIT 1) AND kind = 4", []).unwrap();
+        }),
         ("unknown record kind", |c| {
             c.execute(
                 "INSERT INTO records SELECT id, 9, namespace, nonce, ciphertext FROM records WHERE kind = 3 LIMIT 1",
@@ -240,6 +248,20 @@ fn tampering_is_detected() {
         assert!(matches!(r, Err(StoreError::Corrupt(_))), "{what}: {r:?}");
         assert!(!v.is_unlocked(), "{what}: must stay locked");
     }
+}
+
+#[test]
+fn unlocking_does_not_read_secret_values() {
+    let tmp = TempDir::new("store");
+    let dir = populated(&tmp);
+    // A value unlocking would choke on, had it read it.
+    let n = raw(&dir)
+        .execute("UPDATE records SET ciphertext = 'not a blob' WHERE id = (SELECT id FROM records WHERE kind = 4 LIMIT 1) AND kind = 4", [])
+        .unwrap();
+    assert_eq!(n, 1);
+    let mut v = Vault::open(&dir).unwrap();
+    v.unlock(PW).unwrap();
+    assert!(matches!(v.verify_secrets(), Err(StoreError::Corrupt(_))), "found when checked");
 }
 
 #[test]

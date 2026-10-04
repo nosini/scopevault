@@ -263,13 +263,19 @@ fn open_record(cipher: &RecordCipher, r: &RawRecord) -> Result<Zeroizing<Vec<u8>
         .map_err(|_| StoreError::Corrupt(format!("record {} failed authentication", hex(&r.id))))
 }
 
-/// Builds the decrypted index from all records, refusing anything
+/// Builds the decrypted index from all records except the secrets, of
+/// which it only needs the IDs and namespaces, refusing anything
 /// inconsistent.
-fn build_index(cipher: &RecordCipher, records: &[RawRecord]) -> Result<HashMap<Scope, NamespaceEntry>, StoreError> {
+fn build_index(
+    cipher: &RecordCipher,
+    records: &[RawRecord],
+    secret_ids: &[(RecordId, RecordId)],
+) -> Result<HashMap<Scope, NamespaceEntry>, StoreError> {
     let corrupt = |what: String| StoreError::Corrupt(what);
     let mut by_ns_id: HashMap<RecordId, (Scope, NamespaceEntry, BTreeMap<String, String>)> = HashMap::new();
     let mut seen_scopes = HashSet::new();
-    let mut secrets = HashSet::new();
+    // (id, kind) is the table's primary key, so there are no duplicates.
+    let mut secrets: HashSet<(RecordId, RecordId)> = secret_ids.iter().copied().collect();
 
     for r in records.iter().filter(|r| r.kind == KIND_NAMESPACE) {
         if r.namespace != r.id {
@@ -329,9 +335,6 @@ fn build_index(cipher: &RecordCipher, records: &[RawRecord]) -> Result<HashMap<S
         }
     }
 
-    for r in records.iter().filter(|r| r.kind == KIND_SECRET) {
-        secrets.insert((r.id, r.namespace));
-    }
     for (ns_id, (_, ns, _)) in &by_ns_id {
         for c in ns.collections.values() {
             for item_id in c.items.keys() {
@@ -431,27 +434,30 @@ impl Vault {
         self.unlock_with_key(key)
     }
 
-    /// Finishes unlocking with an already unwrapped key: decrypts and
-    /// checks every metadata record. On any inconsistency the vault stays
-    /// locked.
     /// Decrypts and decodes every secret record, which unlocking does not
     /// do (secrets are read on demand): for checking a backup before it
-    /// replaces a vault. Returns their number.
+    /// replaces a vault. Reads one at a time. Returns their number.
     pub fn verify_secrets(&self) -> Result<usize, StoreError> {
         let u = self.unlocked.as_ref().ok_or(StoreError::Locked)?;
-        let mut n = 0;
-        for r in self.db.load_all()?.iter().filter(|r| r.kind == KIND_SECRET) {
-            payload::decode_secret(&open_record(&u.cipher, r)?)?;
-            n += 1;
+        let ids = self.db.ids_of_kind(KIND_SECRET)?;
+        for (id, _) in &ids {
+            let r = self.db.load_one(id, KIND_SECRET)?.ok_or(StoreError::Corrupt("a secret record vanished".into()))?;
+            payload::decode_secret(&open_record(&u.cipher, &r)?)?;
         }
-        Ok(n)
+        Ok(ids.len())
     }
 
+    /// Finishes unlocking with an already unwrapped key: decrypts and
+    /// checks every metadata record. Secrets stay on disk; only their IDs
+    /// are checked against the items. On any inconsistency the vault stays
+    /// locked.
     pub fn unlock_with_key(&mut self, key: VaultKey) -> Result<(), StoreError> {
         if self.unlocked.is_some() {
             return Ok(());
         }
-        let namespaces = build_index(&key.record_cipher(), &self.db.load_all()?)?;
+        self.db.check_record_sizes()?;
+        let records = self.db.load_all_except(KIND_SECRET)?;
+        let namespaces = build_index(&key.record_cipher(), &records, &self.db.ids_of_kind(KIND_SECRET)?)?;
         self.unlocked = Some(Unlocked::new(key, namespaces));
         Ok(())
     }

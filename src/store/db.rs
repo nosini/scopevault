@@ -25,6 +25,11 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 pub type RecordId = [u8; 16];
 
+/// The largest ciphertext a record may have. The largest plaintexts are a
+/// 512 KiB secret and an item whose 64 attributes JSON-escape to about
+/// 1.7 MiB; this leaves room above both.
+pub const MAX_CIPHERTEXT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Key wraps other than the master password's. Created with the first one.
 const KEY_SLOTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS key_slots (
     kind INTEGER PRIMARY KEY CHECK (kind BETWEEN 1 AND 255),
@@ -320,9 +325,29 @@ impl Db {
         Ok(())
     }
 
-    pub fn load_all(&self) -> Result<Vec<RawRecord>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT id, kind, namespace, nonce, ciphertext FROM records")?;
-        let rows = stmt.query_map([], |r| {
+    /// Refuses the vault if any record has an ID, namespace or nonce of
+    /// the wrong length or a ciphertext over [`MAX_CIPHERTEXT_BYTES`].
+    /// `length()` does not read the value, so a damaged or tampered file
+    /// can't make the loading below allocate without bound.
+    pub fn check_record_sizes(&self) -> Result<(), StoreError> {
+        let bad: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM records WHERE length(id) != 16 OR length(namespace) != 16
+                     OR length(nonce) != ?1 OR length(ciphertext) > ?2)",
+                params![NONCE_LEN as i64, MAX_CIPHERTEXT_BYTES as i64],
+                |r| r.get(0),
+            )
+            .map_err(typed)?;
+        if bad { Err(StoreError::Corrupt("record of the wrong size".into())) } else { Ok(()) }
+    }
+
+    /// Every record except those of kind `except`. Call
+    /// [`Db::check_record_sizes`] first.
+    pub fn load_all_except(&self, except: u8) -> Result<Vec<RawRecord>, StoreError> {
+        let mut stmt =
+            self.conn.prepare("SELECT id, kind, namespace, nonce, ciphertext FROM records WHERE kind != ?1")?;
+        let rows = stmt.query_map(params![except], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, i64>(1)?,
@@ -342,6 +367,20 @@ impl Db {
                 nonce,
                 ciphertext,
             });
+        }
+        Ok(out)
+    }
+
+    /// The IDs and namespaces of the records of one kind, without their
+    /// contents.
+    pub fn ids_of_kind(&self, kind: u8) -> Result<Vec<(RecordId, RecordId)>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id, namespace FROM records WHERE kind = ?1")?;
+        let rows = stmt.query_map(params![kind], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, namespace) = row.map_err(typed)?;
+            let bad = |what: &str| StoreError::Corrupt(format!("record with malformed {what}"));
+            out.push((id.try_into().map_err(|_| bad("id"))?, namespace.try_into().map_err(|_| bad("namespace"))?));
         }
         Ok(out)
     }
