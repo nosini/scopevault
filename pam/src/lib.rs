@@ -296,11 +296,12 @@ unsafe fn child(
         if null < 0 || libc::dup2(null, 1) < 0 || libc::dup2(null, 2) < 0 {
             libc::_exit(126);
         }
-        // Nothing else of the host process reaches the helper.
+        // Nothing else of the host process reaches the helper. Without
+        // close_range (Linux 5.9, or refused by a syscall filter) there is
+        // no async-signal-safe way to find every open descriptor, so the
+        // helper is not started.
         if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) != 0 {
-            for fd in 3..4096 {
-                libc::close(fd);
-            }
+            libc::_exit(126);
         }
         if drop_privileges {
             if libc::setgroups(acct.groups.len(), acct.groups.as_ptr()) != 0

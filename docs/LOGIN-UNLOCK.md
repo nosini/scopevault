@@ -125,7 +125,9 @@ only acts for the account it runs for.
 | `chauthtok` | In the update phase only, passes the old and the new password with `--change`. |
 
 Starting the helper: everything that isn't safe after `fork` happens
-before it. The child closes every other file descriptor, switches to your
+before it. The child closes every other file descriptor with
+`close_range` (Linux 5.9 or later; without it the helper isn't started,
+since nothing else can find every descriptor after `fork`), switches to your
 user and group and checks that this can't be undone, and runs
 `/usr/local/libexec/scopevault-pam-helper` with nothing in its
 environment but `HOME` and `XDG_RUNTIME_DIR`. The password goes over a

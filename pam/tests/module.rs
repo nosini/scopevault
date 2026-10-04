@@ -253,3 +253,62 @@ fn a_hanging_helper_does_not_hold_up_the_login_for_long() {
     let pid = std::fs::read_to_string(fx.log.with_extension("pid")).unwrap();
     assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists(), "the helper {} is still there", pid.trim());
 }
+
+/// Run in a process of its own by `without_close_range_the_helper_is_not_started`:
+/// installs a syscall filter that refuses close_range, so it must not be
+/// run in the test process itself.
+#[test]
+#[ignore = "run by without_close_range_the_helper_is_not_started"]
+fn close_range_refused() {
+    if std::env::var_os("PAM_SCOPEVAULT_SECCOMP_CHILD").is_none() {
+        return;
+    }
+    // A descriptor above any small fallback range, not close-on-exec.
+    let leak = 5000;
+    // SAFETY: duplicating a descriptor of our own.
+    assert_eq!(unsafe { libc::dup2(1, leak) }, leak);
+    let fx = Fixture::new("seccomp", &recorder(leak), None);
+    let (user, ..) = me();
+    // close_range fails with ENOSYS, as on a kernel before 5.9.
+    let filter = [
+        libc::sock_filter { code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, jt: 0, jf: 0, k: 0 },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_close_range as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+        },
+        libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
+    ];
+    let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr().cast_mut() };
+    // SAFETY: a valid filter program that outlives the calls.
+    unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+        assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog), 0);
+    }
+    let pamh = fx.start(&user);
+    // SAFETY: as above.
+    unsafe {
+        assert_eq!(pam_authenticate(pamh, 0), PAM_SUCCESS);
+        pam_end(pamh, PAM_SUCCESS);
+    }
+    assert!(fx.entries().is_empty(), "the helper ran: {:?}", fx.entries());
+    println!("checked: the helper was not started");
+}
+
+#[test]
+fn without_close_range_the_helper_is_not_started() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "close_range_refused", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("PAM_SCOPEVAULT_SECCOMP_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("checked: the helper was not started"), "{text}");
+}
