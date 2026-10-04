@@ -283,6 +283,23 @@ async fn unlock_opens_the_dialog_only_while_locked() {
     assert!(!out.ok && out.stderr.contains(DENIED), "{}", out.stderr);
 }
 
+/// The portal keys cannot be reset as a whole: every app's own files are
+/// encrypted with its key. Refused before any dialog.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_portal_scope_cannot_be_reset() {
+    let e = env(VaultState::Unlocked).await;
+    assert!(e.admin(&Who::Host, &["portal", "init"]).await.ok);
+    let out = e.admin(&Who::Host, &["portal", "new-key", "org.example.PortalApp"]).await;
+    assert!(out.ok, "{}", out.stderr);
+    e.vault.set_pins(&[PASSWORD]);
+    let dialogs = e.vault.dialogs();
+    let out = e.admin(&Who::Host, &["reset-scope", "portal"]).await;
+    assert!(!out.ok && out.stderr.contains("portal scope cannot be reset"), "{}\n{}", out.stdout, out.stderr);
+    assert_eq!(e.vault.dialogs(), dialogs);
+    let listed = e.admin(&Who::Host, &["list", "portal"]).await;
+    assert!(listed.stdout.contains("org.example.PortalApp"), "{}", listed.stdout);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_items_needs_the_password() {
     let e = env(VaultState::Unlocked).await;

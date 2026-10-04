@@ -392,7 +392,7 @@ class Window(Adw.ApplicationWindow):
             "change-password": free and reachable and state != "missing",
             "backup": free and reachable and state != "missing",
             "move": free and self.unlocked() and listing not in (None, "portal") and bool(self.checked),
-            "reset-scope": free and self.unlocked() and listing is not None,
+            "reset-scope": free and self.unlocked() and listing not in (None, "portal"),
             "share": free and self.unlocked() and listing not in (None, "portal"),
             "unshare": free and self.unlocked(),
         }
@@ -803,11 +803,6 @@ class Window(Adw.ApplicationWindow):
             f"This deletes all {items} items in {len(collections)} collections of {scope}, including their "
             "secrets. It cannot be undone, except by restoring a backup. The daemon asks for the master password."
         )
-        if scope == "portal":
-            body += (
-                "\n\nThese are the Secret portal keys: Flatpak apps encrypt their own keyring files with them, "
-                "and lose access to what they stored."
-            )
 
         def go() -> None:
             self.act(

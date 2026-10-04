@@ -59,7 +59,10 @@ A Flatpak app ID names an installed app, not its publisher. An update keeps
 the scope. A different program installed later under the same ID inherits
 it, unless the scope is reset. Uninstalling an app does not delete its
 secrets.
-`scopevault-admin reset-scope` does that on request.
+`scopevault-admin reset-scope` does that on request. It refuses the
+`portal` scope: every Flatpak app that uses the Secret portal encrypts its
+own files with its key there, so resetting it would lose all their data at
+once.
 
 ## Identifying callers
 

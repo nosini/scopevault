@@ -37,7 +37,8 @@ Commands (the daemon must be running):
                               from scope FROM into TO's default collection;
                               asks for the master password
   reset-scope SCOPE           delete everything SCOPE holds; asks for the
-                              master password
+                              master password. Not for portal: apps would
+                              lose the files they encrypted with their keys
   portal init                 create the scope for the Secret portal keys if
                               it does not exist yet
   portal new-key APP-ID       create a portal key for APP-ID (refuses if it

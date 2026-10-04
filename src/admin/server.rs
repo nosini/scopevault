@@ -371,6 +371,13 @@ impl AdminServer {
             }
             Request::ResetScope { scope } => {
                 let scope = parse_scope(&scope)?;
+                // Each Flatpak app encrypts its own files with its portal key;
+                // deleting them all would lose every app's data at once.
+                if scope == Scope::Portal {
+                    return Err(Reply::error(
+                        "the portal scope cannot be reset: every Flatpak app that uses the Secret portal would                          lose access to the files it encrypted with its key",
+                    ));
+                }
                 self.unlocked().await?;
                 let (collections, items, shared_with_it) = {
                     let mut slot = vault.lock().unwrap();
