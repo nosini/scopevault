@@ -352,22 +352,38 @@ impl Unlocker {
     /// Asks for the master password and checks it, without changing the
     /// vault. Used to reopen a collection its owner locked while the vault
     /// stays unlocked. Dropping the future closes the dialog.
-    pub async fn confirm_password(self: &Arc<Self>, requester: &Scope) -> UnlockOutcome {
+    ///
+    /// This is an explicit prompt of `requester`: `None` means it was over
+    /// the refusal limit and no dialog was shown. The limit is checked when
+    /// the dialog's turn comes, and a cancel or failure is recorded before
+    /// the next dialog may start, so prompts that wait together cannot get
+    /// past it.
+    pub async fn confirm_password(self: &Arc<Self>, requester: &Scope) -> Option<UnlockOutcome> {
         let who = display(requester);
         let description =
             format!("{who} wants to unlock one of its locked collections. Enter your keyring password to allow it.");
-        self.confirm("Unlock collection", &description).await
+        let _gate = self.dialog_gate.lock().await;
+        if !self.explicit_dialog_allowed(requester) {
+            return None;
+        }
+        let outcome = self.confirm("Unlock collection", &description).await;
+        if outcome != UnlockOutcome::Unlocked {
+            self.record_explicit_refusal(requester);
+        }
+        Some(outcome)
     }
 
     /// Asks for the master password to allow an administrative action,
     /// described by `action` ("move 2 items from ... to ...").
     pub async fn confirm_admin(self: &Arc<Self>, action: &str) -> UnlockOutcome {
         let description = format!("{ADMIN} wants to {action}. Enter your keyring password to allow it.");
+        let _gate = self.dialog_gate.lock().await;
         self.confirm("Allow keyring administration", &description).await
     }
 
+    /// The password dialog behind the confirmations; the caller holds
+    /// `dialog_gate`.
     async fn confirm(self: &Arc<Self>, title: &str, description: &str) -> UnlockOutcome {
-        let _gate = self.dialog_gate.lock().await;
         let mut error = None;
         for _ in 0..MAX_ATTEMPTS {
             let req = PinRequest {

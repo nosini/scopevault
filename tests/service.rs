@@ -827,6 +827,29 @@ async fn repeatedly_cancelled_prompts_stop_showing_dialogs_for_that_app() {
     assert!(fx.vault.unlocked());
 }
 
+/// Prompts run at the same time on a collection the app locked itself
+/// show no more dialogs than the refusal limit allows: the limit is checked
+/// when each dialog's turn comes, not when its prompt starts waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_prompts_keep_to_the_refusal_limit() {
+    use scopevault::prompts::unlock::EXPLICIT_REFUSAL_LIMIT;
+    let fx = fixture(VaultState::Unlocked).await;
+    let from = fx.service_name().await;
+    let a = fx.client(Some(app_a())).await;
+    let alias = "/org/freedesktop/secrets/aliases/default";
+    xlock(&a, "Lock", &[alias]).await.unwrap();
+    fx.vault.set_pins(&["CANCEL"; MAX_PROMPTS_PER_CONNECTION]);
+    let mut prompts = Vec::new();
+    for _ in 0..MAX_PROMPTS_PER_CONNECTION {
+        let (_, prompt) = xlock(&a, "Unlock", &[alias]).await.unwrap();
+        assert_ne!(prompt, "/");
+        prompts.push(prompt);
+    }
+    let results = futures_util::future::join_all(prompts.iter().map(|p| run_prompt(&a, &from, p))).await;
+    assert!(results.iter().all(|(dismissed, _)| *dismissed));
+    assert_eq!(fx.vault.dialogs(), EXPLICIT_REFUSAL_LIMIT);
+}
+
 /// Repeating paths in `GetSecrets` decrypts nothing twice, and the
 /// plaintext one call can return is bounded, also when distinct paths
 /// (aliases) name the same item.

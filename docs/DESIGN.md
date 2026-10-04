@@ -205,7 +205,8 @@ timeout.
 
 An app can also ask for a dialog explicitly. If it gets three of those
 cancelled within two minutes, its further prompts are dismissed without a
-dialog for a while. Other apps still get theirs.
+dialog for a while, also when it started them all at once. Other apps
+still get theirs.
 
 An app can lock its own collections. That locks them for every connection
 of its scope, and reading secrets from them then needs the master password

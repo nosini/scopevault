@@ -758,10 +758,11 @@ impl<R: CallerResolver> SecretService<R> {
                     })
                     .map_err(fail)?;
                 if !locked_collections.is_empty() {
-                    if !self.unlocker.explicit_dialog_allowed(&scope) {
-                        return over_limit();
+                    // Checks the limit and records a refusal itself.
+                    match self.unlocker.confirm_password(&scope).await {
+                        Some(o) => outcome(o)?,
+                        None => return over_limit(),
                     }
-                    dialog(self.unlocker.confirm_password(&scope).await)?;
                     for c in &locked_collections {
                         // The collection may have been deleted meanwhile.
                         if self.with_vault(principal, |v| Ok(v.set_collection_locked(c, false)?)).is_ok() {
