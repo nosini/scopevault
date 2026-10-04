@@ -100,6 +100,36 @@ async fn creates_a_vault_on_first_use() {
     assert!(reopen(&fx.tmp.path().join("vault"), b"first password"));
 }
 
+/// A global lock (before the system sleeps) while the dialog's password is
+/// being checked cancels the unlock: it does not complete once the lock is
+/// done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_during_the_derivation_cancels_the_dialogs_unlock() {
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::new(&["slow password"], None);
+    // A wrap slow enough to lock during its derivation.
+    let slow = KdfParams { m_kib: 64 * 1024, t: KdfParams::MAX_T, p: 1 };
+    {
+        let mut slot = fx.unlocker.vault().lock().unwrap();
+        let mut v = Vault::create(&slot.dir, b"slow password", slow).unwrap();
+        v.lock();
+        slot.vault = Some(v);
+    }
+    let unlocker = fx.unlocker.clone();
+    let started = Instant::now();
+    let unlock = tokio::spawn(async move { unlocker.ensure_unlocked(&Scope::Host).await });
+    // The fake dialog answers at once; the derivation takes longer.
+    while fx.dialogs() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fx.unlocker.lock(&mut fx.unlocker.vault().lock().unwrap());
+    let outcome = unlock.await.unwrap();
+    assert!(started.elapsed() > Duration::from_millis(300), "the derivation was too fast to test this");
+    assert!(matches!(outcome, UnlockOutcome::Failed(_)), "{outcome:?}");
+    assert!(!fx.unlocked());
+}
+
 #[tokio::test]
 async fn wrong_then_right_password() {
     let _s = SERIAL.lock().await;

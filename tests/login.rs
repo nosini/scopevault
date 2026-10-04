@@ -18,7 +18,7 @@ use scopevault::login::chkpwd::UnixChkpwd;
 use scopevault::login::protocol::Request;
 use scopevault::login::server::{LoginServer, relaxed_classifier};
 use scopevault::login::{LoginTimings, LoginUnlock, PasswordCheck};
-use scopevault::prompts::unlock::UnlockOutcome;
+use scopevault::prompts::unlock::{SlotUnlock, UnlockOutcome};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use zeroize::Zeroizing;
@@ -219,6 +219,44 @@ async fn a_kept_password_expires() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(e.check.calls(), 0);
     assert!(e.slot_opens(LOGIN_PASSWORD));
+}
+
+/// A global lock (before the system sleeps) while a delivery derives the
+/// key, or a new login slot meanwhile, cancels the unlock: it does not
+/// complete once the lock is done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_or_slot_change_during_the_derivation_cancels_the_unlock() {
+    let e = env(VaultState::Locked, true, FAST).await;
+    // A slot slow enough to lock during its derivation.
+    let slow = KdfParams { t: KdfParams::MAX_T, ..KdfParams::MINIMUM };
+    let rewrap = |password: &str| {
+        let mut s = e.vault.unlocker.vault().lock().unwrap();
+        let v = s.vault.as_mut().unwrap();
+        v.unlock(PASSWORD.as_bytes()).unwrap();
+        let current = v.key_slot(Slot::Login).unwrap();
+        let wrap = v.vault_key().unwrap().wrap_for(Slot::Login, password.as_bytes(), slow).unwrap();
+        v.replace_key_slot(Slot::Login, current.as_ref(), Some(&wrap)).unwrap();
+        v.lock();
+    };
+    rewrap(LOGIN_PASSWORD);
+    let unlocker = e.vault.unlocker.clone();
+    let started = std::time::Instant::now();
+    let unlock = tokio::spawn(async move { unlocker.unlock_with_slot(Slot::Login, pw(LOGIN_PASSWORD)).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    e.vault.lock_vault();
+    let outcome = unlock.await.unwrap();
+    assert!(started.elapsed() > Duration::from_millis(100), "the derivation was too fast to test this");
+    assert!(matches!(outcome, SlotUnlock::Failed(_)), "{outcome:?}");
+    assert!(!e.vault.unlocked());
+
+    // The slot replaced (by a password change elsewhere) meanwhile.
+    let unlocker = e.vault.unlocker.clone();
+    let unlock = tokio::spawn(async move { unlocker.unlock_with_slot(Slot::Login, pw(LOGIN_PASSWORD)).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rewrap("another password");
+    let outcome = unlock.await.unwrap();
+    assert!(matches!(outcome, SlotUnlock::Failed(_)), "{outcome:?}");
+    assert!(!e.vault.unlocked());
 }
 
 #[tokio::test(flavor = "multi_thread")]

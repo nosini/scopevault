@@ -62,6 +62,9 @@ pub const NOT_READY_WINDOW: Duration = Duration::from_secs(30);
 /// An app cannot reopen the dialog after every cancel; other apps are not
 /// affected.
 pub const EXPLICIT_REFUSAL_LIMIT: usize = 3;
+/// Why an unlock did not complete: a global lock came while its key was
+/// derived.
+const LOCKED_MEANWHILE: &str = "the vault was locked while the key was derived";
 pub const EXPLICIT_REFUSAL_WINDOW: Duration = Duration::from_secs(120);
 
 /// The waits around unlocking, configurable so tests do not need the
@@ -87,17 +90,42 @@ impl Default for UnlockTimings {
 pub struct VaultSlot {
     pub dir: PathBuf,
     pub vault: Option<Vault>,
+    /// Counts global locks; see [`VaultSlot::lock`].
+    lock_epoch: u64,
 }
 
 impl VaultSlot {
+    pub fn new(dir: PathBuf, vault: Option<Vault>) -> Self {
+        VaultSlot { dir, vault, lock_epoch: 0 }
+    }
+
     /// Opens the vault in `dir` if there is one (locked).
     pub fn open(dir: PathBuf) -> Result<Self, StoreError> {
         let vault = if Vault::exists(&dir) { Some(Vault::open(&dir)?) } else { None };
-        Ok(VaultSlot { dir, vault })
+        Ok(Self::new(dir, vault))
     }
 
     pub fn is_unlocked(&self) -> bool {
         self.vault.as_ref().is_some_and(Vault::is_unlocked)
+    }
+
+    /// Global lock. Every call counts, also on a vault that is locked
+    /// already: an unlock whose key derivation started before it does not
+    /// complete (see [`VaultSlot::lock_epoch`]). Returns whether the vault
+    /// was unlocked. [`Unlocker::lock`] also tells those who wait for it.
+    fn lock(&mut self) -> bool {
+        self.lock_epoch += 1;
+        let was_unlocked = self.is_unlocked();
+        if let Some(v) = self.vault.as_mut() {
+            v.lock();
+        }
+        was_unlocked
+    }
+
+    /// Changes with every global lock. An unlock notes it before deriving
+    /// the key and installs the key only if it is unchanged.
+    pub fn lock_epoch(&self) -> u64 {
+        self.lock_epoch
     }
 }
 
@@ -135,6 +163,7 @@ pub struct Unlocker {
     cooldown_until: Mutex<Option<Instant>>,
     explicit_refusals: Mutex<HashMap<Scope, VecDeque<Instant>>>,
     unlocked_tx: tokio::sync::broadcast::Sender<()>,
+    locked_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 /// Drops one waiter; the last one out cancels the dialog.
@@ -191,11 +220,26 @@ impl Unlocker {
             cooldown_until: Mutex::new(None),
             explicit_refusals: Mutex::default(),
             unlocked_tx: tokio::sync::broadcast::channel(4).0,
+            locked_tx: tokio::sync::broadcast::channel(4).0,
         })
     }
 
     pub fn vault(&self) -> &SharedVault {
         &self.vault
+    }
+
+    /// Global lock of `slot`, which is this unlocker's vault, locked by the
+    /// caller (who may look at it first). See [`VaultSlot::lock`]; returns
+    /// whether the vault was unlocked.
+    pub fn lock(&self, slot: &mut VaultSlot) -> bool {
+        let was_unlocked = slot.lock();
+        let _ = self.locked_tx.send(());
+        was_unlocked
+    }
+
+    /// Notified at each global lock, whether or not the vault was unlocked.
+    pub fn subscribe_locked(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.locked_tx.subscribe()
     }
 
     /// Notified each time a dialog unlocks (or creates) the vault.
@@ -577,13 +621,13 @@ impl Unlocker {
                 Ok(PinOutcome::Cancelled) => return UnlockOutcome::Cancelled,
                 Err(e) => return UnlockOutcome::Failed(e.to_string()),
             };
-            let wrap = {
+            let (wrap, epoch) = {
                 let slot = self.vault.lock().unwrap();
                 if slot.is_unlocked() {
                     return UnlockOutcome::Unlocked;
                 }
                 match slot.vault.as_ref().map(Vault::key_wrap) {
-                    Some(Ok(w)) => w,
+                    Some(Ok(w)) => (w, slot.lock_epoch()),
                     Some(Err(e)) => return UnlockOutcome::Failed(e.to_string()),
                     None => return UnlockOutcome::Failed("vault disappeared".into()),
                 }
@@ -594,11 +638,15 @@ impl Unlocker {
                     let vault = self.vault.clone();
                     let r = tokio::task::spawn_blocking(move || {
                         let mut slot = vault.lock().unwrap();
+                        if slot.lock_epoch() != epoch {
+                            return Err(StoreError::Locked);
+                        }
                         slot.vault.as_mut().expect("checked above").unlock_with_key(key)
                     })
                     .await;
                     return match r {
                         Ok(Ok(())) => UnlockOutcome::Unlocked,
+                        Ok(Err(StoreError::Locked)) => UnlockOutcome::Failed(LOCKED_MEANWHILE.into()),
                         Ok(Err(e)) => UnlockOutcome::Failed(e.to_string()),
                         Err(e) => UnlockOutcome::Failed(e.to_string()),
                     };
@@ -669,35 +717,47 @@ impl Unlocker {
     /// password's), without a dialog. On success, waiting requests are
     /// served and an open unlock dialog is closed. The key derivation runs
     /// without holding the vault.
+    ///
+    /// A global lock while the key is derived, or a change of the slot,
+    /// cancels the unlock.
     pub async fn unlock_with_slot(self: &Arc<Self>, slot: Slot, password: Zeroizing<Vec<u8>>) -> SlotUnlock {
-        let wrap = {
+        let (wrap, epoch) = {
             let s = self.vault.lock().unwrap();
             if s.is_unlocked() {
                 return SlotUnlock::AlreadyUnlocked;
             }
             match s.vault.as_ref().map(|v| v.key_slot(slot)) {
                 None | Some(Ok(None)) => return SlotUnlock::NoSlot,
-                Some(Ok(Some(w))) => w,
+                Some(Ok(Some(w))) => (w, s.lock_epoch()),
                 Some(Err(e)) => return SlotUnlock::Failed(e.to_string()),
             }
         };
-        let key = match tokio::task::spawn_blocking(move || VaultKey::unwrap_for(slot, &wrap, &password)).await {
+        let tried = wrap.clone();
+        let key = match tokio::task::spawn_blocking(move || VaultKey::unwrap_for(slot, &tried, &password)).await {
             Ok(Ok(key)) => key,
             Ok(Err(crate::crypto::CryptoError::Unwrap)) => return SlotUnlock::WrongPassword,
             Ok(Err(e)) => return SlotUnlock::Failed(e.to_string()),
             Err(e) => return SlotUnlock::Failed(e.to_string()),
         };
         let vault = self.vault.clone();
-        let r = tokio::task::spawn_blocking(move || match vault.lock().unwrap().vault.as_mut() {
-            Some(v) => v.unlock_with_key(key),
-            None => Err(StoreError::NotFound),
+        let r = tokio::task::spawn_blocking(move || {
+            let mut s = vault.lock().unwrap();
+            if s.lock_epoch() != epoch {
+                return Ok(Err(LOCKED_MEANWHILE));
+            }
+            let Some(v) = s.vault.as_mut() else { return Err(StoreError::NotFound) };
+            if v.key_slot(slot)?.as_ref() != Some(&wrap) {
+                return Ok(Err("the slot changed while the key was derived"));
+            }
+            v.unlock_with_key(key).map(Ok)
         })
         .await;
         match r {
-            Ok(Ok(())) => {
+            Ok(Ok(Ok(()))) => {
                 self.unlocked_elsewhere();
                 SlotUnlock::Unlocked
             }
+            Ok(Ok(Err(why))) => SlotUnlock::Failed(why.into()),
             Ok(Err(e)) => SlotUnlock::Failed(e.to_string()),
             Err(e) => SlotUnlock::Failed(e.to_string()),
         }

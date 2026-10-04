@@ -884,7 +884,8 @@ impl<R: CallerResolver> SecretService<R> {
     /// Global lock, for the administrative interface: drops the vault key
     /// and all decrypted metadata, so nothing is returned until the next
     /// unlock dialog succeeds. Connections are told that their collections
-    /// are locked. Returns false if the vault was not unlocked.
+    /// are locked. Returns false if the vault was not unlocked; an unlock
+    /// whose key derivation is under way is cancelled either way.
     ///
     /// Transfer sessions stay open. They protect secrets in transit to
     /// their own connection only, and libsecret opens one session per
@@ -895,13 +896,17 @@ impl<R: CallerResolver> SecretService<R> {
         let mut locked: Vec<(Scope, Vec<String>)> = Vec::new();
         {
             let mut slot = self.unlocker.vault().lock().unwrap();
-            let Some(v) = slot.vault.as_mut().filter(|v| v.is_unlocked()) else { return false };
-            for p in &principals {
-                if let Ok(s) = v.scoped(p) {
-                    locked.push((p.scope(), s.collection_names()));
+            if let Some(v) = slot.vault.as_mut().filter(|v| v.is_unlocked()) {
+                for p in &principals {
+                    if let Ok(s) = v.scoped(p) {
+                        locked.push((p.scope(), s.collection_names()));
+                    }
                 }
             }
-            v.lock();
+            // Also when locked already: an unlock under way is cancelled.
+            if !self.unlocker.lock(&mut slot) {
+                return false;
+            }
         }
         let this = self.clone();
         tokio::spawn(async move {

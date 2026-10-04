@@ -194,7 +194,8 @@ impl VaultFixture {
         let dir = tmp.path().join("vault");
         let slot = match state {
             VaultState::Unlocked => {
-                VaultSlot { vault: Some(Vault::create(&dir, PASSWORD.as_bytes(), KdfParams::MINIMUM).unwrap()), dir }
+                let v = Vault::create(&dir, PASSWORD.as_bytes(), KdfParams::MINIMUM).unwrap();
+                VaultSlot::new(dir, Some(v))
             }
             // Locked in memory rather than closed and reopened: a child
             // forked meanwhile by a parallel test could briefly hold the
@@ -202,7 +203,7 @@ impl VaultFixture {
             VaultState::Locked => {
                 let mut v = Vault::create(&dir, PASSWORD.as_bytes(), KdfParams::MINIMUM).unwrap();
                 v.lock();
-                VaultSlot { vault: Some(v), dir }
+                VaultSlot::new(dir, Some(v))
             }
             VaultState::Missing => VaultSlot::open(dir).unwrap(),
         };
@@ -243,8 +244,6 @@ impl VaultFixture {
 
     /// Global lock, as the administrative interface would do it.
     pub fn lock_vault(&self) {
-        if let Some(v) = self.unlocker.vault().lock().unwrap().vault.as_mut() {
-            v.lock();
-        }
+        self.unlocker.lock(&mut self.unlocker.vault().lock().unwrap());
     }
 }
