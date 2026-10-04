@@ -248,6 +248,13 @@ async fn logical_lock_affects_one_collection_and_needs_the_password_again() {
     let log = SignalLog::start(&a2, &from);
     assert_eq!(xlock(&a, "Lock", &[&work]).await.unwrap(), (vec![work.clone()], "/".into()));
     assert!(log.wait_for(&work, "PropertiesChanged", Duration::from_secs(2)).await.is_some());
+    // Each item's Locked changes too; libsecret caches it per item.
+    assert!(log.wait_for(&item, "PropertiesChanged", Duration::from_secs(2)).await.is_some());
+    let item_locked = |log: &SignalLog, item: &str| -> Vec<bool> {
+        log.changed_values(item, "Locked").into_iter().map(|v| v.try_into().unwrap()).collect()
+    };
+    assert_eq!(item_locked(&log, &item), [true]);
+    assert!(item_locked(&log, &home_item).is_empty());
     assert!(locked_prop(&a, &work, COL_IFACE).await);
     assert!(locked_prop(&a, &item, ITEM_IFACE).await);
     assert_eq!(get_secret(&a, &item, &sa).await.unwrap_err().0, IS_LOCKED);
@@ -278,6 +285,14 @@ async fn logical_lock_affects_one_collection_and_needs_the_password_again() {
     let (dismissed, result) = run_prompt(&a, &from, &prompt).await;
     assert!(!dismissed);
     assert_eq!(paths_of(result), [home.clone(), item.clone()]);
+    for _ in 0..100 {
+        if item_locked(&log, &item).len() > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(item_locked(&log, &item), [true, false]);
+    assert!(item_locked(&log, &home_item).is_empty());
     assert!(!locked_prop(&a, &work, COL_IFACE).await);
     assert_eq!(get_secret(&a, &item, &sa).await.unwrap().0, b"work secret");
     assert!(fx.vault.log().contains("locked collections"), "the confirmation dialog explains itself");

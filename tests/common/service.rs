@@ -183,15 +183,34 @@ impl SignalLog {
     }
 
     pub fn find(&self, path: &str, member: &str) -> Option<Message> {
+        self.find_all(path, member).into_iter().next()
+    }
+
+    /// Every signal so far with this path and member, in order.
+    pub fn find_all(&self, path: &str, member: &str) -> Vec<Message> {
         self.messages
             .lock()
             .unwrap()
             .iter()
-            .find(|m| {
+            .filter(|m| {
                 let h = m.header();
                 h.path().map(|p| p.as_str()) == Some(path) && h.member().map(|m| m.as_str()) == Some(member)
             })
             .cloned()
+            .collect()
+    }
+
+    /// The values of `prop` in the `PropertiesChanged` signals for `path` so
+    /// far, in order.
+    pub fn changed_values(&self, path: &str, prop: &str) -> Vec<OwnedValue> {
+        self.find_all(path, "PropertiesChanged")
+            .iter()
+            .filter_map(|m| {
+                let (_, mut changed, _): (String, HashMap<String, OwnedValue>, Vec<String>) =
+                    m.body().deserialize().unwrap();
+                changed.remove(prop)
+            })
+            .collect()
     }
 
     /// Waits until a signal with this path and member arrives.

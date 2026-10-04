@@ -446,7 +446,8 @@ impl<R: CallerResolver> SecretService<R> {
                     Ok((resolved.iter().map(Obj::path).collect::<Vec<_>>(), newly))
                 })?;
                 for c in newly {
-                    self.lock_state_changed(call, &c, true)?;
+                    let events = self.lock_events(&call.principal, &c, true)?;
+                    call.events.extend(events);
                 }
                 call.reply(&(locked, paths::none()))
             }
@@ -524,13 +525,33 @@ impl<R: CallerResolver> SecretService<R> {
         }
     }
 
-    /// Signals a change of a collection's logical lock state.
-    fn lock_state_changed(&self, call: &mut Call<'_>, collection: &str, locked: bool) -> Result<(), Fault> {
+    /// The signals for a change of a collection's logical lock state, to
+    /// the scope of `principal`. Each item's `Locked` changes with it, and
+    /// libsecret caches that property per item.
+    fn lock_events(&self, principal: &Principal, collection: &str, locked: bool) -> Result<Vec<Event>, Fault> {
+        let items =
+            self.with_vault(principal, |v| Ok(v.collection(collection).map(|c| c.items).unwrap_or_default()))?;
+        let scope = principal.scope();
+        let event = |path: OwnedObjectPath, interface: &'static str, member: &'static str, body: SignalBody| Event {
+            target: Target::Scope(scope.clone()),
+            path,
+            interface,
+            member,
+            body,
+        };
         let path = paths::collection(collection);
-        let body = changed(interfaces::COLLECTION.name, vec![("Locked", value(locked)?)]);
-        call.signal_scope(path.clone(), interfaces::PROPERTIES.name, PROPERTIES_CHANGED, body);
-        Self::service_signal(call, "CollectionChanged", path);
-        Ok(())
+        let mut events = vec![event(
+            path.clone(),
+            interfaces::PROPERTIES.name,
+            PROPERTIES_CHANGED,
+            changed(interfaces::COLLECTION.name, vec![("Locked", value(locked)?)]),
+        )];
+        for i in &items {
+            let body = changed(interfaces::ITEM.name, vec![("Locked", value(locked)?)]);
+            events.push(event(paths::item(collection, i), interfaces::PROPERTIES.name, PROPERTIES_CHANGED, body));
+        }
+        events.push(event(service_path(), interfaces::SERVICE.name, "CollectionChanged", SignalBody::Path(path)));
+        Ok(events)
     }
 
     // ---- org.freedesktop.Secret.Collection ----
@@ -766,12 +787,7 @@ impl<R: CallerResolver> SecretService<R> {
                     for c in &locked_collections {
                         // The collection may have been deleted meanwhile.
                         if self.with_vault(principal, |v| Ok(v.set_collection_locked(c, false)?)).is_ok() {
-                            let path = paths::collection(c);
-                            let body =
-                                changed(interfaces::COLLECTION.name, vec![("Locked", value(false).map_err(fail)?)]);
-                            events.push(event(path.clone(), interfaces::PROPERTIES.name, PROPERTIES_CHANGED, body));
-                            let body = SignalBody::Path(path);
-                            events.push(event(service_path(), interfaces::SERVICE.name, "CollectionChanged", body));
+                            events.extend(self.lock_events(principal, c, false).map_err(fail)?);
                         }
                     }
                 }
