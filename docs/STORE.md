@@ -117,8 +117,10 @@ appear in the database or its WAL and shm files.
 
 ## Lock states
 
-When the vault is locked, there is no key and no decrypted metadata in
-memory, and nothing can be listed or read. When it is unlocked, an app can
+When the vault is locked, the daemon holds no key and nothing decrypted
+that it could still reach, and nothing can be listed or read. Keys and
+secret values are wiped as they are dropped; labels, attributes and names
+are freed without being wiped (see "Memory" below). When it is unlocked, an app can
 still lock one of its collections: secrets in it then can't be read and its
 items can't be changed, until the master password is entered again. That
 logical lock affects nothing else and is not saved; after a restart the
@@ -206,9 +208,12 @@ through `/proc`.
 - History. Deleting a secret does not remove it from older backups,
   filesystem snapshots or blocks the SSD remapped. `secure_delete` only
   covers the live file.
-- Memory. Keys and decrypted buffers are wiped when the code drops them,
-  but copies made by the allocator, the kernel or swap are not. Memory is
-  not locked with `mlock`, because Argon2's 256 MiB would exceed the usual
-  limits.
+- Memory. Keys and secret values are wiped when the code drops them, and
+  so are the hash functions' states. Not wiped: decrypted labels,
+  attributes and names, which are freed as they are; Argon2's working
+  memory, which goes back to the kernel; intermediate values on the stack
+  inside the crypto libraries; and copies made by the allocator, the
+  kernel or swap. Memory is not locked with `mlock`, because Argon2's
+  256 MiB would exceed the usual limits.
 - Root, or programs running as you. They can read the daemon's memory by
   other means, replace the daemon, or capture the password as you type it.
