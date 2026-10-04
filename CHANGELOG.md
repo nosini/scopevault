@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.12.1
+
+- The daemon logs a warning when an installed `scopevault.portal` names
+  another bus name than the one it serves, such as the old
+  `page.codeberg.nosini.ScopeVault.Portal` after an update that kept the
+  file. xdg-desktop-portal then sends every Secret portal request to a
+  name nobody owns.
+- `scripts/activation-check.sh` fails in that case too, and when the bus
+  cannot start the portal backend because dbus-broker was not reloaded
+  after the activation file was installed. It also lists activation files
+  left over from older versions.
+- The update steps in docs/INSTALL.md have their own section, reload
+  dbus-broker, and say that a dash pin of the old desktop entry has to be
+  made again.
+
 ## 0.12.0
 
 - The D-Bus names and the application ID now start with

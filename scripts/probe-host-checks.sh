@@ -13,8 +13,10 @@
 # The probe terminal shows the full evidence for every call; this script
 # prints only the verdicts.
 set -u
-NAME=eu.nosini.ScopeVault.IdentityProbe
-OBJ=/eu/nosini/ScopeVault/IdentityProbe
+# shellcheck source=scripts/names.sh
+. "$(dirname "$0")/names.sh"
+NAME=$probe_name
+OBJ=$probe_obj
 ARGS="call --session --dest $NAME --object-path $OBJ --method"
 
 # Prints the verdict fields, or the raw output if there are none (an error).
@@ -25,7 +27,7 @@ summary() {
 }
 
 [ $# -eq 2 ] || { echo "usage: $0 APP_ID_A APP_ID_B" >&2; exit 2; }
-gdbus introspect --session --dest $NAME --object-path $OBJ >/dev/null 2>&1 ||
+gdbus introspect --session --dest "$NAME" --object-path "$OBJ" >/dev/null 2>&1 ||
     { echo "start 'scopevault-probe serve' first" >&2; exit 1; }
 for app in "$1" "$2"; do
     flatpak info "$app" >/dev/null 2>&1 || { echo "$app is not an installed Flatpak (see 'flatpak list --app')" >&2; exit 2; }

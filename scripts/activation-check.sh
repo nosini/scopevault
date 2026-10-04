@@ -17,7 +17,8 @@
 # Ends with "scopevault serves the Secret Service" (exit 0) when
 # scopevault-daemon owns the name, nothing is queued for it, and, if the
 # portal configuration selects scopevault, scopevault-daemon owns its portal
-# backend name; otherwise a one-line reason (exit 1).
+# backend name, the installed scopevault.portal names that name, and the bus
+# can start it; otherwise a one-line reason (exit 1).
 #
 # Needs: gdbus (glib2-tools).
 #
@@ -27,6 +28,8 @@ set -eu
 
 need() { command -v "$1" >/dev/null || { echo "$1 not found ($2)" >&2; exit 2; }; }
 need gdbus "install glib2-tools"
+# shellcheck source=scripts/names.sh
+. "$(dirname "$0")/names.sh"
 
 bus() { # bus METHOD ARG: a call to the bus daemon, the only service talked to
     gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m "org.freedesktop.DBus.$1" "$2"
@@ -84,7 +87,6 @@ fi
 
 echo
 echo "-- the other names"
-portal_name=eu.nosini.ScopeVault.Portal
 portal_owner_cmd=
 for name in org.gnome.keyring org.freedesktop.impl.portal.Secret "$portal_name"; do
     o=$(names "$(bus GetNameOwner "$name" 2>/dev/null || true)")
@@ -95,6 +97,12 @@ for name in org.gnome.keyring org.freedesktop.impl.portal.Secret "$portal_name";
         echo "owner of $name: none"
     fi
 done
+# The bus only starts names whose activation files it has read; dbus-broker
+# reads new ones only when asked to (ReloadConfig).
+portal_activatable=
+gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus \
+    -m org.freedesktop.DBus.ListActivatableNames 2>/dev/null | grep -qF "'$portal_name'" && portal_activatable=yes
+echo "the bus can start $portal_name: ${portal_activatable:-no}"
 
 echo
 echo "-- the portal frontend"
@@ -137,6 +145,13 @@ show "$config/autostart/gnome-keyring-secrets.desktop" 'Hidden='
 show /etc/xdg/autostart/gnome-keyring-secrets.desktop 'Exec='
 show "$data/dbus-1/services/$portal_name.service" 'SystemdService='
 show "$data/xdg-desktop-portal/portals/scopevault.portal" 'DBusName=' 'Interfaces='
+portal_file_name=$(sed -n 's/^DBusName=//p' "$data/xdg-desktop-portal/portals/scopevault.portal" 2>/dev/null | sed -n 1p)
+# Activation files of older versions start the same unit under a name
+# nobody owns any more.
+for f in "$data"/dbus-1/services/*.service; do
+    case $f in */org.freedesktop.secrets.service|*/"$portal_name".service) continue ;; esac
+    grep -qs '^SystemdService=scopevault.service' "$f" && echo "$f: also starts scopevault.service (left over from an older version?)"
+done
 show "$config/xdg-desktop-portal/gnome-portals.conf" 'default=' 'org.freedesktop.impl.portal.Secret='
 show /usr/share/xdg-desktop-portal/gnome-portals.conf 'default=' 'org.freedesktop.impl.portal.Secret='
 # xdg-desktop-portal reads the user file first; without a default= line,
@@ -180,6 +195,10 @@ elif [ -n "$queued" ]; then
     reason="$(describe "$(printf '%s\n' "$queued" | sed -n 1p)") is queued for org.freedesktop.secrets and takes the name if scopevault exits"
 elif [ -n "$portal_selected" ] && ! printf '%s' "$portal_owner_cmd" | grep -q scopevault-daemon; then
     reason="the portal configuration selects scopevault, but $portal_name is not owned by scopevault-daemon"
+elif [ -n "$portal_selected" ] && [ "$portal_file_name" != "$portal_name" ]; then
+    reason="scopevault.portal names ${portal_file_name:-no bus name}, but scopevault-daemon serves $portal_name; install packaging/scopevault.portal"
+elif [ -n "$portal_selected" ] && [ -z "$portal_activatable" ]; then
+    reason="the bus cannot start $portal_name; install its activation file and reload the bus (see docs/INSTALL.md)"
 fi
 if [ -z "$reason" ]; then
     echo "scopevault serves the Secret Service"

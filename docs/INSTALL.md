@@ -168,18 +168,6 @@ On a desktop that never had gnome-keyring, run `scopevault-admin portal
 init` instead of importing. From then on every app without a keyring file
 of its own gets a new key when it first asks.
 
-### Updating from a version before 0.12.0
-
-The bus names and file names used to start with
-`page.codeberg.nosini.ScopeVault`. Remove the old files,
-`~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service`
-and `~/.local/share/applications/page.codeberg.nosini.ScopeVault.desktop`,
-then install the new ones as above (`scopevault.portal` changed too), the
-GUI's desktop entry and the new binaries. Restart the daemon, restart
-`goa-daemon`, then log out and back in so xdg-desktop-portal picks up the
-new backend. `scripts/activation-check.sh` shows whether it is served.
-Nothing in the vault depends on the name.
-
 ## Known risk
 
 Whenever something starts gnome-keyring's Secret Service, gnome-keyring
@@ -282,6 +270,41 @@ python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw
 It runs the `scopevault-admin` next to it, or else the one on `PATH`;
 `--admin PATH` and `--socket PATH` override that. Don't package it as a
 Flatpak: the admin socket refuses sandboxed programs on purpose.
+
+## Updating from a version before 0.12.0
+
+The D-Bus names and the files named after them used to start with
+`page.codeberg.nosini.ScopeVault`. Nothing in the vault depends on the
+name, but the installed files do:
+
+1. Remove the old activation file and desktop entry:
+
+   ```sh
+   rm ~/.local/share/dbus-1/services/page.codeberg.nosini.ScopeVault.Portal.service
+   rm ~/.local/share/applications/page.codeberg.nosini.ScopeVault.desktop
+   ```
+
+2. Install the new binaries and files as in "What gets installed",
+   `scopevault.portal` included, and the GUI's desktop entry as in "The
+   graphical front end".
+
+3. dbus-broker only reads activation files when asked to, so reload it,
+   then restart the daemon and GNOME Online Accounts:
+
+   ```sh
+   gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.ReloadConfig
+   systemctl --user restart scopevault.service
+   pkill -x goa-daemon
+   ```
+
+4. Log out and back in, so xdg-desktop-portal reads the new
+   `scopevault.portal`. `scripts/activation-check.sh` should then end with
+   "scopevault serves the Secret Service". While the installed
+   `scopevault.portal` still names the old bus name, the daemon logs a
+   warning when it starts.
+
+If you pinned ScopeVault to the dash, pin it again: the pin refers to the
+old desktop entry.
 
 ## Unlocking with the login password (optional)
 

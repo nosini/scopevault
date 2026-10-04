@@ -37,6 +37,32 @@ pub const BACKEND_NAME: &str = "eu.nosini.ScopeVault.Portal";
 /// Where the Secret interface is exported.
 pub const BACKEND_PATH: &str = "/org/freedesktop/portal/desktop";
 
+/// The installed `scopevault.portal` files that declare a bus name other
+/// than [`BACKEND_NAME`], with that name. xdg-desktop-portal sends the
+/// Secret portal's requests to the declared name, so a file left over from
+/// an older version breaks the portal while the daemon itself runs fine.
+pub fn stale_portal_files() -> Vec<(PathBuf, String)> {
+    let home = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"));
+    let user = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).or(home);
+    let system = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    user.into_iter()
+        .chain(std::env::split_paths(&system).filter(|p| p.is_absolute()))
+        .map(|dir| dir.join("xdg-desktop-portal/portals/scopevault.portal"))
+        .filter_map(|path| {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let name = portal_file_bus_name(&contents).unwrap_or_default().to_owned();
+            (name != BACKEND_NAME).then_some((path, name))
+        })
+        .collect()
+}
+
+/// The `DBusName=` of a portal file.
+fn portal_file_bus_name(contents: &str) -> Option<&str> {
+    contents.lines().find_map(|l| l.trim().strip_prefix("DBusName=")).map(str::trim)
+}
+
 /// The well-known name of xdg-desktop-portal, the only allowed caller.
 pub const FRONTEND_NAME: &str = "org.freedesktop.portal.Desktop";
 
@@ -449,6 +475,14 @@ mod tests {
     #[test]
     fn the_backend_name_is_the_prefix_plus_portal() {
         assert_eq!(BACKEND_NAME, format!("{DBUS_PREFIX}.Portal"));
+    }
+
+    #[test]
+    fn portal_file_bus_name_reads_the_dbusname_line() {
+        let packaged = include_str!("../../packaging/scopevault.portal");
+        assert_eq!(portal_file_bus_name(packaged), Some(BACKEND_NAME), "the packaged file names the backend");
+        assert_eq!(portal_file_bus_name("[portal]\nDBusName=old.Name.Portal \n"), Some("old.Name.Portal"));
+        assert_eq!(portal_file_bus_name("[portal]\nInterfaces=x\n"), None);
     }
 
     #[test]

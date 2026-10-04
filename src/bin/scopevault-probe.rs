@@ -156,3 +156,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_interface_is_named_after_the_prefix() {
+        // The interface attribute needs a literal; this ties it to the prefix.
+        let name = <Probe as zbus::object_server::Interface>::name();
+        assert_eq!(name.as_str(), format!("{DBUS_PREFIX}.IdentityProbe"));
+    }
+}

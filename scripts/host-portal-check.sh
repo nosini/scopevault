@@ -39,6 +39,8 @@
 # pinentry answers everything by itself.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/names.sh
+. "$root/scripts/names.sh"
 real=
 devel=
 app_id=
@@ -417,10 +419,10 @@ DBUS_SESSION_BUS_ADDRESS="unix:path=$work/bus" RUST_LOG=${RUST_LOG:-scopevault=i
         2>>"$work/daemon.log" &
 daemon_pid=$!
 for _ in $(seq 100); do
-    if owns org.freedesktop.secrets && owns eu.nosini.ScopeVault.Portal; then break; fi
+    if owns org.freedesktop.secrets && owns "$portal_name"; then break; fi
     sleep 0.1
 done
-if ! owns org.freedesktop.secrets || ! owns eu.nosini.ScopeVault.Portal; then
+if ! owns org.freedesktop.secrets || ! owns "$portal_name"; then
     echo "scopevault-daemon did not take org.freedesktop.secrets and its portal name:" >&2
     cat "$work/daemon.log" >&2
     exit 1

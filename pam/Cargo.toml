@@ -1,6 +1,6 @@
 [package]
 name = "pam_scopevault"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 description = "PAM module that hands the login password to scopevault (see docs/LOGIN-UNLOCK.md)"
 publish = false

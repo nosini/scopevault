@@ -281,6 +281,13 @@ async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
         Err(e) => return Err(format!("cannot own {BACKEND_NAME}: {e}")),
     }
     tracing::info!("serving {BACKEND_NAME}");
+    for (path, name) in scopevault::portal_backend::stale_portal_files() {
+        tracing::warn!(
+            file = %path.display(),
+            "the portal file names {name:?}, not {BACKEND_NAME}, so Secret portal requests go nowhere; \
+             install this version's packaging/scopevault.portal and log out and back in"
+        );
+    }
 
     // After taking the names: a daemon that lost one of them to another one
     // must not touch that one's socket.
