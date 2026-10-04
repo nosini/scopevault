@@ -35,6 +35,7 @@ pub use sharing::{GrantListing, MAX_GRANTS_PER_SCOPE};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
@@ -60,6 +61,9 @@ pub const MAX_ATTRIBUTE_NAME_BYTES: usize = 256;
 pub const MAX_ATTRIBUTE_VALUE_BYTES: usize = 4096;
 pub const MAX_SECRET_BYTES: usize = 512 * 1024;
 pub const MAX_CONTENT_TYPE_BYTES: usize = 128;
+/// The secrets of a scope's `session` collection, together: it lives in
+/// the daemon's memory, so it gets a budget rather than the disk.
+pub const MAX_SESSION_SECRET_BYTES: usize = 8 * 1024 * 1024;
 /// Alias (and collection name) of the per-scope in-memory collection.
 pub const SESSION_ALIAS: &str = "session";
 /// The collection a new scope starts with, which the `default` alias points
@@ -157,18 +161,35 @@ struct ItemEntry {
     modified: u64,
 }
 
+/// A write changes a copy of the scope's [`NamespaceEntry`] and installs it
+/// after the commit. Collections, items and session secrets sit behind
+/// [`Arc`], so that copy shares everything the write doesn't touch:
+/// [`Arc::make_mut`] copies only the collection and item being changed.
 #[derive(Debug, Clone)]
 struct CollectionEntry {
     id: RecordId,
     label: String,
     created: u64,
     modified: u64,
-    items: BTreeMap<RecordId, ItemEntry>,
+    items: BTreeMap<RecordId, Arc<ItemEntry>>,
     /// The scope's `session` collection: kept in memory only, never
     /// written to disk, gone after a global lock or restart.
     ephemeral: bool,
     /// Secrets of an ephemeral collection (persistent ones are on disk).
-    secrets: HashMap<RecordId, Secret>,
+    secrets: HashMap<RecordId, Arc<Secret>>,
+}
+
+impl CollectionEntry {
+    fn item_mut(&mut self, id: &RecordId) -> Option<&mut ItemEntry> {
+        self.items.get_mut(id).map(Arc::make_mut)
+    }
+
+    /// Whether replacing `id`'s secret with `secret` keeps an ephemeral
+    /// collection within [`MAX_SESSION_SECRET_BYTES`].
+    fn session_has_room(&self, id: &RecordId, secret: &Secret) -> bool {
+        let others: usize = self.secrets.iter().filter(|(i, _)| *i != id).map(|(_, s)| s.value.len()).sum();
+        others + secret.value.len() <= MAX_SESSION_SECRET_BYTES
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +197,7 @@ struct NamespaceEntry {
     id: RecordId,
     aliases: BTreeMap<String, RecordId>,
     /// Keyed by path name.
-    collections: BTreeMap<String, CollectionEntry>,
+    collections: BTreeMap<String, Arc<CollectionEntry>>,
     /// The explicit sharing grants this namespace's items are given away
     /// with, keyed by grant record ID (see `sharing`).
     grants: BTreeMap<RecordId, GrantEntry>,
@@ -191,8 +212,12 @@ struct GrantEntry {
 }
 
 impl NamespaceEntry {
-    fn collection_by_id(&self, id: &RecordId) -> Option<(&String, &CollectionEntry)> {
+    fn collection_by_id(&self, id: &RecordId) -> Option<(&String, &Arc<CollectionEntry>)> {
         self.collections.iter().find(|(_, c)| &c.id == id)
+    }
+
+    fn collection_mut(&mut self, name: &str) -> Option<&mut CollectionEntry> {
+        self.collections.get_mut(name).map(Arc::make_mut)
     }
 }
 
@@ -316,7 +341,7 @@ fn build_index(
             ephemeral: false,
             secrets: HashMap::new(),
         };
-        ns.collections.insert(p.name, entry);
+        ns.collections.insert(p.name, Arc::new(entry));
         collection_ns.insert(r.id, r.namespace);
     }
 
@@ -328,9 +353,9 @@ fn build_index(
             return Err(corrupt(format!("item {} refers to a collection outside its namespace", hex(&r.id))));
         }
         let (_, ns, _) = by_ns_id.get_mut(&r.namespace).expect("checked above");
-        let col = ns.collections.values_mut().find(|c| c.id == cid).expect("checked above");
+        let col = ns.collections.values_mut().find(|c| c.id == cid).map(Arc::make_mut).expect("checked above");
         let entry = ItemEntry { label: p.label, attributes: p.attributes, created: p.created, modified: p.modified };
-        if col.items.insert(r.id, entry).is_some() {
+        if col.items.insert(r.id, Arc::new(entry)).is_some() {
             return Err(corrupt(format!("duplicate item {}", hex(&r.id))));
         }
     }
@@ -622,7 +647,7 @@ fn validate_secret(s: &Secret) -> Result<(), StoreError> {
 }
 
 /// Turns a label into a readable path element, unique within the scope.
-fn collection_name_for(label: &str, existing: &BTreeMap<String, CollectionEntry>) -> String {
+fn collection_name_for<C>(label: &str, existing: &BTreeMap<String, C>) -> String {
     let mut base: String =
         label.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).take(32).collect();
     if base.bytes().all(|b| b == b'_') || base == SESSION_ALIAS {
@@ -675,7 +700,7 @@ impl ScopedVault<'_> {
     }
 
     fn collection_entry(&self, name: &str) -> Result<&CollectionEntry, StoreError> {
-        self.ns().and_then(|n| n.collections.get(name)).ok_or(StoreError::NoSuchObject)
+        self.ns().and_then(|n| n.collections.get(name)).map(|c| &**c).ok_or(StoreError::NoSuchObject)
     }
 
     fn item_id(&self, collection: &str, item: &str) -> Result<RecordId, StoreError> {
@@ -1059,7 +1084,7 @@ impl ScopedVault<'_> {
             return Err(StoreError::Locked);
         }
         if c.ephemeral {
-            return c.secrets.get(&id).cloned().ok_or(StoreError::NoSuchObject);
+            return c.secrets.get(&id).map(|s| Secret::clone(s)).ok_or(StoreError::NoSuchObject);
         }
         let ns_id = self.ns().expect("collection exists").id;
         self.read_secret_in(ns_id, id)
@@ -1133,7 +1158,7 @@ impl ScopedVault<'_> {
         if !alias.is_empty() {
             ns.aliases.insert(alias.to_owned(), entry.id);
         }
-        ns.collections.insert(name.clone(), entry);
+        ns.collections.insert(name.clone(), Arc::new(entry));
         if !ephemeral {
             // The namespace record may be new, and its aliases may change.
             writes.push(self.namespace_record(&ns)?);
@@ -1230,7 +1255,7 @@ impl ScopedVault<'_> {
         }
         validate_label(label)?;
         let mut ns = self.ns().cloned().ok_or(StoreError::NoSuchObject)?;
-        let c = ns.collections.get_mut(name).ok_or(StoreError::NoSuchObject)?;
+        let c = ns.collection_mut(name).ok_or(StoreError::NoSuchObject)?;
         c.label = label.to_owned();
         c.modified = now();
         let writes =
@@ -1258,33 +1283,41 @@ impl ScopedVault<'_> {
         self.ensure_writable(collection)?;
         let mut ns = self.ns().cloned().ok_or(StoreError::NoSuchObject)?;
         let ns_id = ns.id;
-        let c = ns.collections.get_mut(collection).ok_or(StoreError::NoSuchObject)?;
+        let c = ns.collection_mut(collection).ok_or(StoreError::NoSuchObject)?;
         let cid = c.id;
         let t = now();
         let existing =
             if replace { c.items.iter().find(|(_, i)| i.attributes == attributes).map(|(id, _)| *id) } else { None };
-        let (id, created) = match existing {
-            Some(id) => {
-                let i = c.items.get_mut(&id).expect("found above");
-                i.label = label.to_owned();
-                i.modified = t;
-                (id, false)
-            }
+        let id = match existing {
+            Some(id) => id,
             None => {
                 if c.items.len() >= MAX_ITEMS_PER_COLLECTION {
                     return Err(StoreError::Limit("too many items"));
                 }
-                let id = new_id()?;
-                c.items.insert(id, ItemEntry { label: label.to_owned(), attributes, created: t, modified: t });
-                (id, true)
+                new_id()?
+            }
+        };
+        if c.ephemeral && !c.session_has_room(&id, secret) {
+            return Err(StoreError::Limit("the session collection is full"));
+        }
+        let created = match c.item_mut(&id) {
+            Some(i) => {
+                i.label = label.to_owned();
+                i.modified = t;
+                false
+            }
+            None => {
+                c.items
+                    .insert(id, Arc::new(ItemEntry { label: label.to_owned(), attributes, created: t, modified: t }));
+                true
             }
         };
         c.modified = t;
         let writes = if c.ephemeral {
-            c.secrets.insert(id, secret.clone());
+            c.secrets.insert(id, Arc::new(secret.clone()));
             Vec::new()
         } else {
-            let item = c.items[&id].clone();
+            let item = Arc::clone(&c.items[&id]);
             vec![
                 self.item_record(ns_id, &cid, id, &item)?,
                 self.secret_record(ns_id, id, secret)?,
@@ -1300,9 +1333,9 @@ impl ScopedVault<'_> {
         self.ensure_writable(collection)?;
         let mut ns = self.ns().cloned().expect("item exists");
         let ns_id = ns.id;
-        let c = ns.collections.get_mut(collection).expect("item exists");
+        let c = ns.collection_mut(collection).expect("item exists");
         let cid = c.id;
-        let entry = c.items.get_mut(&id).expect("item exists");
+        let entry = c.item_mut(&id).expect("item exists");
         f(entry);
         entry.modified = now();
         let entry = entry.clone();
@@ -1349,7 +1382,7 @@ impl ScopedVault<'_> {
                 .collections
                 .values_mut()
                 .find(|c| c.id == cid)
-                .and_then(|c| c.items.get_mut(&s.owner_item))
+                .and_then(|c| Arc::make_mut(c).item_mut(&s.owner_item))
                 .ok_or(StoreError::NoSuchObject)?;
             entry.modified = now();
             let entry = entry.clone();
@@ -1363,13 +1396,16 @@ impl ScopedVault<'_> {
         self.ensure_writable(collection)?;
         let mut ns = self.ns().cloned().expect("item exists");
         let ns_id = ns.id;
-        let c = ns.collections.get_mut(collection).expect("item exists");
+        let c = ns.collection_mut(collection).expect("item exists");
         let cid = c.id;
-        let entry = c.items.get_mut(&id).expect("item exists");
+        if c.ephemeral && !c.session_has_room(&id, secret) {
+            return Err(StoreError::Limit("the session collection is full"));
+        }
+        let entry = c.item_mut(&id).expect("item exists");
         entry.modified = now();
         let entry = entry.clone();
         let writes = if c.ephemeral {
-            c.secrets.insert(id, secret.clone());
+            c.secrets.insert(id, Arc::new(secret.clone()));
             Vec::new()
         } else {
             vec![self.item_record(ns_id, &cid, id, &entry)?, self.secret_record(ns_id, id, secret)?]
@@ -1384,7 +1420,9 @@ impl ScopedVault<'_> {
         let id = self.item_id(collection, item)?;
         self.ensure_writable(collection)?;
         let mut ns = self.ns().cloned().expect("item exists");
-        let c = ns.collections.get_mut(collection).expect("item exists");
+        // The field, not `collection_mut`: the grants are changed below
+        // while `c` is still in use.
+        let c = Arc::make_mut(ns.collections.get_mut(collection).expect("item exists"));
         c.items.remove(&id);
         c.modified = now();
         // Grants travel with the item they point at.
@@ -1449,5 +1487,26 @@ mod tests {
         assert_eq!(s.alias(DEFAULT_ALIAS).as_deref(), Some(LOGIN_COLLECTION));
         let (session, created) = s.create_collection("Temporary", SESSION_ALIAS).unwrap();
         assert!(created && s.collection_entry(&session).unwrap().ephemeral, "a new in-memory collection");
+    }
+
+    #[test]
+    fn a_write_shares_what_it_does_not_change() {
+        let tmp = TempDir::new();
+        let mut v = Vault::create(&tmp.0.join("vault"), b"pw", KdfParams::MINIMUM).unwrap();
+        let mut s = v.scoped(&Principal::Host).unwrap();
+        let (a, _) = s.create_collection("A", "").unwrap();
+        let (b, _) = s.create_collection("B", "").unwrap();
+        let secret = Secret::new("x", "text/plain");
+        let (one, _) = s.create_item(&a, "one", BTreeMap::new(), &secret, false).unwrap();
+        s.create_item(&b, "b", BTreeMap::new(), &secret, false).unwrap();
+        let before = s.ns().cloned().unwrap();
+
+        s.create_item(&a, "two", BTreeMap::new(), &secret, false).unwrap();
+        let after = s.ns().unwrap();
+        assert!(Arc::ptr_eq(&before.collections[&b], &after.collections[&b]), "the other collection is shared");
+        assert!(!Arc::ptr_eq(&before.collections[&a], &after.collections[&a]), "the changed one is a copy");
+        let id = unhex(&one).unwrap();
+        assert!(Arc::ptr_eq(&before.collections[&a].items[&id], &after.collections[&a].items[&id]), "so are its items");
+        assert_eq!(before.collections[&a].items.len() + 1, after.collections[&a].items.len());
     }
 }

@@ -324,9 +324,9 @@ impl ScopedVault<'_> {
         let id = self.item_id(collection, item)?;
         let mut ns = self.ns().cloned().expect("item exists");
         let ns_id = ns.id;
-        let c = ns.collections.get_mut(collection).expect("item exists");
+        let c = ns.collection_mut(collection).expect("item exists");
         let cid = c.id;
-        let entry: &mut ItemEntry = c.items.get_mut(&id).expect("item exists");
+        let entry: &mut ItemEntry = c.item_mut(&id).expect("item exists");
         entry.created = created;
         entry.modified = modified;
         let entry = entry.clone();

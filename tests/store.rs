@@ -642,6 +642,39 @@ fn session_collection_is_memory_only() {
 }
 
 #[test]
+fn the_session_collection_has_a_byte_budget() {
+    use scopevault::store::{MAX_SECRET_BYTES, MAX_SESSION_SECRET_BYTES};
+    let tmp = TempDir::new("store");
+    let mut v = Vault::create(&vault_dir(&tmp), PW, KDF).unwrap();
+    let mut s = v.scoped(&app("org.example.Session")).unwrap();
+    let session = s.create_collection("Temporary", "session").unwrap().0;
+    let big = Secret::new(vec![7u8; MAX_SECRET_BYTES], "");
+    let bytes = |n: usize| Secret::new(vec![7u8; n], "");
+    for n in 0..MAX_SESSION_SECRET_BYTES / MAX_SECRET_BYTES - 1 {
+        s.create_item(&session, "big", attrs(&[("n", &n.to_string())]), &big, false).unwrap();
+    }
+    // One byte below the budget.
+    let last = s.create_item(&session, "last", attrs(&[]), &bytes(MAX_SECRET_BYTES - 1), false).unwrap().0;
+    let full = |r: Result<(), StoreError>| assert!(matches!(r, Err(StoreError::Limit(_))), "{r:?}");
+    full(s.create_item(&session, "two bytes", attrs(&[]), &bytes(2), false).map(|_| ()));
+    // Replacing a secret counts only the new one.
+    s.set_secret(&session, &last, &big).unwrap();
+    s.set_secret(&session, &last, &bytes(MAX_SECRET_BYTES - 1)).unwrap();
+    let one = s.create_item(&session, "one byte", attrs(&[]), &bytes(1), false).unwrap().0;
+    full(s.set_secret(&session, &one, &bytes(2)));
+    // Deleting frees room.
+    s.delete_item(&session, &last).unwrap();
+    s.create_item(&session, "fits again", attrs(&[]), &bytes(MAX_SECRET_BYTES - 1), false).unwrap();
+
+    // Persistent collections and other scopes are not affected.
+    let login = s.create_collection("Login", "default").unwrap().0;
+    s.create_item(&login, "on disk", attrs(&[]), &big, false).unwrap();
+    let mut o = v.scoped(&app("org.example.Other")).unwrap();
+    let other = o.create_collection("Temporary", "session").unwrap().0;
+    o.create_item(&other, "big", attrs(&[]), &big, false).unwrap();
+}
+
+#[test]
 fn the_session_alias_names_only_the_session_collection() {
     let tmp = TempDir::new("store");
     let mut v = Vault::create(&vault_dir(&tmp), PW, KDF).unwrap();
