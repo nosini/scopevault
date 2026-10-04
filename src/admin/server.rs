@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
@@ -129,6 +129,18 @@ pub fn bind(path: &Path) -> std::io::Result<BoundSocket> {
     Ok(BoundSocket { listener, path: path.to_owned(), ino })
 }
 
+/// Resolves when the client has closed the connection (or it failed).
+/// Anything it sends after its request is ignored.
+async fn client_gone<R: tokio::io::AsyncRead + Unpin>(rd: &mut R) {
+    let mut buf = [0u8; 256];
+    loop {
+        match rd.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// The confirmation dialog's outcome as a refusal, if it was not allowed.
 fn refused(outcome: UnlockOutcome) -> Option<Reply> {
     match outcome {
@@ -231,8 +243,16 @@ impl AdminServer {
             }
         };
         tracing::info!(request = ?request, "admin request");
+        // A client that goes away cancels its request: its dialog closes
+        // and its slot is free again. Every request changes the vault only
+        // after its last wait, so nothing is left half done.
+        let cancelled = || tracing::info!("admin request cancelled: the client went away");
         if request == Request::Backup {
-            match self.backup().await {
+            let backup = tokio::select! {
+                b = self.backup() => b,
+                () = client_gone(&mut rd) => return cancelled(),
+            };
+            match backup {
                 Ok(bytes) => {
                     let header = Reply::Backup { bytes: bytes.len() as u64 };
                     if write_json(&mut wr, &header).await.is_ok() {
@@ -246,7 +266,10 @@ impl AdminServer {
             }
             return;
         }
-        let reply = self.run(&authority, request).await.unwrap_or_else(|r| r);
+        let reply = tokio::select! {
+            r = self.run(&authority, request) => r.unwrap_or_else(|r| r),
+            () = client_gone(&mut rd) => return cancelled(),
+        };
         if let Reply::Error { message } = &reply {
             tracing::info!(error = %message, "admin request failed");
         }

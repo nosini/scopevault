@@ -13,9 +13,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use common::tempdir::TempDir;
 use common::{FakeCheck, LOGIN_PASSWORD, PASSWORD, TestBus, VaultFixture, VaultState};
+use scopevault::admin::protocol::Request;
 use scopevault::admin::server::{AdminServer, BoundSocket, PeerClassifier, bind};
 use scopevault::identity::{BusIdentityResolver, Classifier, HostBaseline, IdentityPolicy, InstanceRecords};
 use scopevault::login::{LoginTimings, LoginUnlock};
@@ -75,7 +77,7 @@ async fn env(state: VaultState) -> Env {
     let login = LoginUnlock::new(
         vault.unlocker.clone(),
         FakeCheck::new(LOGIN_PASSWORD),
-        LoginTimings { min_interval: std::time::Duration::ZERO, keep_for_repair: std::time::Duration::from_secs(60) },
+        LoginTimings { min_interval: Duration::ZERO, keep_for_repair: Duration::from_secs(60) },
     );
     let server = AdminServer::new(classify, vault.unlocker.clone(), service, login);
     let b = bound.clone();
@@ -164,6 +166,47 @@ async fn malformed_requests_are_refused() {
     let mut reply = String::new();
     let _ = s.read_to_string(&mut reply).await;
     assert!(reply.contains("line too long"), "{reply}");
+}
+
+/// A client that goes away while its request waits for the password
+/// dialog cancels the request: the dialog closes, nothing is deleted, and
+/// the request's slot is free again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_whose_client_left_is_cancelled() {
+    use tokio::io::AsyncWriteExt;
+    let e = env(VaultState::Unlocked).await;
+    let store = e.client(&Who::Host, &["store", "default", "h", "host-secret", "k=v"]).await;
+    assert_eq!(field(&store[0], 1), "ok", "{store:?}");
+    let request = serde_json::to_string(&Request::ResetScope { scope: "host".into() }).unwrap() + "\n";
+    // As many as there are admin slots, each left while its dialog is up.
+    for n in 1..=4 {
+        e.vault.set_pins(&["HANG"]);
+        let mut s = tokio::net::UnixStream::connect(&e.socket).await.unwrap();
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut pid = None;
+        for _ in 0..250 {
+            if e.vault.log().matches("GETPIN").count() >= n {
+                pid = e.vault.pinentry_pid();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid.expect("the dialog appeared");
+        drop(s);
+        let mut closed = false;
+        for _ in 0..150 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z") {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(closed, "the dialog of an abandoned request stays open");
+    }
+    // Nothing was deleted, and requests are still served.
+    let out = e.admin(&Who::Host, &["list", "host"]).await;
+    assert!(out.ok && out.stdout.contains("k=v"), "{}\n{}", out.stdout, out.stderr);
 }
 
 #[tokio::test(flavor = "multi_thread")]
