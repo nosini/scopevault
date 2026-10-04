@@ -188,11 +188,7 @@ fn run_helper(pamh: *mut PamHandle, acct: &Account, helper: &CStr, mode: &CStr, 
     let (Ok(env_runtime), Ok(env_home)) = (CString::new(env_runtime), CString::new(env_home)) else { return };
     let argv = [helper.as_ptr(), mode.as_ptr(), std::ptr::null()];
     let envp = [env_runtime.as_ptr(), env_home.as_ptr(), std::ptr::null()];
-    let mut input = Zeroizing::new(Vec::new());
-    for p in passwords {
-        input.extend_from_slice(p);
-        input.push(0);
-    }
+    let input = helper_input(passwords);
 
     // A socket pair rather than a pipe: `send` with MSG_NOSIGNAL cannot
     // raise SIGPIPE in the host process if the helper exits early.
@@ -236,6 +232,18 @@ fn run_helper(pamh: *mut PamHandle, acct: &Account, helper: &CStr, mode: &CStr, 
         log(pamh, libc::LOG_NOTICE, "the helper did not take the password");
     }
     reap(pamh, pid);
+}
+
+/// The helper's input: each password followed by a NUL. Allocated in full
+/// first: a buffer that grew would leave copies of the passwords behind in
+/// the allocations it moved out of.
+fn helper_input(passwords: &[&[u8]]) -> Zeroizing<Vec<u8>> {
+    let mut input = Zeroizing::new(Vec::with_capacity(passwords.iter().map(|p| p.len() + 1).sum()));
+    for p in passwords {
+        input.extend_from_slice(p);
+        input.push(0);
+    }
+    input
 }
 
 /// Waits up to 5 s for the helper's first process, which exits as soon as
@@ -472,6 +480,13 @@ mod tests {
         let stash = Stash { uid: 1000, password: Zeroizing::new(b"secret".to_vec()) };
         assert_eq!(stash.password_for(&acct(1000)), Some(&b"secret"[..]));
         assert_eq!(stash.password_for(&acct(1001)), None);
+    }
+
+    #[test]
+    fn helper_input_is_allocated_once() {
+        let input = helper_input(&[b"old password", &[b'n'; 300]]);
+        assert_eq!(input.len(), 13 + 301);
+        assert_eq!(input.capacity(), input.len());
     }
 
     #[test]

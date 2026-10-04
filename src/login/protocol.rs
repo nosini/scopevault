@@ -40,11 +40,14 @@ impl Request {
             Request::Deliver(p) => (DELIVER, vec![p]),
             Request::Change { old, new } => (CHANGE, vec![old, new]),
         };
-        let mut out = Zeroizing::new(vec![op]);
+        if passwords.iter().any(|p| p.is_empty() || p.len() > MAX_PASSWORD) {
+            return Err("password empty or too long");
+        }
+        // Allocated in full first: a buffer that grew would leave copies of
+        // the passwords behind in the allocations it moved out of.
+        let mut out = Zeroizing::new(Vec::with_capacity(1 + passwords.iter().map(|p| 2 + p.len()).sum::<usize>()));
+        out.push(op);
         for p in passwords {
-            if p.is_empty() || p.len() > MAX_PASSWORD {
-                return Err("password empty or too long");
-            }
             out.extend_from_slice(&(p.len() as u16).to_be_bytes());
             out.extend_from_slice(p);
         }
@@ -87,6 +90,20 @@ mod tests {
     async fn roundtrip(req: &Request) -> Request {
         let bytes = req.encode().unwrap();
         Request::read(&mut &bytes[..]).await.unwrap()
+    }
+
+    /// The encoding never grows its buffer, which would leave unwiped
+    /// copies of the passwords behind.
+    #[test]
+    fn encoding_allocates_once() {
+        let change = Request::Change {
+            old: Zeroizing::new(vec![b'o'; MAX_PASSWORD]),
+            new: Zeroizing::new(vec![b'n'; MAX_PASSWORD]),
+        };
+        for req in [Request::Deliver(Zeroizing::new(b"password".to_vec())), change] {
+            let out = req.encode().unwrap();
+            assert_eq!(out.capacity(), out.len());
+        }
     }
 
     #[tokio::test]
