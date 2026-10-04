@@ -354,6 +354,12 @@ impl Provider {
         for (pc, target, actions) in plans {
             let target = match target {
                 Some(t) => t,
+                // Created with the `default` alias; never shared with an
+                // ordinary collection of the same label.
+                None if pc.aliases.iter().any(|a| a == "default") => {
+                    report.collections_created += 1;
+                    self.create_collection(pc).await?
+                }
                 None => match created.get(pc.label.as_str()) {
                     Some(t) => t.clone(),
                     None => {
@@ -412,13 +418,16 @@ impl Provider {
         Ok(())
     }
 
+    /// The provider's collection for `pc`: for the default collection the
+    /// provider's own default (`None` if it has none, so one is created with
+    /// the alias), otherwise one with the same label.
     async fn find_collection(&self, pc: &PortableCollection) -> Result<Option<OwnedObjectPath>, String> {
         if pc.aliases.iter().any(|a| a == "default") {
             let m = self.call(SERVICE, SVC, "ReadAlias", &("default",)).await.map_err(err("ReadAlias failed"))?;
             let (default,): (OwnedObjectPath,) = m.body().deserialize().map_err(|e| e.to_string())?;
-            if default.as_str() != "/" {
-                return Ok(Some(default));
-            }
+            // A collection with the same label is not the default one: what
+            // looks for the default (the portal backend) would miss it.
+            return Ok((default.as_str() != "/").then_some(default));
         }
         let cols: Vec<OwnedObjectPath> = self.get(SERVICE, SVC, "Collections").await?;
         for c in cols.into_iter().filter(|c| !c.as_str().ends_with("/session")) {

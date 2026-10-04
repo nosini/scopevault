@@ -313,6 +313,13 @@ pub async fn export(opts: Options) -> ExitCode {
         Ok(b) => b,
         Err(e) => return fail(format!("cannot read the provider back: {e}")),
     };
+    // Portal keys only count in the default collection, where the portal
+    // backend looks for them.
+    let back = if opts.scope == Scope::Portal {
+        back.into_iter().filter(|c| c.aliases.iter().any(|a| a == DEFAULT_ALIAS)).collect()
+    } else {
+        back
+    };
     let (found, total) = found_in(&back, &cols);
     println!(
         "wrote {} items, replaced {} older versions ({} already there, {} new collections)",

@@ -707,4 +707,31 @@ async fn portal_keys_rollback_into_the_default_collection() {
         let found = s.search(&[("app_id".to_owned(), APP.to_owned())].into());
         assert_eq!(found.len(), 1, "only the provider's own key is there: {found:?}");
     }
+
+    // A provider without a default collection, but with one labelled like
+    // the source: the key goes into a new default collection, where the
+    // portal backend looks, not into the one with the same label.
+    let old = old_provider(VaultState::Unlocked).await;
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        let mut s = v.scoped_admin(&AdminAuthority::offline(), Scope::Host).unwrap();
+        s.ensure_namespace().unwrap();
+        let (portal, _) = s.create_collection("Portal", "").unwrap();
+        s.set_alias("default", None).unwrap();
+        assert_eq!(s.alias("default"), None);
+        assert_ne!(portal, "login");
+    }
+    pins.set(&[TARGET_PW]);
+    let out = admin(&["export", "--scope", "portal"], &dir, &pins, Some(&old.bus.address)).await;
+    assert!(out.ok, "{}\n{}", out.stdout, out.stderr);
+    {
+        let mut slot = old.vault.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().unwrap();
+        let s = v.scoped_admin(&AdminAuthority::offline(), Scope::Host).unwrap();
+        let default = s.alias("default").expect("a default collection");
+        let found = s.search(&[("app_id".to_owned(), APP.to_owned())].into());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, default, "{found:?}");
+    }
 }
