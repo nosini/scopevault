@@ -22,8 +22,8 @@ use crate::store::{SHARED_COLLECTION, ScopedVault, Secret};
 
 use super::dispatch::{
     Call, CallResult, Event, Fault, MAX_PROMPTS_PER_CONNECTION, MAX_SECRET_BYTES_PER_REPLY,
-    MAX_SESSIONS_PER_CONNECTION, Node, PromptAction, PromptEntry, SecretService, SignalBody, Target, TransferSession,
-    service_path, value,
+    MAX_SESSIONS_PER_CONNECTION, MAX_UNLOCK_PATHS_PER_SCOPE, Node, PromptAction, PromptEntry, SecretService,
+    SignalBody, Target, TransferSession, service_path, value,
 };
 use super::interfaces::{self, Interface};
 use super::paths::{self, Parsed};
@@ -206,6 +206,20 @@ impl<R: CallerResolver> SecretService<R> {
         if prompts.values().filter(|p| p.owner == call.sender).count() >= MAX_PROMPTS_PER_CONNECTION {
             return Err(Fault::limits("Too many pending prompts"));
         }
+        if let PromptAction::Unlock(objects) = &action {
+            let scope = call.scope();
+            let held: usize = prompts
+                .values()
+                .filter(|p| p.principal.scope() == scope)
+                .map(|p| match &p.action {
+                    PromptAction::Unlock(o) => o.len(),
+                    PromptAction::CreateCollection { .. } => 0,
+                })
+                .sum();
+            if held + objects.len() > MAX_UNLOCK_PATHS_PER_SCOPE {
+                return Err(Fault::limits("Too many objects waiting to be unlocked"));
+            }
+        }
         let id = paths::random_id('p');
         prompts.insert(
             id.clone(),
@@ -386,6 +400,21 @@ impl<R: CallerResolver> SecretService<R> {
             }
             "Unlock" => {
                 let (objects,): (Vec<OwnedObjectPath>,) = args(call)?;
+                // A prompt keeps the paths until it completes: only those
+                // that can name an object are kept, once each.
+                let objects: BTreeSet<String> = objects
+                    .iter()
+                    .filter(|p| {
+                        matches!(
+                            paths::parse(p.as_str()),
+                            Parsed::Collection(_)
+                                | Parsed::AliasedCollection(_)
+                                | Parsed::Item(..)
+                                | Parsed::AliasedItem(..)
+                        )
+                    })
+                    .map(|p| p.as_str().to_owned())
+                    .collect();
                 if objects.is_empty() {
                     return call.reply(&(Vec::<OwnedObjectPath>::new(), paths::none()));
                 }
@@ -394,7 +423,7 @@ impl<R: CallerResolver> SecretService<R> {
                     return call.reply(&(Vec::<OwnedObjectPath>::new(), prompt));
                 }
                 let (open, any_locked) = self.with_vault(&call.principal, |v| {
-                    let resolved: BTreeSet<Obj> = objects.iter().filter_map(|p| resolve_obj(v, p.as_str())).collect();
+                    let resolved: BTreeSet<Obj> = objects.iter().filter_map(|p| resolve_obj(v, p)).collect();
                     let open: Vec<OwnedObjectPath> =
                         resolved.iter().filter(|o| !is_locked(v, o)).map(Obj::path).collect();
                     Ok((open, resolved.iter().any(|o| is_locked(v, o))))
@@ -722,7 +751,7 @@ impl<R: CallerResolver> SecretService<R> {
                     .with_vault(principal, |v| {
                         Ok(objects
                             .iter()
-                            .filter_map(|p| resolve_obj(v, p.as_str()))
+                            .filter_map(|p| resolve_obj(v, p))
                             .filter(|o| is_locked(v, o))
                             .map(|o| o.collection().to_owned())
                             .collect())
@@ -747,8 +776,7 @@ impl<R: CallerResolver> SecretService<R> {
                 }
                 let open: Vec<OwnedObjectPath> = self
                     .with_vault(principal, |v| {
-                        let resolved: BTreeSet<Obj> =
-                            objects.iter().filter_map(|p| resolve_obj(v, p.as_str())).collect();
+                        let resolved: BTreeSet<Obj> = objects.iter().filter_map(|p| resolve_obj(v, p)).collect();
                         Ok(resolved.iter().filter(|o| !is_locked(v, o)).map(Obj::path).collect())
                     })
                     .map_err(fail)?;

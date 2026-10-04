@@ -40,7 +40,7 @@
 //! connection closes, its queued requests are dropped and a request of it
 //! waiting for the unlock dialog stops waiting.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -81,6 +81,10 @@ pub const MAX_CONNECTIONS_PER_SCOPE: usize = 128;
 pub const MAX_SESSIONS_PER_CONNECTION: usize = 16;
 /// Pending prompts per connection.
 pub const MAX_PROMPTS_PER_CONNECTION: usize = 8;
+/// Paths held by a scope's pending `Unlock` prompts, all its connections
+/// together. A prompt keeps its paths until it completes, so without this
+/// one app could make the daemon hold every request it ever sent.
+pub const MAX_UNLOCK_PATHS_PER_SCOPE: usize = 4096;
 
 const BUS_NAME: &str = "org.freedesktop.DBus";
 
@@ -239,8 +243,12 @@ pub(crate) struct TransferSession {
 
 #[derive(Debug, Clone)]
 pub(crate) enum PromptAction {
-    Unlock(Vec<OwnedObjectPath>),
-    CreateCollection { label: String, alias: String },
+    /// The distinct paths asked for that can name a collection or item.
+    Unlock(BTreeSet<String>),
+    CreateCollection {
+        label: String,
+        alias: String,
+    },
 }
 
 pub(crate) struct PromptEntry {

@@ -468,6 +468,48 @@ async fn prompts_belong_to_their_connection_and_complete_only_there() {
     assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded");
 }
 
+/// An `Unlock` prompt keeps only the distinct paths that can name an
+/// object, and a scope's pending prompts hold a bounded number of them, so
+/// an app cannot make the daemon keep every request it sends.
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_prompts_hold_a_bounded_set_of_paths() {
+    use scopevault::service_api::dispatch::MAX_UNLOCK_PATHS_PER_SCOPE;
+    let fx = fixture(VaultState::Locked).await;
+    let a1 = fx.client(Some(app_a())).await;
+    let a2 = fx.client(Some(app_a())).await;
+    let b = fx.client(Some(app_b())).await;
+    let collections =
+        |n: usize| (0..n).map(|n| format!("/org/freedesktop/secrets/collection/c{n}")).collect::<Vec<_>>();
+    fn as_strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    // Repeated and invalid paths are not kept: one path held.
+    let mut objects = vec!["/"; 100_000];
+    objects.extend(["/org/freedesktop/secrets/aliases/default"; 10_000]);
+    let (_, first) = xlock(&a1, "Unlock", &objects).await.unwrap();
+    assert_ne!(first, "/");
+    // Nothing that can name an object: no prompt.
+    let none = ["/", "/org/freedesktop/secrets/session/s1", "/org/freedesktop/secrets/collection"];
+    assert_eq!(xlock(&a1, "Unlock", &none).await.unwrap(), (vec![], "/".into()));
+
+    // The scope's other connection may add up to the limit, not past it.
+    let fill = collections(MAX_UNLOCK_PATHS_PER_SCOPE - 1);
+    let (_, prompt) = xlock(&a2, "Unlock", &as_strs(&fill)).await.unwrap();
+    assert_ne!(prompt, "/");
+    let e = xlock(&a2, "Unlock", &["/org/freedesktop/secrets/collection/more"]).await.unwrap_err();
+    assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded", "{e:?}");
+
+    // Another scope is not affected.
+    let (_, prompt) = xlock(&b, "Unlock", &as_strs(&collections(MAX_UNLOCK_PATHS_PER_SCOPE))).await.unwrap();
+    assert_ne!(prompt, "/");
+
+    // Completed prompts no longer count.
+    call(&a1, &first, PROMPT_IFACE, "Dismiss", &()).await.unwrap();
+    let (_, prompt) = xlock(&a2, "Unlock", &["/org/freedesktop/secrets/collection/more"]).await.unwrap();
+    assert_ne!(prompt, "/");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dismissing_a_prompt_closes_its_dialog() {
     let fx = fixture(VaultState::Locked).await;

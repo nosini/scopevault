@@ -153,7 +153,9 @@ and routes them by the caller's scope:
   scope it concerns, addressed to them directly. xdg-dbus-proxy passes
   such signals on to Flatpak apps.
 - Requests from one connection are handled in order, with limits on the
-  queue, request size and number of connections.
+  queue, request size and number of connections. Pending prompts are
+  limited per connection, and the paths that a scope's pending `Unlock`
+  prompts keep are limited per scope.
 - One table drives both argument checking and introspection, and a test
   compares it with the upstream interface description in `spec/`.
 
