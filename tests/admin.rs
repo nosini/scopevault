@@ -209,6 +209,25 @@ async fn a_request_whose_client_left_is_cancelled() {
     assert!(out.ok && out.stdout.contains("k=v"), "{}\n{}", out.stdout, out.stderr);
 }
 
+/// Text an app chose reaches the terminal escaped: no control characters,
+/// line breaks or bidirectional overrides that could fake or hide output.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_text_is_escaped_in_listings() {
+    let e = env(VaultState::Unlocked).await;
+    let app = Who::Sandbox("ok", "org.example.Spoof");
+    let store = e
+        .client(&app, &["store", "default", "label\u{202e}gpj.exe\nfake", "s", "k\u{1b}[2J=v\nscopes: none\u{2066}x"])
+        .await;
+    assert_eq!(field(&store[0], 1), "ok", "{store:?}");
+    let out = e.admin(&Who::Host, &["list", "flatpak/org.example.Spoof"]).await;
+    assert!(out.ok, "{}", out.stderr);
+    for bad in ['\u{1b}', '\u{202e}', '\u{2066}'] {
+        assert!(!out.stdout.contains(bad), "{bad:?} in {:?}", out.stdout);
+    }
+    assert!(!out.stdout.lines().any(|l| l.starts_with("scopes: none")), "{:?}", out.stdout);
+    assert!(out.stdout.contains("k\\u{1b}[2J=v\\u{a}scopes: none\\u{2066}x"), "{:?}", out.stdout);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn global_lock_needs_a_new_unlock_and_tells_clients() {
     let e = env(VaultState::Unlocked).await;

@@ -97,8 +97,26 @@ collection.
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("scopevault-admin: {msg}");
+    eprintln!("scopevault-admin: {}", shown(&msg.to_string()));
     ExitCode::FAILURE
+}
+
+/// Text for the terminal: control characters, line and paragraph
+/// separators and invisible formatting (bidirectional overrides and the
+/// like) are written as `\u{..}` escapes. Attributes, labels and messages
+/// can hold text an app chose, which must not move the cursor, recolour
+/// or reorder what is shown, or fake further lines.
+fn shown(s: &str) -> std::borrow::Cow<'_, str> {
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c,
+                '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
+    };
+    if !s.chars().any(hidden) {
+        return s.into();
+    }
+    s.chars().map(|c| if hidden(c) { c.escape_unicode().to_string() } else { c.to_string() }).collect::<String>().into()
 }
 
 /// [`fail`], or with `--json` an error reply on standard output.
@@ -219,7 +237,7 @@ fn print_reply(reply: &Reply, json: bool) -> ExitCode {
             println!("transfer sessions: {}", s.sessions);
             println!("pending prompts:  {}", s.prompts);
         }
-        Reply::Done { message } => println!("{message}"),
+        Reply::Done { message } => println!("{}", shown(message)),
         Reply::Scopes { scopes } => {
             if scopes.is_empty() {
                 println!("no scope has data");
@@ -237,7 +255,8 @@ fn print_reply(reply: &Reply, json: bool) -> ExitCode {
                 let locked = if c.locked { " (locked by its app)" } else { "" };
                 println!("{}  {:?}{aliases}{locked}", c.name, c.label);
                 for i in &c.items {
-                    let attrs: Vec<String> = i.attributes.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    let attrs: Vec<String> =
+                        i.attributes.iter().map(|(k, v)| format!("{}={}", shown(k), shown(v))).collect();
                     println!("  {}/{}  {:?}  modified {}", c.name, i.name, i.label, date(i.modified));
                     if !attrs.is_empty() {
                         println!("      {}", attrs.join(" "));

@@ -475,7 +475,7 @@ impl AdminServer {
                 });
                 tracing::info!(grant = %grant, owner = %listing.owner, grantee = %grantee, "admin: grant removed");
                 Ok(Reply::Done {
-                    message: format!("removed the grant on \"{}\" from {}", listing.label, listing.grantee),
+                    message: format!("removed the grant on {:?} from {}", listing.label, listing.grantee),
                 })
             }
             Request::Grants { scope } => {
