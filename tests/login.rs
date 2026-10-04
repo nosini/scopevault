@@ -213,12 +213,33 @@ async fn a_kept_password_expires() {
     .await;
     e.check.set("new login");
     assert_eq!(e.deliver("new login").await, "stale");
+    assert!(e.login.keeps_a_password());
     tokio::time::sleep(Duration::from_millis(400)).await;
+    // Wiped when it expired, not only ignored at the next unlock.
+    assert!(!e.login.keeps_a_password());
     e.vault.set_pins(&[PASSWORD]);
     assert_eq!(e.vault.unlocker.ensure_unlocked_admin().await, UnlockOutcome::Unlocked);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(e.check.calls(), 0);
     assert!(e.slot_opens(LOGIN_PASSWORD));
+}
+
+/// A global lock (before the system sleeps) wipes a kept password: the
+/// time it may be kept does not run while the system sleeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_wipes_a_kept_password() {
+    let e = env(VaultState::Locked, true, FAST).await;
+    e.check.set("new login");
+    assert_eq!(e.deliver("new login").await, "stale");
+    assert!(e.login.keeps_a_password());
+    e.vault.lock_vault();
+    for _ in 0..100 {
+        if !e.login.keeps_a_password() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!e.login.keeps_a_password());
 }
 
 /// A global lock (before the system sleeps) while a delivery derives the

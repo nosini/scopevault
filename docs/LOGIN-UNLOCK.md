@@ -76,8 +76,9 @@ that no password ever crosses it. The framing is binary, so passwords are
 never copied through a JSON parser.
 
 A delivered password that opens the slot unlocks the vault and closes any
-unlock dialog that is open. One that doesn't is kept, wiped after at most
-five minutes, in case the slot is out of date: once the vault is opened
+unlock dialog that is open. One that doesn't is kept, wiped after five
+minutes or at the next lock (before the system sleeps, for example),
+in case the slot is out of date: once the vault is opened
 with the master password, the daemon checks it with `unix_chkpwd`, and if
 it is the current login password, wraps the slot under it. A password
 change sends the old and the new password; the slot is rewrapped if the

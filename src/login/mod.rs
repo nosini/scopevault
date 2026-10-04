@@ -124,11 +124,15 @@ pub struct LoginUnlock {
     /// One socket request at a time.
     busy: tokio::sync::Mutex<()>,
     state: Mutex<State>,
+    /// Wakes the background task when a password is kept, so it can wipe
+    /// it on time.
+    kept: Arc<tokio::sync::Notify>,
 }
 
 impl LoginUnlock {
     /// Also starts the task that repairs the slot once the vault is
-    /// unlocked after a delivery that did not open it.
+    /// unlocked after a delivery that did not open it, and wipes a kept
+    /// password when it expires or the vault is locked.
     pub fn new(unlocker: Arc<Unlocker>, checker: Arc<dyn PasswordCheck>, timings: LoginTimings) -> Arc<Self> {
         let this = Arc::new(LoginUnlock {
             unlocker,
@@ -136,20 +140,65 @@ impl LoginUnlock {
             timings,
             busy: tokio::sync::Mutex::new(()),
             state: Mutex::new(State { pending: None, last_derivation: None, last_unlock: None, last_rewrap: None }),
+            kept: Arc::new(tokio::sync::Notify::new()),
         });
         let weak = Arc::downgrade(&this);
+        let kept = this.kept.clone();
         let mut unlocked = this.unlocker.subscribe_unlocked();
+        let mut locked = this.unlocker.subscribe_locked();
         tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
             loop {
-                match unlocked.recv().await {
-                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                let expires = {
+                    let Some(this) = weak.upgrade() else { return };
+                    let st = this.state.lock().unwrap();
+                    st.pending.as_ref().map(|(_, at)| *at + this.timings.keep_for_repair)
+                };
+                let sleep = async {
+                    match expires {
+                        Some(t) => tokio::time::sleep_until(t.into()).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    r = unlocked.recv() => {
+                        if matches!(r, Err(RecvError::Closed)) {
+                            return;
+                        }
+                        let Some(this) = weak.upgrade() else { return };
+                        this.repair_pending().await;
+                    }
+                    r = locked.recv() => {
+                        if matches!(r, Err(RecvError::Closed)) {
+                            return;
+                        }
+                        let Some(this) = weak.upgrade() else { return };
+                        this.state.lock().unwrap().pending = None;
+                    }
+                    () = sleep => {
+                        let Some(this) = weak.upgrade() else { return };
+                        let mut st = this.state.lock().unwrap();
+                        if st.pending.as_ref().is_some_and(|(_, at)| at.elapsed() >= this.timings.keep_for_repair) {
+                            st.pending = None;
+                        }
+                    }
+                    () = kept.notified() => {}
                 }
-                let Some(this) = weak.upgrade() else { return };
-                this.repair_pending().await;
             }
         });
         this
+    }
+
+    /// Keeps a password that did not open the locked vault's slot, for
+    /// repairing the slot after the next unlock.
+    fn keep(&self, password: Zeroizing<Vec<u8>>) {
+        self.state.lock().unwrap().pending = Some((password, Instant::now()));
+        self.kept.notify_one();
+    }
+
+    /// Whether a password is kept for repair (for tests).
+    pub fn keeps_a_password(&self) -> bool {
+        self.state.lock().unwrap().pending.is_some()
     }
 
     /// The password the PAM module delivered at login or screen unlock.
@@ -169,7 +218,7 @@ impl LoginUnlock {
                 Outcome::Unlocked
             }
             SlotUnlock::WrongPassword => {
-                self.state.lock().unwrap().pending = Some((password, Instant::now()));
+                self.keep(password);
                 Outcome::Stale
             }
             SlotUnlock::AlreadyUnlocked => self.check_and_repair(password).await,
