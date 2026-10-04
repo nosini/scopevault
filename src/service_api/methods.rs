@@ -619,6 +619,7 @@ impl<R: CallerResolver> SecretService<R> {
                     self.items_changed(call, name)?;
                 } else {
                     Self::collection_signal(call, name, "ItemChanged", path.clone());
+                    self.shared_changed(call, name, &item)?;
                 }
                 call.reply(&(path, paths::none()))
             }

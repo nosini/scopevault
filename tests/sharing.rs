@@ -376,6 +376,24 @@ async fn signals_reach_exactly_the_scopes_involved() {
     }
 }
 
+/// Replacing a shared item through `CreateItem` tells its grantees, like
+/// any other change of the item.
+#[tokio::test(flavor = "multi_thread")]
+async fn replacing_a_shared_item_tells_the_grantee() {
+    let fx = fixture(VaultState::Unlocked).await;
+    let (host, item_path, item_id, hs) = host_item(&fx).await;
+    let grant = share(&fx, &item_id, &b_scope(), false);
+    let b = fx.client(Some(common::service::flatpak(B))).await;
+    let from = fx.service_name().await;
+    collections(&b).await;
+    let b_log = SignalLog::start(&b, &from);
+    let replaced = create_item(&host, LOGIN_COL, &hs, "Mail", &[("check", "yes")], b"replaced", true).await.unwrap();
+    assert_eq!(replaced, item_path);
+    let m = b_log.wait_for(SHARED_COL, "ItemChanged", Duration::from_secs(5)).await.expect("B's ItemChanged");
+    let (p,): (zbus::zvariant::OwnedObjectPath,) = m.body().deserialize().unwrap();
+    assert_eq!(p.as_str(), format!("{SHARED_COL}/{grant}"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grants_survive_a_global_lock_and_unlock() {
     let fx = fixture(VaultState::Unlocked).await;
