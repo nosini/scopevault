@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.12.7
+
+- The daemon reads its Secret Service connection from the moment it
+  starts serving. Startup could hang at login when many other
+  connections came and went on the bus before it had taken its name.
+- Locking the vault, before the system sleeps or with `scopevault-admin
+  lock`, also closes an unlock dialog that is still open, so answering it
+  afterwards no longer unlocks the vault again.
+- `scopevault-admin lock`, which locks the vault at logout, tries again
+  for up to ten seconds while the daemon's client slots are busy instead
+  of failing at once.
+- INSTALL.md: the portal configuration is a copy of the system's
+  `gnome-portals.conf` with the Secret line changed. xdg-desktop-portal
+  1.20 reads only the first such file, so a file naming only the Secret
+  portal dropped the system's settings for the other portals. The upgrade
+  from before 0.12.0 now reloads systemd before restarting the daemon.
+- DESIGN.md lists one more limit: while the vault is locked, one app can
+  fill the request queue that all apps share.
+
 ## 0.12.6
 
 - The Secret portal backend writes an app's key without tying up a
