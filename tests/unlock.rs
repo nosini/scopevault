@@ -124,10 +124,13 @@ async fn a_lock_during_the_derivation_cancels_the_dialogs_unlock() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     fx.unlocker.lock(&mut fx.unlocker.vault().lock().unwrap());
+    // The lock closes the dialog at once, while the derivation, on a
+    // blocking thread, runs on; it takes about half a second.
     let outcome = unlock.await.unwrap();
-    assert!(started.elapsed() > Duration::from_millis(300), "the derivation was too fast to test this");
-    assert!(matches!(outcome, UnlockOutcome::Failed(_)), "{outcome:?}");
-    assert!(!fx.unlocked());
+    assert!(started.elapsed() < Duration::from_millis(300), "the lock did not close the dialog at once");
+    assert_eq!(outcome, UnlockOutcome::Cancelled);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!fx.unlocked(), "the key derived after the lock was installed");
 }
 
 /// New wraps of the vault key, a new master password or the login slot,
@@ -491,4 +494,36 @@ async fn a_slot_unlock_needs_a_vault_with_that_slot() {
     assert_eq!(fx.unlocker.unlock_with_slot(Slot::Login, pw("master")).await, SlotUnlock::NoSlot);
     assert!(!fx.unlocked());
     assert_eq!(fx.dialogs(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_closes_an_open_dialog() {
+    // A dialog left open across a lock (before the system sleeps) would
+    // unlock the vault again as soon as someone answered it.
+    let _s = SERIAL.lock().await;
+    let fx = Fixture::new(&["HANG", "pw"], Some(b"pw"));
+    let waiter = {
+        let u = fx.unlocker.clone();
+        tokio::spawn(async move { u.ensure_unlocked(&app()).await })
+    };
+    fx.wait_for_getpin().await;
+    let pid = fx.pinentry_pid();
+
+    fx.unlocker.lock(&mut fx.unlocker.vault().lock().unwrap());
+    let outcome = tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("the dialog stayed open").unwrap();
+    assert_eq!(outcome, UnlockOutcome::Cancelled);
+    let mut gone = false;
+    for _ in 0..100 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "pinentry still running after the lock");
+    assert!(!fx.unlocked());
+
+    // Asking again opens a new dialog.
+    assert_eq!(fx.unlocker.ensure_unlocked(&app()).await, UnlockOutcome::Unlocked);
+    assert_eq!(fx.dialogs(), 2);
 }

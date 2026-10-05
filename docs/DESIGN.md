@@ -229,7 +229,8 @@ way to its own connection, so keeping it gives nothing away.
 The vault also locks when the system goes to sleep. The daemon holds a
 logind delay inhibitor, locks the vault when logind announces the suspend,
 and only then lets it go ahead. An unlock that is still deriving its key
-at that moment, from the dialog or the login password, does not complete.
+at that moment, from the dialog or the login password, does not complete,
+and an unlock dialog still open is closed. (Any global lock does both.)
 It does not lock with the screen: many
 apps need their secrets in the background, and they would stall every time
 the screen locks. With login unlocking set up, unlocking the screen after

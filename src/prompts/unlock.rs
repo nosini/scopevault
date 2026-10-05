@@ -231,8 +231,18 @@ impl Unlocker {
     /// Global lock of `slot`, which is this unlocker's vault, locked by the
     /// caller (who may look at it first). See [`VaultSlot::lock`]; returns
     /// whether the vault was unlocked.
+    ///
+    /// An unlock dialog still open is closed too: answered after the lock
+    /// (before the system sleeps, say), it would unlock the vault again.
+    /// Its requests end cancelled, which starts the usual cooldown.
     pub fn lock(&self, slot: &mut VaultSlot) -> bool {
         let was_unlocked = slot.lock();
+        if let Some(f) = self.flight.lock().unwrap().as_ref()
+            && settle_once(&f.settle, UnlockOutcome::Cancelled)
+        {
+            f.abort.abort();
+            tracing::info!("unlock dialog closed: the vault was locked");
+        }
         let _ = self.locked_tx.send(());
         was_unlocked
     }
