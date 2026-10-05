@@ -17,11 +17,14 @@
 //! (`crate::store::portal`, a private module).
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use zbus::message::Header;
 use zbus::names::OwnedUniqueName;
 use zbus::zvariant::{ObjectPath, OwnedFd, OwnedValue};
@@ -70,7 +73,7 @@ pub const FRONTEND_NAME: &str = "org.freedesktop.portal.Desktop";
 pub const REQUEST_PREFIX: &str = "/org/freedesktop/portal/desktop/request/";
 
 /// How long the app gets to read its key from the fd. The fd comes from the
-/// app, so it may be a pipe nobody ever reads: the daemon must not block on
+/// app, so it may be a pipe nobody ever reads: the daemon must not wait on
 /// it indefinitely.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the diagnostics lookup behind a refusal may take.
@@ -287,15 +290,10 @@ impl PortalBackend {
         };
         // The key's bytes go to the app through the fd the frontend passed
         // on; they are never logged.
-        let data = secret.value.clone();
-        match tokio::task::spawn_blocking(move || write_secret(fd, &data, WRITE_TIMEOUT)).await {
-            Ok(Ok(())) => (RESPONSE_SUCCESS, results),
-            Ok(Err(e)) => {
-                tracing::warn!(app_id = %app_id, error = %e, "portal: writing the key to the app's fd failed");
-                (RESPONSE_OTHER, results)
-            }
+        match write_secret(fd, &secret.value, WRITE_TIMEOUT).await {
+            Ok(()) => (RESPONSE_SUCCESS, results),
             Err(e) => {
-                tracing::warn!(app_id = %app_id, error = %e, "portal: the write task failed");
+                tracing::warn!(app_id = %app_id, error = %e, "portal: writing the key to the app's fd failed");
                 (RESPONSE_OTHER, results)
             }
         }
@@ -315,46 +313,94 @@ fn caller_from_handle(handle: &str) -> Option<String> {
     Some(format!(":{first}").replace('_', "."))
 }
 
-/// Writes all of `data` to `fd`, waiting for the pipe to drain, but never
-/// longer than `timeout`. Runs on a blocking thread: the fd belongs to the
-/// app and may be a full pipe that is never read.
-fn write_secret(fd: OwnedFd, data: &[u8], timeout: Duration) -> std::io::Result<()> {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+/// Where the key goes: the app's fd, made safe to wait on.
+enum WriteTarget {
+    /// A pipe or FIFO, reopened as a private, non-blocking open file
+    /// description.
+    Pipe(AsyncFd<std::os::fd::OwnedFd>),
+    /// A socket, written with per-call non-blocking sends.
+    Socket(AsyncFd<std::os::fd::OwnedFd>),
+}
 
-    // Non-blocking, so a full pipe surfaces as EAGAIN instead of a stuck
-    // write the daemon can never time out.
-    let flags = fcntl_getfl(&fd).map_err(std::io::Error::from)?;
-    fcntl_setfl(&fd, flags | OFlags::NONBLOCK).map_err(std::io::Error::from)?;
-    let deadline = Instant::now() + timeout;
-    let mut done = 0;
-    while done < data.len() {
-        match rustix::io::write(&fd, &data[done..]) {
-            Ok(n) => done += n,
-            Err(rustix::io::Errno::INTR) => {}
-            Err(rustix::io::Errno::AGAIN) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "the application did not read its secret",
-                    ));
-                }
-                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
-                let left = deadline - now;
-                let left = Timespec { tv_sec: left.as_secs() as _, tv_nsec: left.subsec_nanos() as _ };
-                let waited = poll(&mut fds, Some(&left)).map_err(std::io::Error::from)?;
-                if waited == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "the application did not read its secret",
-                    ));
-                }
+impl WriteTarget {
+    /// Accepts writable pipes, FIFOs and sockets, the fds libsecret and
+    /// oo7 pass; anything else (a regular file, a device) is refused.
+    ///
+    /// The fd shares its open file description with the app, which can
+    /// change its flags at any time: an O_NONBLOCK set on it could be
+    /// cleared again between the check and the write, which would then
+    /// block. So the description's flags are never relied on, nor changed:
+    /// a pipe is reopened through `/proc/self/fd` (a new description of the
+    /// same pipe), and a socket is written with `MSG_DONTWAIT`.
+    fn new(fd: OwnedFd) -> std::io::Result<Self> {
+        use rustix::fs::{FileType, Mode, OFlags};
+        let fd = std::os::fd::OwnedFd::from(fd);
+        let unsupported = |what: &str| std::io::Error::new(std::io::ErrorKind::Unsupported, what.to_owned());
+        let access = rustix::fs::fcntl_getfl(&fd)? & OFlags::RWMODE;
+        if access != OFlags::WRONLY && access != OFlags::RDWR {
+            return Err(unsupported("the fd is not open for writing"));
+        }
+        match FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) {
+            FileType::Fifo => {
+                let private = rustix::fs::open(
+                    format!("/proc/self/fd/{}", fd.as_raw_fd()),
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                Ok(WriteTarget::Pipe(AsyncFd::with_interest(private, Interest::WRITABLE)?))
             }
-            Err(e) => return Err(std::io::Error::from(e)),
+            FileType::Socket => Ok(WriteTarget::Socket(AsyncFd::with_interest(fd, Interest::WRITABLE)?)),
+            _ => Err(unsupported("the fd is neither a pipe nor a socket")),
         }
     }
-    Ok(())
+
+    fn fd(&self) -> &AsyncFd<std::os::fd::OwnedFd> {
+        match self {
+            WriteTarget::Pipe(fd) | WriteTarget::Socket(fd) => fd,
+        }
+    }
+
+    /// One write that never blocks.
+    fn write_once(&self, data: &[u8]) -> std::io::Result<usize> {
+        let n = match self {
+            WriteTarget::Pipe(fd) => rustix::io::write(fd.get_ref(), data)?,
+            WriteTarget::Socket(fd) => {
+                use rustix::net::{SendFlags, send};
+                send(fd.get_ref(), data, SendFlags::DONTWAIT | SendFlags::NOSIGNAL)?
+            }
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        Ok(n)
+    }
+}
+
+/// Writes all of `data` to the app's `fd`, waiting for it to drain, but
+/// never longer than `timeout`. Nothing blocks a thread: the fd belongs to
+/// the app and may be a full pipe that is never read. Dropping the future
+/// (the request was closed) stops the write and closes the daemon's copy
+/// of the fd.
+async fn write_secret(fd: OwnedFd, data: &[u8], timeout: Duration) -> std::io::Result<()> {
+    let target = WriteTarget::new(fd)?;
+    let write_all = async {
+        let mut done = 0;
+        while done < data.len() {
+            let mut ready = target.fd().writable().await?;
+            match ready.try_io(|_| target.write_once(&data[done..])) {
+                Ok(Ok(n)) => done += n,
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Ok(Err(e)) => return Err(e),
+                // Not writable after all; readiness was cleared, wait again.
+                Err(_would_block) => {}
+            }
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(timeout, write_all).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the application did not read its secret")),
+    }
 }
 
 /// Resolves once the frontend closed the request, or its sender went away.

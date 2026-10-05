@@ -9,7 +9,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::io::Read as _;
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::sync::MutexGuard;
 use std::time::Duration;
 
@@ -107,8 +107,21 @@ type CallError = (String, String);
 /// as soon as the backend has written (or never touched) its copy.
 async fn retrieve_at(c: &Connection, handle: &str, app_id: &str) -> (Result<u32, CallError>, Vec<u8>) {
     let (mut rd, wr) = std::io::pipe().unwrap();
-    let fd = OwnedFd::from(wr.as_fd().try_clone_to_owned().unwrap());
+    let response = retrieve_with_fd(c, handle, app_id, wr.as_fd()).await;
     drop(wr);
+    let mut buf = Vec::new();
+    let bytes = tokio::task::spawn_blocking(move || {
+        rd.read_to_end(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    (response, bytes)
+}
+
+/// Calls RetrieveSecret with a copy of `fd`.
+async fn retrieve_with_fd(c: &Connection, handle: &str, app_id: &str, fd: BorrowedFd<'_>) -> Result<u32, CallError> {
+    let fd = OwnedFd::from(fd.try_clone_to_owned().unwrap());
     let options: HashMap<String, OwnedValue> = HashMap::new();
     let path = OwnedObjectPath::try_from(handle.to_owned()).unwrap();
     let reply = c
@@ -120,22 +133,14 @@ async fn retrieve_at(c: &Connection, handle: &str, app_id: &str) -> (Result<u32,
             &(path, app_id, fd, options),
         )
         .await;
-    let response = match reply {
+    match reply {
         Ok(m) => {
             let (response, _): (u32, HashMap<String, OwnedValue>) = m.body().deserialize().unwrap();
             Ok(response)
         }
         Err(zbus::Error::MethodError(name, msg, _)) => Err((name.to_string(), msg.unwrap_or_default())),
         Err(e) => panic!("transport error: {e}"),
-    };
-    let mut buf = Vec::new();
-    let bytes = tokio::task::spawn_blocking(move || {
-        rd.read_to_end(&mut buf).unwrap();
-        buf
-    })
-    .await
-    .unwrap();
-    (response, bytes)
+    }
 }
 
 async fn retrieve(c: &Connection, app_id: &str) -> (Result<u32, CallError>, Vec<u8>) {
@@ -395,4 +400,140 @@ async fn concurrent_calls_for_a_new_app_create_one_key() {
     assert_eq!(a.1.len(), 64);
     assert_eq!(a.1, b.1, "both calls got the same key");
     assert_eq!(stored_keys(&fx).len(), 1, "exactly one key was created");
+}
+
+/// An unlocked fixture whose vault holds a key for [`APP`], and its
+/// frontend.
+async fn serving_fixture() -> (PortalFixture, Connection) {
+    let fx = fixture(VaultState::Unlocked).await;
+    {
+        let mut slot = fx.store();
+        let v = slot.vault.as_mut().unwrap();
+        v.init_portal(&AdminAuthority::offline()).unwrap();
+        v.admin_create_portal_key(&AdminAuthority::offline(), APP).unwrap();
+    }
+    let fe = fx.frontend(Some(Principal::Host), true).await;
+    (fx, fe)
+}
+
+/// Fills a pipe through `wr` until a write would block; returns how many
+/// bytes it holds. `wr` is left blocking.
+fn fill_pipe(wr: &std::io::PipeWriter) -> usize {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let flags = fcntl_getfl(wr).unwrap();
+    fcntl_setfl(wr, flags | OFlags::NONBLOCK).unwrap();
+    let mut filled = 0;
+    loop {
+        match rustix::io::write(wr, &[0u8; 4096]) {
+            Ok(n) => filled += n,
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    fcntl_setfl(wr, flags).unwrap();
+    filled
+}
+
+/// Reads `rd` until every write end is closed, within ten seconds.
+async fn read_all(mut rd: std::io::PipeReader) -> Vec<u8> {
+    let read = tokio::task::spawn_blocking(move || {
+        let mut buf = Vec::new();
+        rd.read_to_end(&mut buf).unwrap();
+        buf
+    });
+    tokio::time::timeout(Duration::from_secs(10), read).await.expect("a write end stayed open").unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_apps_file_description_keeps_its_flags() {
+    // The fd shares its open file description with the app. Flags set on
+    // it are the app's to change back, so the backend must not rely on
+    // them, nor change them.
+    let (fx, fe) = serving_fixture().await;
+    let (rd, wr) = std::io::pipe().unwrap();
+    assert_eq!(retrieve_with_fd(&fe, HANDLE, APP, wr.as_fd()).await.unwrap(), 0);
+    let flags = rustix::fs::fcntl_getfl(&wr).unwrap();
+    assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK), "the backend made the app's pipe non-blocking");
+    drop(wr);
+    assert_eq!(read_all(rd).await.len(), 64);
+    drop(fx);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_request_stops_a_pending_write() {
+    let (_fx, fe) = serving_fixture().await;
+    let (rd, wr) = std::io::pipe().unwrap();
+    let filled = fill_pipe(&wr);
+    let handle = "/org/freedesktop/portal/desktop/request/test/full";
+    let task = {
+        let fe = fe.clone();
+        let fd = wr.as_fd().try_clone_to_owned().unwrap();
+        tokio::spawn(async move { retrieve_with_fd(&fe, handle, APP, fd.as_fd()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!task.is_finished(), "the write waits for the full pipe");
+
+    close(&fe, handle).await.unwrap();
+    assert_eq!(task.await.unwrap().unwrap(), 1, "cancelled");
+    // The app drains its pipe after the Close: the key must not follow.
+    drop(wr);
+    let bytes = read_all(rd).await;
+    assert_eq!(bytes.len(), filled, "{} key bytes were written after the Close", bytes.len() - filled);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_pipes_and_sockets_get_the_key() {
+    let (fx, fe) = serving_fixture().await;
+
+    let path = fx.app_data.path().join("plain-file");
+    let file = std::fs::File::create(&path).unwrap();
+    assert_eq!(retrieve_with_fd(&fe, HANDLE, APP, file.as_fd()).await.unwrap(), 2);
+    drop(file);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "nothing was written to the regular file");
+
+    // oo7 passes one end of a socket pair.
+    let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert_eq!(retrieve_with_fd(&fe, HANDLE, APP, a.as_fd()).await.unwrap(), 0);
+    drop(a);
+    let mut bytes = Vec::new();
+    b.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes.len(), 64);
+}
+
+#[test]
+fn full_pipes_hold_no_threads() {
+    // Requests waiting for an app to read its pipe must not hold any of the
+    // runtime's blocking threads: classification, the login socket and key
+    // derivation need them.
+    let rt = tokio::runtime::Builder::new_multi_thread().max_blocking_threads(4).enable_all().build().unwrap();
+    rt.block_on(async {
+        let (_fx, fe) = serving_fixture().await;
+        let mut pipes = Vec::new();
+        let mut pending = Vec::new();
+        for i in 0..4 {
+            let (rd, wr) = std::io::pipe().unwrap();
+            fill_pipe(&wr);
+            let fe = fe.clone();
+            let fd = wr.as_fd().try_clone_to_owned().unwrap();
+            let handle = format!("/org/freedesktop/portal/desktop/request/test/full{i}");
+            pending.push(tokio::spawn(async move { retrieve_with_fd(&fe, &handle, APP, fd.as_fd()).await }));
+            pipes.push((rd, wr));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        let blocking = tokio::task::spawn_blocking(|| ());
+        tokio::time::timeout(Duration::from_secs(2), blocking)
+            .await
+            .expect("no blocking thread was free while the writes waited")
+            .unwrap();
+        let (r, bytes) = retrieve(&fe, APP).await;
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bytes.len(), 64);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(pipes);
+        for p in pending {
+            p.await.unwrap().unwrap();
+        }
+    });
 }

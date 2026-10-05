@@ -308,6 +308,12 @@ them.
   separate connection. A Flatpak app allowed to talk to
   `org.freedesktop.secrets` can therefore not reach it through the same
   connection.
+- The key goes to the fd the app passed, which must be a pipe or a
+  socket open for writing. The app shares that fd's open file description
+  and can change its flags, so the backend never relies on them: a pipe is
+  reopened as a private non-blocking description, a socket is written with
+  non-blocking sends. The app gets five seconds to read; no thread waits
+  meanwhile, and closing the request stops the write.
 - Keys are moved from gnome-keyring byte for byte. A new key for an app
   that already has encrypted data would make that data unreadable, so no
   key is created until the keys were imported or `scopevault-admin portal
