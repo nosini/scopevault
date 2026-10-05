@@ -29,7 +29,7 @@ use zbus::message::Header;
 use zbus::names::OwnedUniqueName;
 use zbus::zvariant::{ObjectPath, OwnedFd, OwnedValue};
 
-use crate::identity::{Principal, Resolved};
+use crate::identity::{AppId, Principal, Resolved};
 use crate::prompts::unlock::{UnlockOutcome, Unlocker};
 use crate::store::{Secret, is_valid_portal_app_id};
 
@@ -296,6 +296,17 @@ impl PortalBackend {
         let secret = match self.stored_key(app_id, false) {
             Ok(Some(key)) => key,
             Ok(None) => {
+                // Only a Flatpak app's own keyring file can be checked for,
+                // in its directory under `~/.var/app`. Snaps and host apps
+                // keep theirs elsewhere, so they get a key only explicitly.
+                if AppId::parse(app_id).is_err() {
+                    tracing::warn!(
+                        app_id = %app_id,
+                        "no key is created automatically for an app that is not a Flatpak; import its \
+                         key or run `scopevault-admin portal new-key {app_id}`"
+                    );
+                    return (RESPONSE_OTHER, results);
+                }
                 // The app's directory is looked at without holding the vault
                 // mutex: it is the app's to arrange.
                 match self.app_keyring_exists(app_id) {

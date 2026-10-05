@@ -573,3 +573,25 @@ async fn symlinks_in_the_apps_data_count_as_a_keyring_file() {
     assert_eq!(r.unwrap(), 0);
     assert_eq!(bytes.len(), 64);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_flatpak_apps_get_a_key_automatically() {
+    // A snap keeps its keyring file under ~/snap, where the backend does
+    // not look, so a fresh key could make its data unreadable.
+    let fx = fixture(VaultState::Unlocked).await;
+    fx.store().vault.as_mut().unwrap().init_portal(&AdminAuthority::offline()).unwrap();
+    let fe = fx.frontend(Some(Principal::Host), true).await;
+
+    for app_id in ["snap.firefox", "firefox"] {
+        let (r, bytes) = retrieve(&fe, app_id).await;
+        assert_eq!(r.unwrap(), 2, "{app_id}");
+        assert!(bytes.is_empty(), "{app_id}");
+    }
+    assert!(stored_keys(&fx).is_empty(), "no key was created: {:?}", stored_keys(&fx));
+
+    // Created explicitly, the key is served.
+    fx.store().vault.as_mut().unwrap().admin_create_portal_key(&AdminAuthority::offline(), "snap.firefox").unwrap();
+    let (r, bytes) = retrieve(&fe, "snap.firefox").await;
+    assert_eq!(r.unwrap(), 0);
+    assert_eq!(bytes.len(), 64);
+}
