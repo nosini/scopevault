@@ -19,11 +19,17 @@
 # org.freedesktop.secrets (or the probe), and read-only access to the
 # directory holding the client binary. Nothing is installed or changed.
 #
-# --app APP_ID starts the real app on the private bus (close it first if it
-# is running: many apps hand over to a running instance). Use it, then quit
-# the app; the script summarises what the app asked the daemon. It then
-# offers to restart the daemon and the app on the same vault, to check that
-# the app finds what it stored.
+# --app APP_ID starts the real app on the private bus. It must not be
+# running (many apps hand over to a running instance, which uses the real
+# bus). The app gets a fresh profile: its ~/.var/app/APP_ID directory is
+# moved aside for the run and put back afterwards, so nothing the app does
+# against the temporary vault (a new encryption key, data encrypted with
+# it) outlives that vault. An app that can write outside that directory
+# (filesystem access to home, host, xdg-config or xdg-data) is only
+# started after you confirm. Use it, then quit the app; the script
+# summarises what the app asked the daemon. It then offers to restart the
+# daemon and the app on the same vault, to check that the app finds what
+# it stored.
 #
 # Needs: flatpak, dbus-broker, systemd-socket-activate, gdbus, and built
 # binaries (cargo build --bins). The client must run inside Flatpak runtimes,
@@ -75,12 +81,42 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/scopevault-flatpak.XXXXXX")
 bus_pid=
 daemon_pid=
 probe_pid=
+# --app: the app's real profile, and where it waits during the run.
+profile=
+aside=
+profile_moved=
+profile_in_use=
+# Puts the app's real profile back; the run's own profile is deleted.
+restore_profile() {
+    [ -n "$profile_in_use" ] || return 0
+    if flatpak ps --columns=application 2>/dev/null | grep -qx "$app"; then
+        echo "$app is still running, so its profile was not restored. Quit it, then run:" >&2
+        if [ -n "$profile_moved" ]; then
+            echo "    rm -rf '$profile' && mv '$aside' '$profile'" >&2
+        else
+            echo "    rm -rf '$profile'" >&2
+        fi
+        profile_in_use=
+        return 0
+    fi
+    profile_in_use=
+    if [ -z "$profile_moved" ]; then
+        rm -rf "$profile"
+    elif [ -d "$aside" ]; then
+        rm -rf "$profile"
+        mv "$aside" "$profile" && echo "$app's own data is back in $profile"
+    else
+        echo "warning: $aside is missing; $profile was left as it is" >&2
+    fi
+}
 cleanup() {
     for p in $probe_pid $daemon_pid $bus_pid; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
+    restore_profile
     rm -rf "$work"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 real_bus=${DBUS_SESSION_BUS_ADDRESS-}
 
 # ---- pinentry (as in host-libsecret-check.sh) ----
@@ -210,12 +246,38 @@ if [ -n "$app" ]; then
     flatpak info --show-permissions "$app" | sed 's/^/    /'
     flatpak info --show-permissions "$app" | grep -q 'org.freedesktop.secrets=talk' ||
         echo "note: $app has no talk access to org.freedesktop.secrets, so it cannot use the Secret Service directly"
+    if flatpak ps --columns=application 2>/dev/null | grep -qx "$app"; then
+        echo "$app is running. Quit it first: a new start may just hand over to that" >&2
+        echo "instance, which uses the real session bus and its real profile." >&2
+        exit 1
+    fi
+    # The app's real data must not meet the temporary vault: what it creates
+    # there (an encryption key, say) is gone with the vault.
+    profile=$HOME/.var/app/$app
+    aside=$profile.scopevault-check
+    if [ -e "$aside" ]; then
+        echo "$aside is left over from an interrupted run: it is $app's real profile." >&2
+        echo "Check it, then put it back: rm -rf '$profile' && mv '$aside' '$profile'" >&2
+        exit 1
+    fi
+    case $(flatpak info --show-permissions "$app" | sed -n 's/^filesystems=//p') in
+        *host* | *home* | *xdg-config* | *xdg-data* | *'~/'*)
+            echo "$app can also keep data outside $profile (see filesystems= above)."
+            echo "That data is used as it is, against the temporary vault, and may not"
+            echo "work with your real keyring afterwards."
+            printf 'Start it anyway? [y/N] '
+            read -r go </dev/tty || go=
+            case $go in [yY]*) ;; *) exit 1 ;; esac
+            ;;
+    esac
+    if [ -e "$profile" ]; then
+        mv "$profile" "$aside"
+        profile_moved=yes
+        echo "$app's own data waits in $aside during the run; it is put back at the end."
+    fi
+    profile_in_use=yes
     pins "$pw" "$pw" "$pw" "$pw" "$pw" "$pw"
     say "a new vault: choose \"$pw\" when asked (twice)"
-    if flatpak ps --columns=application 2>/dev/null | grep -qx "$app"; then
-        echo "note: $app is already running; a new start may just hand over to that instance,"
-        echo "      which uses the real session bus. Quit it first for a meaningful run."
-    fi
     run=1
     while :; do
         echo "Starting $app on the private bus (run $run). Use it (log in, save a password...), then quit it."
