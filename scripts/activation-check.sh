@@ -138,7 +138,16 @@ echo
 echo "-- the files that decide activation"
 config=${XDG_CONFIG_HOME:-$HOME/.config}
 data=${XDG_DATA_HOME:-$HOME/.local/share}
-show "$config/systemd/user/scopevault.service" 'ExecStart='
+# The unit file systemd uses: the package's in /usr/lib/systemd/user, or a
+# copy in the user's own directory, which takes precedence.
+unit=$(systemctl --user show -p FragmentPath --value scopevault.service 2>/dev/null || true)
+if [ -n "$unit" ]; then
+    echo "systemd uses $unit for scopevault.service"
+    show "$unit" 'ExecStart='
+else
+    show "$config/systemd/user/scopevault.service" 'ExecStart='
+    show /usr/lib/systemd/user/scopevault.service 'ExecStart='
+fi
 show "$data/dbus-1/services/org.freedesktop.secrets.service" 'SystemdService=' 'Exec='
 show /usr/share/dbus-1/services/org.freedesktop.secrets.service 'Exec='
 show "$config/autostart/gnome-keyring-secrets.desktop" 'Hidden='
