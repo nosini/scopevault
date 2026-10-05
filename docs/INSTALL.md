@@ -26,12 +26,24 @@ install -D -m 644 packaging/org.freedesktop.secrets.service ~/.local/share/dbus-
 install -D -m 644 packaging/eu.nosini.ScopeVault.Portal.service ~/.local/share/dbus-1/services/eu.nosini.ScopeVault.Portal.service
 install -D -m 644 packaging/gnome-keyring-secrets.desktop ~/.config/autostart/gnome-keyring-secrets.desktop
 install -D -m 644 packaging/scopevault.portal ~/.local/share/xdg-desktop-portal/portals/scopevault.portal
-install -D -m 644 packaging/gnome-portals.conf ~/.config/xdg-desktop-portal/gnome-portals.conf
 ```
 
-If you already have a `~/.config/xdg-desktop-portal/gnome-portals.conf`,
-add the `org.freedesktop.impl.portal.Secret=scopevault` line to its
-`[preferred]` group instead of replacing the file.
+Your own `gnome-portals.conf` selects scopevault for the Secret portal.
+xdg-desktop-portal reads it instead of the system's (version 1.20 reads
+only the first one it finds), so it has to keep the system's settings
+too. Start from a copy of the system file:
+
+```sh
+mkdir -p ~/.config/xdg-desktop-portal
+cp /usr/share/xdg-desktop-portal/gnome-portals.conf ~/.config/xdg-desktop-portal/
+```
+
+Then, in its `[preferred]` group, change the
+`org.freedesktop.impl.portal.Secret=` line to
+`org.freedesktop.impl.portal.Secret=scopevault`, or add that line. If you
+already have a `~/.config/xdg-desktop-portal/gnome-portals.conf`, only
+make that change in it. If the system has no `gnome-portals.conf`, install
+`packaging/gnome-portals.conf` instead.
 
 What they do:
 
@@ -45,8 +57,8 @@ What they do:
   start gnome-keyring's Secret Service.
 - `scopevault.portal` and `gnome-portals.conf` make scopevault the Secret
   portal backend, which hands Flatpak apps the keys they encrypt their own
-  files with. Your `gnome-portals.conf` only names the Secret portal;
-  everything else still comes from the system's configuration. The
+  files with. Your `gnome-portals.conf` is the system's with the Secret
+  portal changed, so the other portals stay as they were. The
   backend has its own bus name, `eu.nosini.ScopeVault.Portal`, and
   its activation file starts the same unit.
 - `scopevault-unlock.service` opens the unlock dialog as soon as you are
@@ -230,9 +242,9 @@ creating new keys that would clash with the ones you export.
    backend looks for them. If gnome-keyring already has a different key
    for one of the apps, nothing is written.
 
-4. Remove `~/.local/share/xdg-desktop-portal/portals/scopevault.portal`
-   and the Secret line in `~/.config/xdg-desktop-portal/gnome-portals.conf`,
-   or the whole file if nothing else is in it.
+4. Remove `~/.local/share/xdg-desktop-portal/portals/scopevault.portal`,
+   and `~/.config/xdg-desktop-portal/gnome-portals.conf` if you made it
+   for scopevault (otherwise set its Secret line back).
 
 5. Log out and back in. The vault stays in `~/.local/share/scopevault`
    until you delete it.

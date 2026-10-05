@@ -154,8 +154,9 @@ for f in "$data"/dbus-1/services/*.service; do
 done
 show "$config/xdg-desktop-portal/gnome-portals.conf" 'default=' 'org.freedesktop.impl.portal.Secret='
 show /usr/share/xdg-desktop-portal/gnome-portals.conf 'default=' 'org.freedesktop.impl.portal.Secret='
-# xdg-desktop-portal reads the user file first; without a default= line,
-# interfaces it does not name fall through to the system files.
+# xdg-desktop-portal reads the user file instead of the system's (1.20
+# reads only the first one it finds), so the user file should be a copy of
+# the system file with the Secret line changed.
 portal_selected=
 grep -qs '^org.freedesktop.impl.portal.Secret=scopevault' "$config/xdg-desktop-portal/gnome-portals.conf" \
     && portal_selected=yes
