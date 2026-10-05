@@ -40,11 +40,20 @@ def by_kind(items):
     return {i.get_attributes()["kind"]: i for i in items}
 
 
+def read_alias(conn, alias):
+    service = DBusAddress("/org/freedesktop/secrets", bus_name="org.freedesktop.secrets",
+                          interface="org.freedesktop.Secret.Service")
+    return conn.send_and_get_reply(new_method_call(service, "ReadAlias", "s", (alias,))).body[0]
+
+
 def store(conn):
-    # No vault yet: reading the default alias opens the creation dialog;
-    # the alias is then missing, so secretstorage creates the collection.
+    # No vault yet: reading the default alias opens the creation dialog. The
+    # new vault has a collection behind the alias, which secretstorage then
+    # uses through the alias path.
     col = secretstorage.get_default_collection(conn)
-    assert col.collection_path == "/org/freedesktop/secrets/collection/default", col.collection_path
+    target = read_alias(conn, "default")
+    assert target.startswith("/org/freedesktop/secrets/collection/"), target
+    assert col.collection_path in (target, "/org/freedesktop/secrets/aliases/default"), col.collection_path
     assert not col.is_locked()
 
     col.create_item("binary", {**ATTRS, "kind": "binary"}, BINARY, content_type="application/octet-stream")
