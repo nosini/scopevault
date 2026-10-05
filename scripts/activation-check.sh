@@ -154,12 +154,38 @@ for f in "$data"/dbus-1/services/*.service; do
 done
 show "$config/xdg-desktop-portal/gnome-portals.conf" 'default=' 'org.freedesktop.impl.portal.Secret='
 show /usr/share/xdg-desktop-portal/gnome-portals.conf 'default=' 'org.freedesktop.impl.portal.Secret='
-# xdg-desktop-portal reads the user file instead of the system's (1.20
-# reads only the first one it finds), so the user file should be a copy of
-# the system file with the Secret line changed.
+# The configuration xdg-desktop-portal uses: the first file found in its
+# search order (portals.conf(5)); 1.20 reads only that one, so the user
+# file should be a copy of the system file with the Secret line changed.
+# The portal is a user service, so its desktop names come from the user
+# manager's environment.
+portal_config() {
+    desktops=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^XDG_CURRENT_DESKTOP=//p')
+    desktops=$(printf '%s' "${desktops:-${XDG_CURRENT_DESKTOP-}}" | tr ':' ' ' | tr '[:upper:]' '[:lower:]')
+    for d in "$config" $(printf '%s' "${XDG_CONFIG_DIRS:-/etc/xdg}" | tr ':' ' ') /etc \
+        "$data" $(printf '%s' "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" | tr ':' ' ') /usr/share; do
+        for f in $(for x in $desktops; do echo "$x-portals.conf"; done) portals.conf; do
+            if [ -f "$d/xdg-desktop-portal/$f" ]; then
+                echo "$d/xdg-desktop-portal/$f"
+                return 0
+            fi
+        done
+    done
+}
+# The first backend a configuration lists for a key.
+portal_key() {
+    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | sed -n '1{s/;.*//;s/[[:space:]]*$//;p;}'
+}
+portal_conf=$(portal_config)
 portal_selected=
-grep -qs '^org.freedesktop.impl.portal.Secret=scopevault' "$config/xdg-desktop-portal/gnome-portals.conf" \
-    && portal_selected=yes
+if [ -n "$portal_conf" ]; then
+    secret_backend=$(portal_key "$portal_conf" 'org\.freedesktop\.impl\.portal\.Secret')
+    [ -n "$secret_backend" ] || secret_backend=$(portal_key "$portal_conf" default)
+    echo "xdg-desktop-portal's configuration: $portal_conf (Secret portal: ${secret_backend:-not named})"
+    if [ "$secret_backend" = scopevault ]; then portal_selected=yes; fi
+else
+    echo "xdg-desktop-portal's configuration: none found"
+fi
 
 echo
 echo "-- the systemd units"
