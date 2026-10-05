@@ -16,12 +16,19 @@ cargo build --release
 install -m 755 target/release/scopevault-daemon target/release/scopevault-admin ~/.local/bin/
 ```
 
-The configuration files are in `packaging/`. Each one says in its first
-lines where it belongs:
+The configuration files are in `packaging/`. The two systemd units go
+into `~/.config/systemd/user/`:
 
 ```sh
 install -D -m 644 packaging/scopevault.service ~/.config/systemd/user/scopevault.service
 install -D -m 644 packaging/scopevault-unlock.service ~/.config/systemd/user/scopevault-unlock.service
+```
+
+`scopevault-admin setup` installs the rest when you switch over (see
+"Switching over"). To do it by hand instead, each file says in its first
+lines where it belongs:
+
+```sh
 install -D -m 644 packaging/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
 install -D -m 644 packaging/eu.nosini.ScopeVault.Portal.service ~/.local/share/dbus-1/services/eu.nosini.ScopeVault.Portal.service
 install -D -m 644 packaging/gnome-keyring-secrets.desktop ~/.config/autostart/gnome-keyring-secrets.desktop
@@ -88,8 +95,11 @@ name, and it exits after two minutes.
    cp -a ~/.local/share/keyrings ~/keyrings-backup
    ```
 
-3. Install the files as above, but don't log out yet. While gnome-keyring
-   still runs the session and scopevault doesn't run, import everything:
+3. Install the files, but don't log out yet: run `scopevault-admin
+   setup`, which also does step 4 (or install them by hand as above). It
+   keeps a `gnome-portals.conf` of your own aside as
+   `gnome-portals.conf.before-scopevault`. While gnome-keyring still runs
+   the session and scopevault doesn't run, import everything:
 
    ```sh
    scopevault-admin import --pinentry /usr/bin/pinentry-gnome3
@@ -109,7 +119,7 @@ name, and it exits after two minutes.
    it stops because gnome-keyring has several items for one app, delete
    the wrong one in Seahorse and import again.
 
-4. Enable scopevault and mask gnome-keyring's units:
+4. Enable scopevault and mask gnome-keyring's units (`setup` did this):
 
    ```sh
    systemctl --user daemon-reload
@@ -195,6 +205,11 @@ org.freedesktop.secrets" when that happens, and
 and back in. Don't restart scopevault while something is queued.
 
 ## Switching back
+
+`scopevault-admin setup --revert` does steps 1, 2 and 4 in the right
+order, puts your own `gnome-portals.conf` back, and prints the commands
+for step 3. xdg-desktop-portal reads its configuration only at login, so
+the export still works afterwards. Otherwise, by hand:
 
 The order matters. As long as the D-Bus activation file is installed, any
 request for the name starts scopevault again, and the export would end up

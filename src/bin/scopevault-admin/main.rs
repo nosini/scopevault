@@ -7,6 +7,7 @@
 //! `offline.rs`).
 
 mod offline;
+mod setup;
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -81,6 +82,15 @@ ask for its password with pinentry):
                               secret or label) is replaced, and if several
                               items there could be that older version,
                               nothing is written
+
+Setting up this account (no daemon needed):
+  setup                       make scopevault this account's Secret Service
+                              and Secret portal backend from the next login
+                              on, instead of gnome-keyring: installs the
+                              activation and portal files in your home,
+                              enables the units, masks gnome-keyring's.
+                              Your own gnome-portals.conf is kept aside
+  setup --revert              undo that, and stop the daemon; the vault stays
 
 A SCOPE is `host`, `flatpak/APP-ID` or `portal`. With `export --scope
 portal`, the portal keys are written back into the provider's default
@@ -361,6 +371,12 @@ async fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    match (cmd.as_str(), rest.as_slice()) {
+        ("setup", []) => return setup::setup().await,
+        ("setup", ["--revert"]) => return setup::revert().await,
+        ("setup", _) => return usage(),
+        _ => {}
+    }
     if matches!(cmd.as_str(), "restore" | "import" | "export") {
         let (opts, positional) = match offline::parse(&rest) {
             Ok(p) => p,
