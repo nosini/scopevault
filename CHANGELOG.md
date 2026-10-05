@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.12.8
+
+- The GUI stops a refresh that an operation overtook. Locking the vault
+  while the window was still reading it could ask for the grants or a
+  listing afterwards, which opened the unlock dialog again.
+- `scripts/host-flatpak-check.sh --app` gives the app a fresh profile:
+  its `~/.var/app` directory is moved aside for the run and put back
+  afterwards. The app used to keep its real data while talking to a
+  temporary vault, so a key it created there was lost with that vault.
+  A running app now stops the script.
+- `scripts/activation-check.sh` finds the portal configuration in
+  xdg-desktop-portal's search order instead of looking only at the
+  user's `gnome-portals.conf`.
+- The SecretStorage interoperability check runs again against a new
+  vault (it expected an old collection path), and the isolated bus it
+  runs on is torn down when its helper is interrupted.
+
 ## 0.12.7
 
 - The daemon reads its Secret Service connection from the moment it
