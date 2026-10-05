@@ -302,11 +302,13 @@ name, but the installed files do:
    `scopevault.portal` included, and the GUI's desktop entry as in "The
    graphical front end".
 
-3. dbus-broker only reads activation files when asked to, so reload it,
+3. dbus-broker only reads activation files when asked to, and systemd
+   keeps using the old unit files until it reloads them, so reload both,
    then restart the daemon and GNOME Online Accounts:
 
    ```sh
    gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.ReloadConfig
+   systemctl --user daemon-reload
    systemctl --user restart scopevault.service
    pkill -x goa-daemon
    ```
