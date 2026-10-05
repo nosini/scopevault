@@ -38,6 +38,8 @@ class Namespace(types.ModuleType):
 
 
 def load_gui() -> Any:
+    # No __pycache__ next to the GUI.
+    sys.dont_write_bytecode = True
     gi = types.ModuleType("gi")
     gi.require_version = lambda *_: None  # type: ignore[attr-defined]
     repository = types.ModuleType("gi.repository")
