@@ -17,7 +17,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
@@ -169,17 +169,28 @@ fn is_valid_instance_id(s: &str) -> bool {
 /// Reads `/.flatpak-info` from a caller's root. `Ok(None)` means the file
 /// does not exist; any other failure is an error.
 pub fn read_flatpak_info(root: &OwnedFd) -> Result<Option<Vec<u8>>, IdentityError> {
-    let fd = match rustix::fs::openat(
-        root,
-        ".flatpak-info",
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    let fd = match open_no_follow(root, ".flatpak-info") {
         Ok(fd) => fd,
         Err(rustix::io::Errno::NOENT) => return Ok(None),
         Err(e) => return Err(IdentityError::Inspect("open .flatpak-info", e.into())),
     };
     read_regular_file(fd, None).map(Some)
+}
+
+/// Opens `name` in `dir` without following a symlink. Only a regular file
+/// is opened for reading; anything else stays an `O_PATH` fd, which
+/// [`read_regular_file`] refuses: opening a device node or a FIFO can have
+/// effects of its own.
+fn open_no_follow(dir: &OwnedFd, name: &str) -> rustix::io::Result<OwnedFd> {
+    let fd = rustix::fs::openat(dir, name, OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
+    if rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != rustix::fs::FileType::RegularFile {
+        return Ok(fd);
+    }
+    rustix::fs::open(
+        format!("/proc/self/fd/{}", fd.as_raw_fd()),
+        OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
 }
 
 fn read_regular_file(fd: OwnedFd, owner: Option<u32>) -> Result<Vec<u8>, IdentityError> {
@@ -259,13 +270,8 @@ impl InstanceRecords {
     }
 
     fn read_file(&self, dir: &OwnedFd, name: &str) -> Result<Vec<u8>, IdentityError> {
-        let fd = rustix::fs::openat(
-            dir,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| IdentityError::Instance("cannot open instance record", e.into()))?;
+        let fd =
+            open_no_follow(dir, name).map_err(|e| IdentityError::Instance("cannot open instance record", e.into()))?;
         read_regular_file(fd, Some(self.uid))
     }
 
@@ -387,5 +393,37 @@ mod tests {
         for c in cases {
             assert!(info(c).is_err(), "{c}");
         }
+    }
+
+    #[test]
+    fn a_metadata_file_that_is_not_regular_is_not_opened() {
+        // A writer blocked opening a FIFO wakes up when a reader opens it,
+        // which shows whether the FIFO was opened.
+        let dir = std::env::temp_dir().join(format!("scopevault-fifo-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = dir.join(".flatpak-info");
+        rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+        let (opened_tx, opened) = std::sync::mpsc::channel();
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                opened_tx.send(()).unwrap();
+                drop(w);
+            })
+        };
+
+        // Give the writer time to block in its open.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let root = rustix::fs::open(&dir, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        let read = read_flatpak_info(&root);
+        let woken = opened.recv_timeout(std::time::Duration::from_millis(200)).is_ok();
+        // Release the writer either way.
+        let _reader = rustix::fs::open(&fifo, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).unwrap();
+        writer.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(matches!(read, Err(IdentityError::Malformed(_))), "{read:?}");
+        assert!(!woken, "the FIFO was opened");
     }
 }
