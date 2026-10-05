@@ -139,6 +139,57 @@ fn usage() -> ExitCode {
 const QUICK_CANCEL: Duration = Duration::from_secs(5);
 const UNLOCK_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// How long `lock` keeps trying while the daemon closes connections
+/// without a reply, as it does while all its client slots are busy. Logout
+/// relies on this lock.
+const LOCK_RETRY: Duration = Duration::from_secs(10);
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// `lock`, retried for [`LOCK_RETRY`] when the daemon took the connection
+/// but did not answer. Locking twice does no harm. A daemon that is not
+/// running is not waited for.
+async fn lock(socket: &PathBuf, json: bool) -> ExitCode {
+    let deadline = Instant::now() + LOCK_RETRY;
+    loop {
+        match request(socket, &Request::Lock, None).await {
+            Ok((reply, _)) => return print_reply(&reply, json),
+            Err(RequestError::NoReply(e)) if Instant::now() + LOCK_RETRY_DELAY < deadline => {
+                eprintln!("scopevault-admin: {e}; trying again");
+                tokio::time::sleep(LOCK_RETRY_DELAY).await;
+            }
+            Err(e) => return fail_as(json, e),
+        }
+    }
+}
+
+/// Why a request got no reply.
+enum RequestError {
+    /// The daemon accepted the connection but closed it without replying
+    /// (or before the request was sent).
+    NoReply(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestError::NoReply(e) | RequestError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for RequestError {
+    fn from(e: String) -> Self {
+        RequestError::Failed(e)
+    }
+}
+
+impl From<&str> for RequestError {
+    fn from(e: &str) -> Self {
+        RequestError::Failed(e.into())
+    }
+}
+
 /// `unlock`. With `wait` (the login unit), a dialog cancelled within
 /// [`QUICK_CANCEL`] is opened again until the wait has passed; without it,
 /// a cancel is final.
@@ -170,7 +221,7 @@ async fn unlock(socket: &PathBuf, wait: Option<Duration>, json: bool) -> ExitCod
 /// `wait`, a connection that fails because the socket does not exist yet or
 /// refuses is retried every 500 ms until the wait has passed: only the
 /// connection is retried, never the request.
-async fn request(socket: &PathBuf, req: &Request, wait: Option<Duration>) -> Result<(Reply, Vec<u8>), String> {
+async fn request(socket: &PathBuf, req: &Request, wait: Option<Duration>) -> Result<(Reply, Vec<u8>), RequestError> {
     let cannot_connect =
         |e: std::io::Error| format!("cannot connect to {}: {e} (is scopevault-daemon running?)", socket.display());
     let deadline = wait.map(|w| Instant::now() + w);
@@ -183,13 +234,15 @@ async fn request(socket: &PathBuf, req: &Request, wait: Option<Duration>) -> Res
             {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Err(e) => return Err(cannot_connect(e)),
+            Err(e) => return Err(cannot_connect(e).into()),
         }
     };
     let (rd, mut wr) = stream.into_split();
-    write_json(&mut wr, req).await.map_err(|e| format!("cannot send the request: {e}"))?;
+    write_json(&mut wr, req).await.map_err(|e| RequestError::NoReply(format!("cannot send the request: {e}")))?;
     let mut rd = BufReader::new(rd);
-    let line = read_line(&mut rd, MAX_REPLY_LINE).await.map_err(|e| format!("no reply from the daemon: {e}"))?;
+    let line = read_line(&mut rd, MAX_REPLY_LINE)
+        .await
+        .map_err(|e| RequestError::NoReply(format!("no reply from the daemon: {e}")))?;
     let reply: Reply = serde_json::from_str(&line).map_err(|e| format!("unreadable reply: {e}"))?;
     let mut data = Vec::new();
     if let Reply::Backup { bytes } = reply {
@@ -401,6 +454,9 @@ async fn run() -> ExitCode {
         }
         _ => return usage(),
     };
+    if matches!(req, Request::Lock) {
+        return lock(&socket, json).await;
+    }
     match request(&socket, &req, None).await {
         Ok((reply, _)) => print_reply(&reply, json),
         Err(e) => fail_as(json, e),

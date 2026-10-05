@@ -629,3 +629,21 @@ async fn login_unlock_enable_status_disable() {
     let out = e.admin(&Who::Host, &["login-unlock", "disable"]).await;
     assert_eq!(out.stdout.trim(), "login unlock was not enabled");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_waits_for_a_free_client_slot() {
+    // Logout locks the vault through `scopevault-admin lock`. While every
+    // client slot is busy the daemon closes new connections unanswered; the
+    // lock must not give up at once.
+    let e = env(VaultState::Unlocked).await;
+    let held: Vec<_> = (0..4).map(|_| std::os::unix::net::UnixStream::connect(&e.socket).unwrap()).collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(held);
+    });
+
+    let out = e.admin(&Who::Host, &["lock"]).await;
+    assert_eq!(out.stdout.trim(), "locked", "{}", out.stderr);
+    assert!(!e.vault.unlocked());
+}
