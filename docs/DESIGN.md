@@ -318,8 +318,9 @@ them.
   that already has encrypted data would make that data unreadable, so no
   key is created until the keys were imported or `scopevault-admin portal
   init` was run, and none for an app that already has a libsecret keyring
-  file of its own. `scopevault-admin portal new-key` overrides that
-  explicitly.
+  file of its own. That path is in the app's directory, so it is looked
+  up without following symlinks; a symlink anywhere on it counts as a
+  file. `scopevault-admin portal new-key` overrides that explicitly.
 - If gnome-keyring has several candidate keys for one app, the import
   stops and changes nothing: which one gnome-keyring hands out is not
   defined.

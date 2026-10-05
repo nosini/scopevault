@@ -174,15 +174,72 @@ impl PortalBackend {
     }
 
     /// Whether `<app_data_root>/<app-id>/data/keyrings/default.keyring`
-    /// exists. Any directory entry counts, a dangling symlink included. A
-    /// stat error other than "not found" refuses: the key must not be
+    /// exists. The app controls everything below its directory, so the path
+    /// is resolved without following any symlink: any directory entry
+    /// counts, a dangling symlink included, and so does a symlink on the
+    /// way, wherever it leads. Any other error refuses: the key must not be
     /// replaced blindly, and a fresh one would not decrypt the file anyway.
     fn app_keyring_exists(&self, app_id: &str) -> Result<bool, std::io::Error> {
-        let path = self.app_data_root.join(app_id).join("data").join("keyrings").join("default.keyring");
-        match std::fs::symlink_metadata(&path) {
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        use rustix::io::Errno;
+        let root = match rustix::fs::open(
+            &self.app_data_root,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        match rustix::fs::openat2(
+            &root,
+            format!("{app_id}/data/keyrings/default.keyring"),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
             Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
+            Err(Errno::LOOP) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The app's key from the vault; with `create`, a new one if it has
+    /// none. `Err` means refused (logged here).
+    fn stored_key(&self, app_id: &str, create: bool) -> Result<Option<Secret>, ()> {
+        let mut slot = self.unlocker.vault().lock().unwrap();
+        let v = slot.vault.as_mut().ok_or(())?;
+        let auth = PortalAuthority::verified_frontend();
+        match v.portal_initialised() {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    app_id = %app_id,
+                    "the Secret portal keys were neither imported nor initialised; run \
+                     `scopevault-admin import` or `scopevault-admin portal init`"
+                );
+                return Err(());
+            }
+            Err(e) => {
+                tracing::warn!(app_id = %app_id, error = %e, "portal: cannot inspect the portal keys");
+                return Err(());
+            }
+        }
+        match v.portal_key(&auth, app_id) {
+            Ok(Some(key)) => Ok(Some(key)),
+            Ok(None) if !create => Ok(None),
+            Ok(None) => match v.create_portal_key(&auth, app_id) {
+                Ok(key) => Ok(Some(key)),
+                Err(e) => {
+                    tracing::warn!(app_id = %app_id, error = %e, "portal: cannot create a portal key");
+                    Err(())
+                }
+            },
+            Err(e) => {
+                tracing::warn!(app_id = %app_id, error = %e, "portal: cannot read the portal key");
+                Err(())
+            }
         }
     }
 
@@ -236,32 +293,13 @@ impl PortalBackend {
                 return (RESPONSE_OTHER, results);
             }
         }
-        // Lookup and creation under one hold of the vault mutex, so two
-        // concurrent calls for a new app cannot create two keys.
-        let secret: Secret = {
-            let mut slot = self.unlocker.vault().lock().unwrap();
-            let Some(v) = slot.vault.as_mut() else {
-                return (RESPONSE_OTHER, results);
-            };
-            let auth = PortalAuthority::verified_frontend();
-            match v.portal_initialised() {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(
-                        app_id = %app_id,
-                        "the Secret portal keys were neither imported nor initialised; run \
-                         `scopevault-admin import` or `scopevault-admin portal init`"
-                    );
-                    return (RESPONSE_OTHER, results);
-                }
-                Err(e) => {
-                    tracing::warn!(app_id = %app_id, error = %e, "portal: cannot inspect the portal keys");
-                    return (RESPONSE_OTHER, results);
-                }
-            }
-            match v.portal_key(&auth, app_id) {
-                Ok(Some(key)) => key,
-                Ok(None) => match self.app_keyring_exists(app_id) {
+        let secret = match self.stored_key(app_id, false) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                // The app's directory is looked at without holding the vault
+                // mutex: it is the app's to arrange.
+                match self.app_keyring_exists(app_id) {
+                    Ok(false) => {}
                     Ok(true) => {
                         tracing::warn!(
                             app_id = %app_id,
@@ -270,23 +308,19 @@ impl PortalBackend {
                         );
                         return (RESPONSE_OTHER, results);
                     }
-                    Ok(false) => match v.create_portal_key(&auth, app_id) {
-                        Ok(key) => key,
-                        Err(e) => {
-                            tracing::warn!(app_id = %app_id, error = %e, "portal: cannot create a portal key");
-                            return (RESPONSE_OTHER, results);
-                        }
-                    },
                     Err(e) => {
                         tracing::warn!(app_id = %app_id, error = %e, "portal: cannot look at the app's data");
                         return (RESPONSE_OTHER, results);
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(app_id = %app_id, error = %e, "portal: cannot read the portal key");
-                    return (RESPONSE_OTHER, results);
+                }
+                // Lookup and creation under one hold of the vault mutex, so
+                // two concurrent calls for a new app cannot create two keys.
+                match self.stored_key(app_id, true) {
+                    Ok(Some(key)) => key,
+                    _ => return (RESPONSE_OTHER, results),
                 }
             }
+            Err(()) => return (RESPONSE_OTHER, results),
         };
         // The key's bytes go to the app through the fd the frontend passed
         // on; they are never logged.

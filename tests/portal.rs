@@ -537,3 +537,39 @@ fn full_pipes_hold_no_threads() {
         }
     });
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn symlinks_in_the_apps_data_count_as_a_keyring_file() {
+    // The app arranges its own directory: where a symlink leads is its
+    // choice, so the check must not follow one.
+    let fx = fixture(VaultState::Unlocked).await;
+    fx.store().vault.as_mut().unwrap().init_portal(&AdminAuthority::offline()).unwrap();
+    let fe = fx.frontend(Some(Principal::Host), true).await;
+    let apps = fx.app_data.path().join("apps");
+    let elsewhere = fx.app_data.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+
+    // `data` dangles, for example into storage that is not mounted.
+    std::fs::create_dir(apps.join("org.example.Dangling")).unwrap();
+    std::os::unix::fs::symlink(fx.app_data.path().join("missing"), apps.join("org.example.Dangling/data")).unwrap();
+    // `keyrings` leads to a directory without the file.
+    std::fs::create_dir_all(apps.join("org.example.Moved/data")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, apps.join("org.example.Moved/data/keyrings")).unwrap();
+    // The file itself is a dangling symlink.
+    std::fs::create_dir_all(apps.join("org.example.Link/data/keyrings")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("gone"), apps.join("org.example.Link/data/keyrings/default.keyring"))
+        .unwrap();
+
+    for app in ["org.example.Dangling", "org.example.Moved", "org.example.Link"] {
+        let (r, bytes) = retrieve(&fe, app).await;
+        assert_eq!(r.unwrap(), 2, "{app}");
+        assert!(bytes.is_empty(), "{app}");
+    }
+    assert!(stored_keys(&fx).is_empty(), "no key was created: {:?}", stored_keys(&fx));
+
+    // A plain directory without the file still gets a key.
+    std::fs::create_dir_all(apps.join(APP).join("data/keyrings")).unwrap();
+    let (r, bytes) = retrieve(&fe, APP).await;
+    assert_eq!(r.unwrap(), 0);
+    assert_eq!(bytes.len(), 64);
+}
