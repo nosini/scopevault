@@ -327,8 +327,9 @@ async fn run(opts: Options, classifier: Classifier) -> Result<(), String> {
         () = login_server.serve(&login_bound.listener) => Ok(()),
         () = watch_queue(&dbus) => Ok(()),
         r = serving => match r {
-            Ok(()) => Err("the session bus connection closed".into()),
-            Err(e) => Err(format!("the session bus connection failed: {e}")),
+            Ok(Ok(())) => Err("the session bus connection closed".into()),
+            Ok(Err(e)) => Err(format!("the session bus connection failed: {e}")),
+            Err(e) => Err(format!("serving the session bus failed: {e}")),
         },
         () = portal_conn.closed() => Err("the portal bus connection closed".into()),
         _ = term.recv() => Ok(()),

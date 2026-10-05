@@ -375,11 +375,15 @@ impl<R: CallerResolver> SecretService<R> {
         })
     }
 
-    /// Starts listening and returns the future that serves requests until
-    /// the bus connection closes. Request bus names only after this
-    /// returns, so no early call is missed. When the future ends the
-    /// process must exit: identity caches are valid for one connection only.
-    pub async fn start(self: Arc<Self>) -> zbus::Result<impl std::future::Future<Output = zbus::Result<()>>> {
+    /// Starts serving requests, on a task of its own, until the bus
+    /// connection closes. Request bus names only after this returns, so no
+    /// early call is missed. When the task ends the process must exit:
+    /// identity caches are valid for one connection only.
+    ///
+    /// The task starts at once: its stream receives every message of the
+    /// connection, and once it holds 64 unread ones zbus stops reading the
+    /// connection, replies included.
+    pub async fn start(self: Arc<Self>) -> zbus::Result<tokio::task::JoinHandle<zbus::Result<()>>> {
         // Disconnect notifications must arrive in the same ordered stream as
         // method calls, so a connection's departure is always processed
         // after every request it sent.
@@ -403,7 +407,7 @@ impl<R: CallerResolver> SecretService<R> {
                 this.announce_unlock().await;
             }
         });
-        Ok(self.serve(stream))
+        Ok(tokio::spawn(self.serve(stream)))
     }
 
     async fn serve(self: Arc<Self>, mut stream: MessageStream) -> zbus::Result<()> {

@@ -939,3 +939,27 @@ async fn get_secrets_is_deduplicated_and_bounded() {
     let e = call(&a, SERVICE, SVC_IFACE, "GetSecrets", &(&paths[..], &s.path)).await.unwrap_err();
     assert_eq!(e.0, "org.freedesktop.DBus.Error.LimitsExceeded", "{e:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_connections_cannot_stall_startup() {
+    // Between start() and the end of the daemon's setup, every connection
+    // that comes or goes on the bus sends a NameOwnerChanged into the
+    // service's stream. Unread, 64 of them stopped the connection, and the
+    // setup's own calls (RequestName) never got their replies.
+    let vault = VaultFixture::new(VaultState::Unlocked);
+    let bus = std::sync::Arc::new(common::TestBus::start());
+    let conn = bus.connect().await;
+    let resolver = std::sync::Arc::new(FixedResolver::default());
+    let service = scopevault::service_api::SecretService::new(conn.clone(), resolver, vault.unlocker.clone());
+    let _serving = service.clone().start().await.unwrap();
+
+    let mut others = Vec::new();
+    for _ in 0..80 {
+        others.push(bus.connect().await);
+    }
+    tokio::time::timeout(Duration::from_secs(5), conn.request_name(DEST))
+        .await
+        .expect("the service connection stopped reading")
+        .unwrap();
+    drop(others);
+}
