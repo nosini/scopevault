@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.1
+
+- `scopevault-admin setup` on an account that scopevault already serves
+  (moving from a manual installation to the packages, say) installs the
+  files, enables the units and says there is nothing else to do, instead
+  of asking for an import from gnome-keyring and a new login.
+- `scripts/activation-check.sh` shows the unit file systemd actually uses,
+  so the packaged unit in `/usr/lib/systemd/user` no longer shows up as a
+  missing user unit.
+
 ## 0.13.0
 
 - `scopevault-admin setup` switches the current account from gnome-keyring
