@@ -16,9 +16,11 @@
 //! Every entry point returns `PAM_IGNORE`, whatever happens: the module
 //! must never decide or break a login. Panics are caught.
 //!
-//! Option: `helper=/absolute/path` (default
-//! `/usr/local/libexec/scopevault-pam-helper`). The helper must be a file
-//! the user cannot replace: it starts as root's child.
+//! Option: `helper=/absolute/path`. The default is
+//! `/usr/local/libexec/scopevault-pam-helper`, or the path in
+//! `SCOPEVAULT_PAM_HELPER` when the module was built (packages set it). The
+//! helper must be a file the user cannot replace: it starts as root's
+//! child.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -61,7 +63,12 @@ pub mod ffi {
 
 use ffi::PamHandle;
 
-const DEFAULT_HELPER: &str = "/usr/local/libexec/scopevault-pam-helper";
+const DEFAULT_HELPER: &str = match option_env!("SCOPEVAULT_PAM_HELPER") {
+    Some(path) => path,
+    None => "/usr/local/libexec/scopevault-pam-helper",
+};
+const _: () =
+    assert!(!DEFAULT_HELPER.is_empty() && DEFAULT_HELPER.as_bytes()[0] == b'/', "the helper path must be absolute");
 const STASH: &CStr = c"scopevault_authtok";
 
 fn log(pamh: *mut PamHandle, priority: c_int, msg: &str) {

@@ -131,7 +131,8 @@ before it. The child closes every other file descriptor with
 `close_range` (Linux 5.9 or later; without it the helper isn't started,
 since nothing else can find every descriptor after `fork`), switches to your
 user and group and checks that this can't be undone, and runs
-`/usr/local/libexec/scopevault-pam-helper` with nothing in its
+`/usr/local/libexec/scopevault-pam-helper` (the RPM's module runs
+`/usr/libexec/scopevault-pam-helper`) with nothing in its
 environment but `HOME` and `XDG_RUNTIME_DIR`. The password goes over a
 socket pair rather than a pipe, so the host process can never get a
 `SIGPIPE`.
