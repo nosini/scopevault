@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.13.0
+
+- `scopevault-admin setup` switches the current account from gnome-keyring
+  to scopevault: it installs the D-Bus activation, autostart and portal
+  files in your home, selects scopevault in a `gnome-portals.conf` made
+  from the system's (keeping your own aside), enables the units and masks
+  gnome-keyring's. `setup --revert` undoes it and stops the daemon. Both
+  print what is left to do (import or export, and logging out).
+- RPMs for openSUSE Tumbleweed: `scripts/build-rpm.sh` builds
+  `scopevault`, `scopevault-gui` and `pam_scopevault`. They change nothing
+  until a user runs `scopevault-admin setup`. See docs/INSTALL.md,
+  "Installing the packages".
+- The PAM module's default helper path can be set when it is built
+  (`SCOPEVAULT_PAM_HELPER`); the package uses
+  `/usr/libexec/scopevault-pam-helper`. Manual installations keep
+  `/usr/local/libexec`.
+
 ## 0.12.8
 
 - The GUI stops a refresh that an operation overtook. Locking the vault
