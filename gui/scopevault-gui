@@ -15,7 +15,8 @@ grants of a locked vault opens the unlock dialog. So nothing is polled:
 the window reads the status first, lists only an unlocked vault, and
 refreshes after each operation or on request. The daemon serves at most
 four clients at once; reads run one after another, and only one operation
-runs at a time.
+runs at a time. Reads that an operation overtook (a lock, say) stop
+there, and the refresh after the operation starts again from the status.
 """
 
 import argparse
@@ -211,6 +212,11 @@ class Window(Adw.ApplicationWindow):
         self.listing: tuple[str, list[Reply]] | None = None
         self.checked: set[str] = set()
         self.busy = False
+        # Bumped when an operation starts. A read that was sent before, or
+        # while one runs, describes a vault that may have changed (a lock):
+        # its reply must not lead to further reads, which on a locked vault
+        # open the unlock dialog.
+        self.generation = 0
         self.refreshing = False
         self.refresh_again = False
         # The scope a listing request is out for, and whether its reply is
@@ -417,7 +423,8 @@ class Window(Adw.ApplicationWindow):
             self.refresh_again = True
             return
         self.refreshing = True
-        self.admin.run(["status"], self.got_status)
+        generation = self.generation
+        self.admin.run(["status"], lambda reply: self.got_status(reply, generation))
 
     def refresh_done(self) -> None:
         self.refreshing = False
@@ -425,14 +432,25 @@ class Window(Adw.ApplicationWindow):
             self.refresh_again = False
             self.refresh()
 
-    def got_status(self, reply: Reply) -> None:
+    def outdated(self, generation: int) -> bool:
+        """Whether a read of `generation` must stop: an operation started
+        since or is running. That operation refreshes when it ends."""
+        return self.busy or generation != self.generation
+
+    def got_status(self, reply: Reply, generation: int) -> None:
+        if self.outdated(generation):
+            self.refresh_done()
+            return
         self.show_status(reply)
         if not self.unlocked():
             self.refresh_done()
             return
-        self.admin.run(["scopes"], self.got_scopes)
+        self.admin.run(["scopes"], lambda reply: self.got_scopes(reply, generation))
 
-    def got_scopes(self, reply: Reply) -> None:
+    def got_scopes(self, reply: Reply, generation: int) -> None:
+        if self.outdated(generation):
+            self.refresh_done()
+            return
         if is_error(reply):
             self.scopes = []
             self.show_scopes()
@@ -442,9 +460,12 @@ class Window(Adw.ApplicationWindow):
         else:
             self.scopes = reply.get("scopes", [])
             self.show_scopes()
-        self.admin.run(["grants"], self.got_grants)
+        self.admin.run(["grants"], lambda reply: self.got_grants(reply, generation))
 
-    def got_grants(self, reply: Reply) -> None:
+    def got_grants(self, reply: Reply, generation: int) -> None:
+        if self.outdated(generation):
+            self.refresh_done()
+            return
         self.show_grants(reply)
         self.refresh_done()
         self.load_listing()
@@ -454,13 +475,16 @@ class Window(Adw.ApplicationWindow):
         if self.listing_for is not None:
             self.listing_stale = True
             return
-        if self.selected is None or not self.unlocked():
+        if self.selected is None or not self.unlocked() or self.busy:
             return
         scope = self.listing_for = self.selected
         self.listing_stale = False
+        generation = self.generation
 
         def got(reply: Reply) -> None:
             self.listing_for = None
+            if self.outdated(generation):
+                return
             if self.selected != scope or self.listing_stale:
                 self.load_listing()
                 return
@@ -662,6 +686,7 @@ class Window(Adw.ApplicationWindow):
             self.toast("Another operation is still running")
             return
         self.busy = True
+        self.generation += 1
         if waiting:
             self.banner.set_title(waiting)
             self.banner.set_revealed(True)
