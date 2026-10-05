@@ -366,17 +366,29 @@ impl PortalBackend {
         })
     }
 
-    /// The work of one authorised call, raced against the request's `Close`
-    /// and against the frontend losing its name.
+    /// One call, once its request object is exported: authorise the
+    /// caller, then do the work, raced against the request's `Close` and
+    /// against the frontend losing its name. A `Close` that came first
+    /// wins.
     async fn serve_call(
         &self,
         sender: &OwnedUniqueName,
+        handle: &str,
         app_id: &str,
         fd: OwnedFd,
         cancel: tokio::sync::watch::Receiver<bool>,
-        frontend_moved: impl Future<Output = ()>,
-    ) -> (u32, Results) {
-        tokio::select! {
+    ) -> zbus::fdo::Result<(u32, Results)> {
+        // Watched from before the check on: the call is the frontend's
+        // only while it owns the frontend's name.
+        let frontend_moved = self.frontend_moved(sender).await?;
+        self.authorise(sender).await?;
+        if !is_valid_portal_app_id(app_id) {
+            tracing::warn!(sender = %sender, app_id = %app_id, "portal: refused an invalid app ID");
+            self.log_refused_caller(handle).await;
+            return Ok((RESPONSE_OTHER, empty_results()));
+        }
+        Ok(tokio::select! {
+            biased;
             true = cancelled(cancel) => {
                 tracing::info!(sender = %sender, app_id = %app_id, "portal: the request was closed");
                 (RESPONSE_CANCELLED, empty_results())
@@ -386,7 +398,7 @@ impl PortalBackend {
                 (RESPONSE_OTHER, empty_results())
             }
             r = self.serve_request(app_id, fd) => r,
-        }
+        })
     }
 }
 
@@ -550,19 +562,13 @@ impl PortalBackend {
         let Some(sender) = header.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else {
             return Err(zbus::fdo::Error::AccessDenied("no sender".into()));
         };
-        // Watched from before the check on: the call is the frontend's
-        // only while it owns the frontend's name.
-        let frontend_moved = self.frontend_moved(&sender).await?;
-        self.authorise(&sender).await?;
         if !handle.as_str().strip_prefix(REQUEST_PREFIX).is_some_and(|rest| !rest.is_empty()) {
             return Err(zbus::fdo::Error::InvalidArgs(format!("the handle must start with {REQUEST_PREFIX}")));
         }
-        if !is_valid_portal_app_id(app_id) {
-            tracing::warn!(sender = %sender, app_id = %app_id, "portal: refused an invalid app ID");
-            self.log_refused_caller(handle.as_str()).await;
-            return Ok((RESPONSE_OTHER, empty_results()));
-        }
 
+        // Exported before anything else: xdg-desktop-portal forwards an
+        // app's Close as soon as it gets it, which can be before this call
+        // was authorised. Only the caller may close it (see Request).
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let request = Request { owner: sender.clone(), cancel: cancel_tx };
         let added = self
@@ -575,7 +581,7 @@ impl PortalBackend {
             return Err(zbus::fdo::Error::Failed(format!("a request object already exists at {handle}")));
         }
 
-        let response = self.serve_call(&sender, app_id, fd, cancel_rx, frontend_moved).await;
+        let result = self.serve_call(&sender, handle.as_str(), app_id, fd, cancel_rx).await;
         // Removed whatever the outcome. (If the call's task is dropped
         // instead, the object stays until the daemon exits; its Close then
         // only reaches a finished call.)
@@ -583,12 +589,12 @@ impl PortalBackend {
             tracing::warn!(path = %handle, error = %e, "portal: cannot remove the request object");
         }
         // Some apps ask every second (Bitwarden), so successes are debug.
-        if response.0 == RESPONSE_SUCCESS {
-            tracing::debug!(app_id = %app_id, "portal: RetrieveSecret finished");
-        } else {
-            tracing::info!(app_id = %app_id, response = response.0, "portal: RetrieveSecret finished");
+        match &result {
+            Ok((RESPONSE_SUCCESS, _)) => tracing::debug!(app_id = %app_id, "portal: RetrieveSecret finished"),
+            Ok((response, _)) => tracing::info!(app_id = %app_id, response, "portal: RetrieveSecret finished"),
+            Err(_) => {}
         }
-        Ok(response)
+        result
     }
 
     /// The backend API version, the only one the frontend understands.

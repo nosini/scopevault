@@ -10,17 +10,18 @@ mod common;
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::os::fd::{AsFd as _, BorrowedFd};
-use std::sync::MutexGuard;
+use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
-use common::service::{Fixture, collections, flatpak, search};
+use common::service::{FixedResolver, Fixture, collections, flatpak, search};
 use common::tempdir::TempDir;
 use common::{PASSWORD, VaultFixture, VaultState};
-use scopevault::identity::{Principal, Scope};
+use scopevault::identity::{CallerResolver, Principal, Resolved, Scope};
 use scopevault::portal_backend::{BACKEND_NAME, BACKEND_PATH, FRONTEND_NAME, PortalBackend};
 use scopevault::prompts::unlock::{UnlockOutcome, VaultSlot};
 use scopevault::store::{AdminAuthority, PortableItem, Secret};
 use zbus::Connection;
+use zbus::names::UniqueName;
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue};
 
 const SECRET_IFACE: &str = "org.freedesktop.impl.portal.Secret";
@@ -39,11 +40,17 @@ struct PortalFixture {
 
 async fn fixture(state: VaultState) -> PortalFixture {
     let fx = common::service::fixture(state).await;
+    let resolver = fx.resolver.clone();
+    fixture_with(fx, resolver).await
+}
+
+/// A fixture whose backend identifies callers through `resolver`.
+async fn fixture_with<R: CallerResolver>(fx: Fixture, resolver: Arc<R>) -> PortalFixture {
     let app_data = TempDir::new("portal-apps");
     let app_root = app_data.path().join("apps");
     std::fs::create_dir(&app_root).unwrap();
     let portal_conn = fx.bus.connect().await;
-    let backend = PortalBackend::new(portal_conn.clone(), fx.resolver.clone(), fx.vault.unlocker.clone(), app_root);
+    let backend = PortalBackend::new(portal_conn.clone(), resolver, fx.vault.unlocker.clone(), app_root);
     backend.start().await.unwrap();
     portal_conn.request_name(BACKEND_NAME).await.unwrap();
     PortalFixture { fx, app_data, _portal_conn: portal_conn }
@@ -618,4 +625,53 @@ async fn a_request_ends_when_the_frontend_loses_its_name() {
     assert_eq!(r.unwrap(), 2, "the request was dropped when the name moved");
     assert!(bytes.is_empty());
     assert!(process_gone(pid).await, "pinentry still running after the frontend went away");
+}
+
+/// Identifies callers through the fixture's table, but only once the test
+/// opens the gate.
+struct GatedResolver {
+    table: Arc<FixedResolver>,
+    entered: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl CallerResolver for GatedResolver {
+    async fn resolve(&self, sender: &UniqueName<'_>) -> Resolved {
+        self.entered.notify_one();
+        let _open = self.gate.acquire().await.unwrap();
+        self.table.resolve(sender).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_during_authorisation_cancels_the_call() {
+    // xdg-desktop-portal forwards an app's Close at once, which can be
+    // while the backend is still checking the frontend.
+    let fx = common::service::fixture(VaultState::Unlocked).await;
+    let gated = Arc::new(GatedResolver {
+        table: fx.resolver.clone(),
+        entered: tokio::sync::Notify::new(),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let fx = fixture_with(fx, gated.clone()).await;
+    {
+        let mut slot = fx.store();
+        let v = slot.vault.as_mut().unwrap();
+        v.init_portal(&AdminAuthority::offline()).unwrap();
+        v.admin_create_portal_key(&AdminAuthority::offline(), APP).unwrap();
+    }
+    let fe = fx.frontend(Some(Principal::Host), true).await;
+    let handle = "/org/freedesktop/portal/desktop/request/test/early";
+    let task = {
+        let fe = fe.clone();
+        tokio::spawn(async move { retrieve_at(&fe, handle, APP).await })
+    };
+    gated.entered.notified().await;
+
+    let closed = close(&fe, handle).await;
+    gated.gate.add_permits(1);
+    assert_eq!(closed, Ok(()), "the Close found the request");
+    let (r, bytes) = task.await.unwrap();
+    assert_eq!(r.unwrap(), 1, "cancelled");
+    assert!(bytes.is_empty(), "no key was written");
 }
