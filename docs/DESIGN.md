@@ -381,6 +381,14 @@ asks for the status first.
   anyway, for example by asking `systemd --user` to start a program.
 - Rolling the vault file back to an older copy, and secrets surviving in
   old backups or snapshots. See [STORE.md](STORE.md).
+- An app keeping other apps waiting while the vault is locked. Requests
+  that wait for an unlock keep their place in the queue, and all
+  connections share one budget for queued requests (64 MiB). An app that
+  fills it with large requests makes every other app's requests fail at
+  once with "Too many requests", until the vault is unlocked or its
+  requests give up after five minutes. Nothing is revealed. A share per
+  scope would not close this reliably: requests are counted when they
+  arrive, before their caller is identified.
 
 ### Host services acting for Flatpak apps
 
