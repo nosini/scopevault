@@ -1,6 +1,7 @@
 //! Records the git commit the binaries are built from, for `--version` and
 //! the daemon's startup log: the short hash, with `-dirty` if tracked files
-//! differ from it, or `unknown` outside a git checkout.
+//! differ from it, or `unknown` outside a git checkout. A package build from
+//! a source tarball sets it in `SCOPEVAULT_COMMIT` instead.
 
 use std::process::Command;
 
@@ -10,6 +11,11 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=SCOPEVAULT_COMMIT");
+    if let Some(commit) = std::env::var("SCOPEVAULT_COMMIT").ok().filter(|c| !c.is_empty()) {
+        println!("cargo:rustc-env=SCOPEVAULT_COMMIT={commit}");
+        return;
+    }
     let commit = match git(&["rev-parse", "--short=7", "HEAD"]) {
         Some(hash) => match git(&["status", "--porcelain", "--untracked-files=no"]) {
             Some(changes) if changes.is_empty() => hash,

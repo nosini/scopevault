@@ -52,8 +52,8 @@ what it does protect and why.
 - [docs/DESIGN.md](docs/DESIGN.md): how callers are identified, how scopes
   work, and the limits.
 - [docs/STORE.md](docs/STORE.md): the encrypted vault.
-- [docs/INSTALL.md](docs/INSTALL.md): switching from gnome-keyring, and
-  back.
+- [docs/INSTALL.md](docs/INSTALL.md): installing (also as RPMs),
+  switching from gnome-keyring, and back.
 - [docs/LOGIN-UNLOCK.md](docs/LOGIN-UNLOCK.md): unlocking with the login
   password.
 - [docs/TESTING.md](docs/TESTING.md): the tests, and checking scopevault

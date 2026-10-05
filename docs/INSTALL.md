@@ -4,8 +4,50 @@ This guide switches a GNOME desktop from gnome-keyring to scopevault, and
 back again if you change your mind. It is written for openSUSE Tumbleweed;
 on other distributions the steps are the same once the paths match.
 
-Nothing here happens automatically, and nothing needs root except the
-optional login unlocking at the end.
+Nothing here happens automatically, and nothing needs root except
+installing the packages and the optional login unlocking at the end.
+
+## Installing the packages
+
+On openSUSE Tumbleweed, scopevault can be installed as RPMs instead of
+the manual installation below. Build them from the repository, then
+install them:
+
+```sh
+scripts/build-rpm.sh
+sudo zypper install --allow-unsigned-rpm target/rpm/RPMS/x86_64/scopevault-*.rpm \
+    target/rpm/RPMS/noarch/scopevault-gui-*.rpm
+```
+
+`pam_scopevault-*.rpm` (in the same directory) adds the PAM module and its
+helper for the login unlock, in `/usr/libexec/scopevault-pam-helper`. The
+packages don't change anything for anyone by themselves: they install the
+programs, the systemd user units (not enabled) and the GUI's desktop
+entry. Each user switches with `scopevault-admin setup`, as in "Switching
+over" below, skipping step 1.
+
+After installing a newer version, each user who switched restarts the
+daemon (which locks the vault) and GNOME Online Accounts:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart scopevault.service
+pkill -x goa-daemon
+```
+
+Coming from a manual installation, remove its copies, which would take
+precedence over the packages' (`scopevault-admin setup` names any it
+finds), and the manual PAM helper:
+
+```sh
+rm ~/.local/bin/scopevault-daemon ~/.local/bin/scopevault-admin ~/.local/bin/scopevault-gui
+rm ~/.config/systemd/user/scopevault.service ~/.config/systemd/user/scopevault-unlock.service
+rm ~/.local/share/applications/eu.nosini.ScopeVault.desktop
+sudo rm /usr/local/libexec/scopevault-pam-helper
+```
+
+The package's PAM module replaces the manually installed one at the same
+path; the lines in `/etc/pam.d` stay as they are.
 
 ## What gets installed
 
@@ -347,7 +389,9 @@ described in [LOGIN-UNLOCK.md](LOGIN-UNLOCK.md).
 It needs root and changes two PAM files. Keep a root shell open while you
 try it: the module can't block a login, but a typo in a PAM file can.
 
-1. Build and install the daemon, the CLI, the helper and the module:
+1. With the packages, install `pam_scopevault-*.rpm` and go on with
+   step 2. Otherwise build and install the daemon, the CLI, the helper
+   and the module:
 
    ```sh
    cargo build --release
