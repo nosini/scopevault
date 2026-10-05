@@ -47,7 +47,10 @@ sudo rm /usr/local/libexec/scopevault-pam-helper
 ```
 
 The package's PAM module replaces the manually installed one at the same
-path; the lines in `/etc/pam.d` stay as they are.
+path; the lines in `/etc/pam.d` stay as they are. Then run
+`scopevault-admin setup`: on an account that scopevault already serves,
+it takes over the files and enables the packaged units, and there is
+nothing left to import. Restart the daemon as after an update.
 
 ## What gets installed
 

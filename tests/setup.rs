@@ -26,7 +26,7 @@ struct Out {
 impl Home {
     fn new() -> Self {
         let tmp = TempDir::new("setup");
-        for d in ["home", "bin", "share/xdg-desktop-portal", "etc"] {
+        for d in ["home", "bin", "share/xdg-desktop-portal", "etc", "run"] {
             std::fs::create_dir_all(tmp.path().join(d)).unwrap();
         }
         std::fs::write(tmp.path().join("share/xdg-desktop-portal/gnome-portals.conf"), SYSTEM_CONF).unwrap();
@@ -65,6 +65,7 @@ impl Home {
             .env("XDG_CONFIG_DIRS", self.path("etc"))
             .env("XDG_DATA_DIRS", self.path("share"))
             .env("DBUS_SESSION_BUS_ADDRESS", &self.bus.address)
+            .env("XDG_RUNTIME_DIR", self.path("run"))
             .output()
             .unwrap();
         Out {
@@ -185,4 +186,31 @@ fn a_failing_systemctl_fails_setup() {
     let out = h.admin(&["setup"]);
     assert!(!out.ok);
     assert!(out.stderr.contains("systemctl --user enable"), "{}", out.stderr);
+}
+
+#[test]
+fn an_account_scopevault_already_serves_needs_nothing_more() {
+    // A running daemon answers on its administrative socket: setup takes
+    // over the files and says there is nothing left to do.
+    let h = Home::new();
+    h.systemctl(None);
+    let out = h.admin(&["setup"]);
+    assert!(out.stdout.contains("scopevault-admin import"), "no daemon yet: {}", out.stdout);
+
+    let socket = h.path("run/scopevault/admin");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        use std::io::{BufRead as _, Write as _};
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+        (&stream).write_all(b"{\"reply\":\"error\",\"message\":\"any reply will do\"}\n").unwrap();
+        line
+    });
+    let out = h.admin(&["setup"]);
+    assert!(out.ok, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("already serves it"), "{}", out.stdout);
+    assert!(!out.stdout.contains("import"), "{}", out.stdout);
+    assert!(daemon.join().unwrap().contains("status"), "setup asked for the status");
 }

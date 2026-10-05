@@ -372,7 +372,7 @@ async fn run() -> ExitCode {
     }
     let mut rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     match (cmd.as_str(), rest.as_slice()) {
-        ("setup", []) => return setup::setup().await,
+        ("setup", []) => return setup::setup(socket.or_else(default_socket_path)).await,
         ("setup", ["--revert"]) => return setup::revert().await,
         ("setup", _) => return usage(),
         _ => {}

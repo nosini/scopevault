@@ -219,7 +219,10 @@ fn print_leftovers(dirs: &Dirs) {
     println!("  rm {}", list.join(" "));
 }
 
-pub async fn setup() -> ExitCode {
+/// `socket` is the daemon's administrative socket: if a daemon answers
+/// there, it already serves this account (it exits when it cannot own
+/// org.freedesktop.secrets).
+pub async fn setup(socket: Option<PathBuf>) -> ExitCode {
     let dirs = match Dirs::from_env() {
         Ok(d) => d,
         Err(e) => return super::fail(e),
@@ -229,6 +232,16 @@ pub async fn setup() -> ExitCode {
         Err(e) => return super::fail(e),
     }
     reload_bus().await;
+    let serving = match &socket {
+        Some(s) => super::request(s, &scopevault::admin::protocol::Request::Status, None).await.is_ok(),
+        None => false,
+    };
+    if serving {
+        println!("scopevault is set up for your account, and already serves it: nothing");
+        println!("else to do.");
+        print_leftovers(&dirs);
+        return ExitCode::SUCCESS;
+    }
     let vault = dirs.data.join("scopevault");
     println!("scopevault is set up for your account; it takes over at your next login.");
     println!();
