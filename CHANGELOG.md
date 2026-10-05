@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.12.6
+
+- The Secret portal backend writes an app's key without tying up a
+  thread, and no longer changes the flags of the fd the app passed. An
+  app could otherwise occupy the threads that caller identification, the
+  login socket and key derivation need, or leave a write blocked for
+  good. Closing a request stops its write, and only pipes and sockets
+  receive a key.
+- The check for an app's own keyring file no longer follows symlinks in
+  the app's directory; a symlink anywhere on the path counts as a file.
+  A dangling `data` symlink could get an app a fresh key that cannot
+  decrypt its data. The check no longer holds the vault lock.
+- Keys are created automatically only for Flatpak apps. Snaps and host
+  apps keep their keyring files elsewhere, so they need an imported key
+  or `scopevault-admin portal new-key`.
+- A portal request is dropped, and its dialog closed, when its frontend
+  no longer owns `org.freedesktop.portal.Desktop`. A Close that arrives
+  while the request is still being checked is no longer lost.
+- Caller identification checks that `/.flatpak-info` and Flatpak's
+  instance records are regular files before opening them for reading.
+
 ## 0.12.5
 
 - `scopevault-admin restore` swaps the backup in for the vault in one
