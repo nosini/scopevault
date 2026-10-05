@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use futures_util::future::BoxFuture;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -345,6 +346,50 @@ impl PortalBackend {
     }
 }
 
+impl PortalBackend {
+    /// Resolves once `sender` no longer owns the frontend's name: it
+    /// released it, another connection took it over, or `sender`
+    /// disconnected. Subscribed before it returns, so no change after that
+    /// is missed.
+    async fn frontend_moved(&self, sender: &OwnedUniqueName) -> zbus::fdo::Result<impl Future<Output = ()> + use<>> {
+        let failed = |e: zbus::Error| zbus::fdo::Error::Failed(e.to_string());
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn).await.map_err(failed)?;
+        let mut changes = dbus.receive_name_owner_changed_with_args(&[(0, FRONTEND_NAME)]).await.map_err(failed)?;
+        let sender = sender.clone();
+        Ok(async move {
+            while let Some(signal) = changes.next().await {
+                let Ok(args) = signal.args() else { continue };
+                if args.new_owner().as_ref().map(|n| n.as_str()) != Some(sender.as_str()) {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// The work of one authorised call, raced against the request's `Close`
+    /// and against the frontend losing its name.
+    async fn serve_call(
+        &self,
+        sender: &OwnedUniqueName,
+        app_id: &str,
+        fd: OwnedFd,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        frontend_moved: impl Future<Output = ()>,
+    ) -> (u32, Results) {
+        tokio::select! {
+            true = cancelled(cancel) => {
+                tracing::info!(sender = %sender, app_id = %app_id, "portal: the request was closed");
+                (RESPONSE_CANCELLED, empty_results())
+            }
+            () = frontend_moved => {
+                tracing::info!(sender = %sender, app_id = %app_id, "portal: the frontend went away; dropping its request");
+                (RESPONSE_OTHER, empty_results())
+            }
+            r = self.serve_request(app_id, fd) => r,
+        }
+    }
+}
+
 /// The caller of a portal request, as xdg-desktop-portal encodes it into
 /// the request handle: the calling application's unique bus name with the
 /// leading `:` removed and every `.` replaced by `_`. Empty handles, empty
@@ -448,9 +493,8 @@ async fn write_secret(fd: OwnedFd, data: &[u8], timeout: Duration) -> std::io::R
     }
 }
 
-/// Resolves once the frontend closed the request, or its sender went away.
-/// A `Close` that arrived before this is called is still seen: the watched
-/// value is already set.
+/// Resolves once the frontend closed the request. A `Close` that arrived
+/// before this is called is still seen: the watched value is already set.
 async fn cancelled(mut rx: tokio::sync::watch::Receiver<bool>) -> bool {
     loop {
         if *rx.borrow_and_update() {
@@ -506,6 +550,9 @@ impl PortalBackend {
         let Some(sender) = header.sender().map(|s| OwnedUniqueName::from(s.to_owned())) else {
             return Err(zbus::fdo::Error::AccessDenied("no sender".into()));
         };
+        // Watched from before the check on: the call is the frontend's
+        // only while it owns the frontend's name.
+        let frontend_moved = self.frontend_moved(&sender).await?;
         self.authorise(&sender).await?;
         if !handle.as_str().strip_prefix(REQUEST_PREFIX).is_some_and(|rest| !rest.is_empty()) {
             return Err(zbus::fdo::Error::InvalidArgs(format!("the handle must start with {REQUEST_PREFIX}")));
@@ -528,14 +575,7 @@ impl PortalBackend {
             return Err(zbus::fdo::Error::Failed(format!("a request object already exists at {handle}")));
         }
 
-        let work = self.serve_request(app_id, fd);
-        let response = tokio::select! {
-            true = cancelled(cancel_rx) => {
-                tracing::info!(sender = %sender, app_id = %app_id, "portal: the request was closed");
-                (RESPONSE_CANCELLED, empty_results())
-            }
-            r = work => r,
-        };
+        let response = self.serve_call(&sender, app_id, fd, cancel_rx, frontend_moved).await;
         // Removed whatever the outcome. (If the call's task is dropped
         // instead, the object stays until the daemon exits; its Close then
         // only reaches a finished call.)

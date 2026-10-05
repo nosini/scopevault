@@ -595,3 +595,27 @@ async fn only_flatpak_apps_get_a_key_automatically() {
     assert_eq!(r.unwrap(), 0);
     assert_eq!(bytes.len(), 64);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_ends_when_the_frontend_loses_its_name() {
+    let fx = fixture(VaultState::Locked).await;
+    let fe = fx.frontend(Some(Principal::Host), true).await;
+    fx.fx.vault.set_pins(&["HANG"]);
+    let handle = "/org/freedesktop/portal/desktop/request/test/moved";
+    let task = {
+        let fe = fe.clone();
+        tokio::spawn(async move { retrieve_at(&fe, handle, APP).await })
+    };
+    let pid = dialog_waiting(&fx.fx.vault, 1).await;
+
+    // Another frontend takes over: the old one's request is dropped, and
+    // its dialog goes away.
+    fe.release_name(FRONTEND_NAME).await.unwrap();
+    let _successor = fx.frontend(Some(Principal::Host), true).await;
+    let (r, bytes) = tokio::time::timeout(Duration::from_secs(5), task).await.expect("the call kept waiting").unwrap();
+    // 1 (cancelled) would mean it only gave up at the fixture's unlock
+    // deadline, a second after the call.
+    assert_eq!(r.unwrap(), 2, "the request was dropped when the name moved");
+    assert!(bytes.is_empty());
+    assert!(process_gone(pid).await, "pinentry still running after the frontend went away");
+}

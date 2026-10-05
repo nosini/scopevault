@@ -300,7 +300,8 @@ them.
 - Only xdg-desktop-portal is served. The caller must own
   `org.freedesktop.portal.Desktop` at that moment and be identified as a
   host program; everyone else is refused before anything is read or
-  written. There is no check of the portal's executable: it would break
+  written. A request is dropped, and its dialog closed, as soon as its
+  caller no longer owns that name. There is no check of the portal's executable: it would break
   during package updates and would not stop host code anyway. A host
   program that replaces xdg-desktop-portal does become the frontend for
   every app, but host code is trusted.
