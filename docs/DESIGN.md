@@ -373,6 +373,11 @@ asks for the status first.
   Isolating Flatpak apps from each other is the point; hiding secrets from
   your own unsandboxed programs is not possible this way.
 - Flatpak apps with permissions that escape the sandbox (see above).
+- Sandboxes that use no namespaces, such as a process confined only by
+  seccomp or Landlock. Host status is proven through namespaces, the root
+  directory and the security label, so such a process counts as `host`
+  when it can reach the session bus. With the bus it can usually escape
+  anyway, for example by asking `systemd --user` to start a program.
 - Rolling the vault file back to an older copy, and secrets surviving in
   old backups or snapshots. See [STORE.md](STORE.md).
 
